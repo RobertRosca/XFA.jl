@@ -1,0 +1,18 @@
+name = "XFA"
+uuid = "1c39a8db-6709-4730-8fe8-40f12fd2079f"
+authors = ["JamesWrigley <james@puiterwijk.org>"]
+version = "0.1.0"
+
+[deps]
+Debugger = "31a5f54b-26ea-5ae9-a837-f05ce5417438"
+GLMakie = "e9467ef8-e4e7-5192-8a1a-b1aee30e663a"
+JET = "c3a54625-cd67-489e-a8e7-0a5a0ff4e31b"
+MsgPack = "99f44e22-a591-53d1-9472-aa23ef4bd671"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+ReTest = "e0db7c4e-2690-44b9-bad6-7687da720f89"
+Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
+UnicodePlots = "b8865327-cd53-5732-bb35-84acbb429228"
+ZMQ = "c2297ded-f4af-51ae-bb23-16f91089e4e1"
+
+[compat]
+julia = "1.7"
