@@ -6,7 +6,7 @@ export KaraboBridgeClient, KaraboBridgeServer, startbridge, stopbridge, next
 
 
 """
-    KaraboBridgeClient("tcp://127.0.0.1:1234", timeout=0.5)
+    KaraboBridgeClient("tcp://127.0.0.1:1234", timeout::Real=0.5)
 
 Connect to the Karabo bridge at the given endpoint.
 """
@@ -58,6 +58,12 @@ function Base.show(io::IO, client::KaraboBridgeClient)
     print(io, """KaraboBridgeClient("$(addr)")""")
 end
 
+"""
+    startbridge(server::KaraboBridgeServer)
+
+Start a bridge server. This returns a task, which runs the main server
+loop. This function guarantees that the server task is started before returning.
+"""
 function startbridge(server::KaraboBridgeServer)
     # Ensure that only one task at a time is running the server
     if server.running
@@ -72,23 +78,28 @@ function startbridge(server::KaraboBridgeServer)
     start_condition = Condition()
 
     # Start the server loop in a task
-    bridge.running = true
+    server.running = true
     t = errormonitor(
         @async begin
             notify(start_condition)
+
+            # Keep track of the current value to send to the client
             value = nothing
-            while bridge.running
+            while server.running
+                # Wait for some data
                 if value == nothing
-                    if timedwait(() -> isready(bridge.channel), timeout) == :timed_out
+                    if timedwait(() -> isready(server.channel), timeout) == :timed_out
                         continue
                     end
 
-                    value = take!(bridge.channel)
+                    value = take!(server.channel)
                 end
 
+                # Wait for the client to request some data
                 try
-                    msg = recv(bridge.socket)
+                    msg = recv(server.socket, String)
                 catch e
+                    # If it times out keep going, otherwise rethrow the exception
                     if e isa ErrorException
                         continue
                     else
@@ -96,9 +107,10 @@ function startbridge(server::KaraboBridgeServer)
                     end
                 end
 
+                # Now we can serialize the data and send it to the client
                 data, metadata = value
                 msgs = serialize(data, metadata)
-                send_multipart(bridge.socket, msgs)
+                send_multipart(server.socket, msgs)
             end
        end
     )
@@ -107,23 +119,23 @@ function startbridge(server::KaraboBridgeServer)
     return t
 end
 
-stopbridge(bridge::KaraboBridgeServer) = bridge.running = false
-Base.put!(bridge::KaraboBridgeServer, data, metadata=nothing) = put!(bridge.channel, (data, metadata))
+stopbridge(server::KaraboBridgeServer) = server.running = false
+Base.put!(server::KaraboBridgeServer, data, metadata=nothing) = put!(server.channel, (data, metadata))
 
 """
-    next(bridge)
+    next(client)
 
-Get the next message from this bridge.
+Get the next message from a bridge client.
 """
-function next(bridge::KaraboBridgeClient)
-    if !bridge.ready
-        send(bridge.socket, Vector{UInt8}("next"))
-        bridge.ready = true
+function next(client::KaraboBridgeClient)
+    if !client.ready
+        send(client.socket, Vector{UInt8}("next"))
+        client.ready = true
     end
 
-    msgs = recv_multipart(bridge.socket)
+    msgs = recv_multipart(client.socket)
 
-    bridge.ready = false
+    client.ready = false
 
     return deserialize(msgs)
 end
