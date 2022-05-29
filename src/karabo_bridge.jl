@@ -24,7 +24,7 @@ mutable struct KaraboBridgeClient
 end
 
 """
-    KaraboBridgeServer("tcp://127.0.0.1:45454", buffer_size=10)
+    KaraboBridgeServer("tcp://127.0.0.1:45454", timeout::Real=0.5, buffer_size=10)
 
 Create a Karabo bridge server.
 """
@@ -33,11 +33,12 @@ mutable struct KaraboBridgeServer
     channel::Channel
     running::Bool
 
-    function KaraboBridgeServer(endpoint::String, buffer_size::Integer=10)
+    function KaraboBridgeServer(endpoint::String, timeout::Real=0.5, buffer_size::Integer=10)
         socket = Socket(REP)
         socket.linger = 0
         socket.rcvhwm = 1
         socket.sndhwm = 1
+        socket.rcvtimeo = Int(timeout * 1000)
         bind(socket, endpoint)
 
         return new(socket, Channel(buffer_size), false)
@@ -57,11 +58,21 @@ function Base.show(io::IO, client::KaraboBridgeClient)
     print(io, """KaraboBridgeClient("$(addr)")""")
 end
 
-function startbridge(bridge::KaraboBridgeServer, timeout=0.5)
-    start_condition = Condition()
-    bridge.socket.rcvtimeo = Int(timeout * 1000)
-    bridge.running = true
+function startbridge(server::KaraboBridgeServer)
+    # Ensure that only one task at a time is running the server
+    if server.running
+        error("Karabo bridge server is already running")
+    end
 
+    timeout = server.socket.rcvtimeo / 1000
+
+    # This condition is notified when the server loop begins. We wait on it to
+    # guarantee the caller that the server loop has started by the time this
+    # function returns.
+    start_condition = Condition()
+
+    # Start the server loop in a task
+    bridge.running = true
     t = errormonitor(
         @async begin
             notify(start_condition)
