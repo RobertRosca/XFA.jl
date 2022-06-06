@@ -14,7 +14,7 @@ mutable struct KaraboBridgeClient
     socket::Socket
     ready::Bool
 
-    function KaraboBridgeClient(endpoint::String, timeout::Real=0.5)
+    function KaraboBridgeClient(endpoint::String; timeout::Real=0.5)
         socket = Socket(REQ)
         socket.rcvtimeo = Int(timeout * 1000)
         connect(socket, endpoint)
@@ -33,11 +33,11 @@ mutable struct KaraboBridgeServer
     channel::Channel
     running::Bool
 
-    function KaraboBridgeServer(endpoint::String, timeout::Real=0.5, buffer_size::Integer=10)
+    function KaraboBridgeServer(endpoint::String; timeout::Real=0.5, buffer_size::Integer=10)
         socket = Socket(REP)
         socket.linger = 0
         socket.rcvhwm = 1
-        socket.sndhwm = 1
+        socket.sndhwm = 2
         socket.rcvtimeo = Int(timeout * 1000)
         bind(socket, endpoint)
 
@@ -59,9 +59,23 @@ function Base.show(io::IO, client::KaraboBridgeClient)
 end
 
 """
+    close(server::KaraboBridgeServer)
+
+Close a Karabo bridge server (unbind its socket).
+"""
+Base.close(server::KaraboBridgeServer) = close(server.socket)
+
+"""
+    close(client::KaraboBridgeClient)
+
+Close a Karabo bridge client (disconnect its socket).
+"""
+Base.close(client::KaraboBridgeClient) = close(client.socket)
+
+"""
     startbridge(server::KaraboBridgeServer)
 
-Start a bridge server. This returns a task, which runs the main server
+Start a bridge server. It returns the task running the main server
 loop. This function guarantees that the server task is started before returning.
 """
 function startbridge(server::KaraboBridgeServer)
@@ -88,7 +102,7 @@ function startbridge(server::KaraboBridgeServer)
             while server.running
                 # Wait for some data
                 if value == nothing
-                    if timedwait(() -> isready(server.channel), timeout) == :timed_out
+                    if wait_timeout(server.channel, timeout) == :timed_out
                         continue
                     end
 
@@ -98,6 +112,9 @@ function startbridge(server::KaraboBridgeServer)
                 # Wait for the client to request some data
                 try
                     msg = recv(server.socket, String)
+                    if msg != "next"
+                        error("Unexpected message from Karabo bridge client: '$(msg)'. Expected 'next'.")
+                    end
                 catch e
                     # If it times out keep going, otherwise rethrow the exception
                     if e isa ErrorException
@@ -111,6 +128,7 @@ function startbridge(server::KaraboBridgeServer)
                 data, metadata = value
                 msgs = serialize(data, metadata)
                 send_multipart(server.socket, msgs)
+                value = nothing
             end
        end
     )
