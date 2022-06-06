@@ -37,7 +37,7 @@ function Base.length(device::Device)
     function count_elements(dict)
         properties = 0
 
-        for v ∈ values(dict)
+        for v in values(dict)
             properties += v isa Dict ? count_elements(v) : 1
         end
 

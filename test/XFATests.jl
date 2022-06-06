@@ -12,7 +12,7 @@ function getavailableport(port_hint; interface=ip"127.0.0.1")
     port_range_end = min(65535, port_hint + 5000)
     available_port = -1
 
-    for port ∈ port_hint:port_range_end
+    for port in port_hint:port_range_end
         try
             s = listen(interface, port)
             close(s)
@@ -78,6 +78,9 @@ end
     # Close the client and server
     close(client)
     close(server)
+end
+
+@testset "multibridge.jl" begin
 end
 
 end

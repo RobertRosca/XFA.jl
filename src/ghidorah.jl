@@ -14,7 +14,7 @@ mutable struct Ghidorah
         end
 
         servers = Dict{String, KaraboBridgeServer}()
-        for port ∈ bridge_ports
+        for port in bridge_ports
             if port < 0
                 throw(ArgumentError("Invalid port number: $(port)"))
             end

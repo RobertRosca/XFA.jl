@@ -167,16 +167,16 @@ protocol.
 function serialize(data, metadata=nothing)
     if metadata == nothing
         metadata = Dict(src => get(value, "metadata", Dict())
-                        for (src, value) ∈ pairs(data))
+                        for (src, value) in pairs(data))
     end
 
     msgs = []
-    for (src, props) ∈ pairs(data)
+    for (src, props) in pairs(data)
         src_meta = copy(metadata[src])
         main_data = Dict()
         arrays = Dict()
 
-        for (key, value) ∈ pairs(props)
+        for (key, value) in pairs(props)
             if value isa AbstractArray
                 arrays[key] = value
             else
@@ -193,7 +193,7 @@ function serialize(data, metadata=nothing)
         push!(msgs, pack(main_data))
 
         # Serialize the arrays
-        for (key, array) ∈ arrays
+        for (key, array) in arrays
             if !(array isa DenseArray)
                 array = Array(array)
             end
@@ -221,7 +221,7 @@ function deserialize(msgs::Vector{Message})
     data = Dict()
     meta = Dict()
 
-    for piece ∈ Iterators.partition(msgs, 2)
+    for piece in Iterators.partition(msgs, 2)
         header = unpack(piece[1])
         payload = piece[2]
 
@@ -315,7 +315,7 @@ end
 Sends a multipart message from a ZMQ socket.
 """
 function send_multipart(socket::Socket, msgs)
-    for msg ∈ msgs
+    for msg in msgs
         send(socket, msg, more=msg !== msgs[end])
     end
 end
