@@ -183,7 +183,14 @@ function serialize(data, metadata=nothing)
         arrays = Dict()
 
         for (key, value) in pairs(props)
-            if value isa AbstractArray
+            # Only treat an array as an 'array' (i.e. to be serialized in
+            # zero-copy mode in separate ZMQ messages) if it's of a concrete and
+            # numeric type, it's larger than 500 elements (to avoid the overhead
+            # of another ZMQ message), and it's not Float16 (because MsgPack
+            # doesn't support that).
+            if (value isa AbstractArray && isconcretetype(eltype(value)) &&
+                eltype(value) <: Number && (length(value) > 500 || eltype(value) == Float16))
+
                 arrays[key] = value
             else
                 main_data[key] = value
@@ -239,33 +246,7 @@ function deserialize(msgs::Vector{Message})
             meta[source] = get(header, "metadata", Dict())
         elseif content == "array"
             shape = tuple(Int.(header["shape"])...)
-            dtype = let type = header["dtype"]
-                if type == "float16"
-                    Float16
-                elseif type == "float32"
-                    Float32
-                elseif type == "float64"
-                    Float64
-                elseif type == "int8"
-                    Int8
-                elseif type == "int16"
-                    Int16
-                elseif type == "int32"
-                    Int32
-                elseif type == "int64"
-                    Int64
-                elseif type == "uint8"
-                    UInt8
-                elseif type == "uint16"
-                    UInt16
-                elseif type == "uint32"
-                    UInt32
-                elseif type == "uint64"
-                    UInt64
-                else
-                    error("Unsupported dtype for Karabo bridge: '$type'")
-                end
-            end
+            dtype = dtype_str_to_type(header["dtype"])
 
             array = let rank = length(shape)
                 if rank == 1

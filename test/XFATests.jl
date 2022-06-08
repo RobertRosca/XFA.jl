@@ -50,12 +50,18 @@ end
     dummy_data = Dict("foo" => Dict(
         "string" => "hello world!",
         "scalar" => 42.314,
-        "boolean" => true
+        "boolean" => true,
+        "list" => ["foo", "bar", 42, 3.14],
     ))
-    for type in [Float16, Float32, Float64,
+    for type in [Bool,
+                 Float16, Float32, Float64,
                  Int8, Int16, Int32, Int64,
                  UInt8, UInt16, UInt32, UInt64]
-        dummy_data["foo"]["$(lowercase(string(type)))_array"] = rand(type, 10)
+        # These arrays should use zero-copy transfer
+        dummy_data["foo"]["big_$(lowercase(string(type)))_array"] = rand(type, 1000)
+        # These arrays should be serialized, except for Float16 since MsgPack
+        # doesn't support Float16.
+        dummy_data["foo"]["small_$(lowercase(string(type)))_array"] = rand(type, 10)
     end
 
     # Send the test data and ensure it's received by the client

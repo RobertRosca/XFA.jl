@@ -17,3 +17,37 @@ function wait_timeout(waitable, timeout::Real)
 
     return take!(chan)
 end
+
+function dtype_str_to_type(dtype::String)
+    if dtype == "float16"
+        Float16
+    elseif dtype == "float32"
+        Float32
+    elseif dtype == "float64"
+        Float64
+    elseif dtype == "int8"
+        Int8
+    elseif dtype == "int16"
+        Int16
+    elseif dtype == "int32"
+        Int32
+    elseif dtype == "int64"
+        Int64
+    elseif dtype == "uint8"
+        UInt8
+    elseif dtype == "uint16"
+        UInt16
+    elseif dtype == "uint32"
+        UInt32
+    elseif dtype == "uint64"
+        UInt64
+    elseif dtype == "bool"
+        Bool
+    else
+        error("Unsupported dtype: '$dtype'")
+    end
+end
+
+function type_to_dtype_str(type::DataType)
+    return lowercase(string(type))
+end
