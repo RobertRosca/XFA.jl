@@ -19,7 +19,10 @@ mutable struct KaraboBridgeClient
         socket.rcvtimeo = Int(timeout * 1000)
         connect(socket, endpoint)
 
-        return new(socket, false)
+        new_client = new(socket, false)
+        return finalizer(new_client) do client
+            close(client)
+        end
     end
 end
 
@@ -41,7 +44,10 @@ mutable struct KaraboBridgeServer
         socket.rcvtimeo = Int(timeout * 1000)
         bind(socket, endpoint)
 
-        return new(socket, Channel(buffer_size), false)
+        new_server = new(socket, Channel(buffer_size), false)
+        return finalizer(new_server) do server
+            close(server)
+        end
     end
 end
 
