@@ -107,8 +107,8 @@ function startbridge(server::KaraboBridgeServer)
             value = nothing
             while server.running
                 # Wait for some data
-                if value == nothing
-                    if wait_timeout(server.channel, timeout) == :timed_out
+                if value === nothing
+                    if wait_timeout(server.channel, timeout) === :timed_out
                         continue
                     end
 
