@@ -1,7 +1,7 @@
 module XFA
 
 include("util.jl")
-include("Device.jl")
+include("devices.jl")
 include("karabo_bridge.jl")
 include("sim_onc.jl")
 
