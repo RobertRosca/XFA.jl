@@ -51,3 +51,5 @@ end
 function type_to_dtype_str(type::DataType)
     return lowercase(string(type))
 end
+
+isfull(c::Channel) = length(c.data) >= c.sz_max
