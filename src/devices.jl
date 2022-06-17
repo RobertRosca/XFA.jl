@@ -1,7 +1,7 @@
 using Printf
 using InterProcessCommunication
 
-export Device, printschema, makedetector, makeagipd
+export Device, ShmemHandle, get_instrument_sources, get_control_properties, printschema, makedetector, makeagipd
 
 """
     Device("MID_EXP_EPIX-1/DET/RECEIVER", Dict(
@@ -34,7 +34,10 @@ mutable struct Device
     end
 end
 
-struct DeviceGroup
+get_instrument_sources(device::Device) = unique([split(x[1], "[")[1] for x in device if ':' ∈ x[1]])
+get_control_properties(device::Device) = [x[1][length(device.name) + 2:end] for x in device if ':' ∉ x[1]]
+
+mutable struct DeviceGroup
     name::String
     devices::Vector{Device}
     distributed_parts::Int
@@ -82,14 +85,14 @@ end
 function nextslot(handle::ShmemHandle)
     shmem_name = handle.prefix * "$(handle.next_slot_index)"
 
-    handle.next_slot_index = (handle.next_slot_index + 1) % handle.num_slots
+    handle.next_slot_index = (handle.next_slot_index % handle.num_slots) + 1
 
     return shmem_name
 end
 
 function makedetector(prefix::String;
                       n_quadrants=4, n_modules=16, dtype=Float32, module_shape=(128, 512),
-                      output_pipeline=":dataOutput", distributed_parts=4)
+                      output_pipeline="dataOutput", distributed_parts=4)
     devices = Device[]
     modules_per_quadrant = n_modules ÷ n_quadrants
 
@@ -100,8 +103,8 @@ function makedetector(prefix::String;
 
         handle = ShmemHandle(device_name, module_shape; output_pipeline, dtype)
         device = Device(device_name,
-                        output_pipeline => (
-                            "image.data" => () -> nextslot(handle),
+                        ":$(output_pipeline)" => (
+                            "image.data" => handle,
                             "calngShmemPaths" => ["image.data"]))
         push!(devices, device)
     end
@@ -132,6 +135,33 @@ function Base.length(device::Device)
     end
 
     return count_elements(device.schema)
+end
+
+function Base.getindex(device::Device, source_name::String, property_name::String)
+    sep = ':' ∈ source_name ? "" : "."
+    full_source_name = "$(device.name)$(sep)$(source_name)"
+    source = device[source_name]
+
+    if !(source isa Dict)
+        error("$(full_source_name) doesn't have any sub-properties, can't retrieve property '$(property_name)'")
+    end
+
+    for (prop_name, value) in source
+        if prop_name == property_name
+            return value
+        end
+    end
+
+    error("Couldn't find property '$(property_name)' in $(full_source_name)")
+end
+
+function Base.getindex(device::Device, property_name::String)
+    if property_name ∉ keys(device.schema)
+        error("'$(property_name)' is not a property of $(device.name)")
+    end
+
+    property = device.schema[property_name]
+    return property isa Tuple ? Dict(property) : property
 end
 
 """

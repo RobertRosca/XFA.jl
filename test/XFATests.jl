@@ -2,12 +2,13 @@ module XFATests
 
 __revise_mode__ = :eval
 
-using XFA
 using Printf
-using ReTest
-
 using Sockets
+using Distributed
 
+using XFA
+using ReTest
+using InterProcessCommunication
 
 function getavailableport(port_hint; interface=ip"127.0.0.1")
     port_range_end = min(65535, port_hint + 5000)
@@ -92,6 +93,124 @@ end
 
         stopbridge(server)
         @test timedwait(() -> istaskdone(t), 1) == :ok
+    end
+end
+
+# Helper function that reads from/writes to an array in shared memory
+function access_shmem(id, dtype, dims)
+    handle = SharedMemory(id)
+    array = unsafe_wrap(Array, reinterpret(Ptr{dtype}, pointer(handle)), dims)
+
+    # Modify the array
+    array[end] = array[1] * 2
+
+    return array[1]
+end
+
+# Helper function to handle setup/teardown. The main purpose of this is to
+# test ShmemHandle, so all other args/kwargs are forwarded to the
+# ShmemHandle constructor.
+function shmem_fixture(f::Function, name="foo", shape=(10, 10), args...; mkproc=false, kwargs...)
+    handle = ShmemHandle(name, shape, args...; kwargs...)
+    module_path = dirname(@__DIR__)
+    if mkproc
+        pid = addprocs(1; exeflags="--project=$(module_path)")[1]
+    end
+
+    try
+        if mkproc
+            f(handle, pid)
+        else
+            f(handle)
+        end
+    finally
+        finalize(handle)
+        if mkproc
+            rmprocs(pid)
+        end
+    end
+end
+
+@testset "devices.jl" begin
+    @testset "ShmemHandle" begin
+        shmem_fixture() do handle
+            # Test the default pipeline name
+            @test shmid(handle.buffer) == "/foo:dataOutput"
+
+            # Check that the finalizer actually frees the shared memory
+            finalize(handle)
+            @test_throws SystemError SharedMemory(shmid(handle.buffer))
+        end
+
+        test_shape = (128, 512)
+        dtype = UInt8
+        num_slots = 20
+        shmem_fixture("foo", test_shape; mkproc=true, output_pipeline="bar", dtype, num_slots) do handle, pid
+            # Check the shared mem ID
+            @test shmid(handle.buffer) == "/foo:bar"
+
+            # Check the size of the buffer
+            @test sizeof(handle.buffer) == prod(test_shape) * sizeof(dtype) * num_slots
+
+            # Check that we can open the buffer from another process
+            handle.array[1] = 42
+            @everywhere pid include(@__FILE__)
+
+            remote_value = remotecall_fetch(access_shmem, pid,
+                                            shmid(handle.buffer), dtype, test_shape)
+
+            # Check that that the other process can read from and write to the array
+            @test remote_value == handle.array[1]
+            @test handle.array[end] == handle.array[1] * 2
+        end
+    end
+
+    @testset "Device" begin
+        test_device = Device("Foo",
+                             "slithy" => "toves",
+                             ":bar" => (
+                                 "baz" => 1,
+                                 "quux" => 2
+                             ))
+
+        # Test get_control_properties() and get_instrument_sources()
+        @test length(get_control_properties(test_device)) == 1
+        @test length(get_instrument_sources(test_device)) == 1
+
+        # Test indexing by source and property names
+        @test test_device["slithy"] == "toves"
+        @test test_device[":bar"] isa Dict
+        @test test_device[":bar"]["baz"] == 1
+        @test test_device[":bar", "quux"] == 2
+
+        @test_throws ErrorException test_device["foo"]
+        @test_throws ErrorException test_device[":bar", "bars"]
+
+        # Test the Device finalizer
+        shmem_fixture() do handle
+            device_with_shmem = Device("Foo", "bar" => handle)
+            finalize(device_with_shmem)
+
+            @test_throws SystemError SharedMemory(shmid(handle.buffer))
+        end
+    end
+
+    @testset "DeviceGroup" begin
+        agipd = makeagipd("MID")
+        try
+            # Test that we generate the right number of modules
+            @test length(agipd) == 16
+
+            # Test the finalizer
+            finalize(agipd)
+            handle_ids = [shmid(d[":dataOutput", "image.data"].buffer) for d in agipd.devices]
+            for id in handle_ids
+                @test_throws SystemError SharedMemory(id)
+            end
+        catch e
+            finalize(agipd)
+            rethrow(e)
+        end
     end
 end
 
