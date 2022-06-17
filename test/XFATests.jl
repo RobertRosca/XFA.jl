@@ -214,21 +214,6 @@ end
     end
 end
 
-function sim_onc_test_state(f::Function, devices, ports)
-    onc = OnlineCluster(devices, ports)
-
-    # Attach a client to the bridge server
-    endpoint = first(keys(onc.servers))
-    client = KaraboBridgeClient(endpoint; timeout=2)
-
-    try
-        f(onc, client)
-    finally
-        close(client)
-        close(onc)
-    end
-end
-
 @testset "sim_onc.jl" begin
     # Create some devices
     devices = []
@@ -260,8 +245,37 @@ end
     @test_throws ArgumentError OnlineCluster(devices, Int[])
     @test_throws ArgumentError OnlineCluster(devices, [port, port + 1])
 
+    function sim_onc_fixture(f::Function, devices, ports)
+        onc = OnlineCluster(devices, ports)
+
+        # Attach a client to the bridge server
+        endpoint = first(keys(onc.servers))
+        client = KaraboBridgeClient(endpoint; timeout=2)
+
+        try
+            f(onc, client)
+        finally
+            close(client)
+            finalize(onc)
+        end
+    end
+
+    # Test finalizer of OnlineCluster
+    shmem_fixture() do handle
+        test_device = Device("Foo", "bar" => handle)
+
+        sim_onc_fixture([test_device], [port]) do onc, client
+            # Sanity check that the buffer is created
+            @test_nowarn SharedMemory(shmid(handle.buffer))
+        end
+
+        # After the above block ends the OnlineCluster should be finalized,
+        # deleting the buffer.
+        @test_throws SystemError SharedMemory(shmid(handle.buffer))
+    end
+
     # Create a mock online cluster with a single trainmatcher
-    sim_onc_test_state(devices, [port]) do onc, client
+    sim_onc_fixture(devices, [port]) do onc, client
         # Start it
         t = startonc(onc)
         @test istaskstarted(t)
@@ -281,33 +295,36 @@ end
         data, metadata = next(client)
 
         # Check that all the slow data properties are present
-        @test epix.name ∈ keys(data)
-        control_properties = [x[1][length(epix.name) + 2:end] for x in epix if ':' ∉ x[1]]
-        @test length(control_properties) == 4
-        for prop in control_properties
-            @test prop ∈ keys(data[epix.name])
-        end
+        for device in get_all_devices(devices)
+            control_properties = get_control_properties(device)
+            if !isempty(control_properties)
+                @test device.name ∈ keys(data)
 
-        # And the instrument sources
-        instrument_sources = unique([split(x[1], "[")[1] for x in epix if ':' ∈ x[1]])
-        @test length(instrument_sources) == 2
-        for source in instrument_sources
-            @test source ∈ keys(data)
+                for prop in control_properties
+                    @test prop ∈ keys(data[device.name])
+                end
+            end
 
-            source_properties = Dict(x for x in epix if startswith(x[1], source))
-            @test length(source_properties) > 0
-            for (key, prop_type) in pairs(source_properties)
-                # Check that the property is present
-                prop_name = split(key, '[')[2][1:end - 1]
-                @test prop_name ∈ keys(data[source])
+            # And the instrument sources
+            instrument_sources = get_instrument_sources(device)
+            for source in instrument_sources
+                @test source ∈ keys(data)
 
-                # And that arrays have the right shape
-                if prop_type isa Array && eltype(prop_type) <: Real
-                    # Note: the bridge client currently assumes that all arrays are
-                    # row-major (Python/numpy default), so the axis order will be
-                    # swapped to represent the array as a column-major Julia array.
-                    shape = Tuple(Int.(prop_type))
-                    @test size(data[source][prop_name]) == reverse(shape)
+                source_properties = Dict(x for x in device if startswith(x[1], source))
+                @test length(source_properties) > 0
+                for (key, prop_type) in pairs(source_properties)
+                    # Check that the property is present
+                    prop_name = split(key, '[')[2][1:end - 1]
+                    @test prop_name ∈ keys(data[source])
+
+                    # And that arrays have the right shape
+                    if prop_type isa Array && eltype(prop_type) <: Real
+                        # Note: the bridge client currently assumes that all arrays are
+                        # row-major (Python/numpy default), so the axis order will be
+                        # swapped to represent the array as a column-major Julia array.
+                        shape = Tuple(Int.(prop_type))
+                        @test size(data[source][prop_name]) == reverse(shape)
+                    end
                 end
             end
         end

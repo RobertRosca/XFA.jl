@@ -1,10 +1,9 @@
 using Printf
 
-export OnlineCluster, startonc, stoponc, generatemockdata, generatetrain
+export OnlineCluster, startonc, stoponc, get_all_devices, generatemockdata, generatetrain
 
 mutable struct OnlineCluster
     servers::Dict{String, KaraboBridgeServer}
-    all_devices::Vector{Device}
     single_devices::Vector{Device}
     device_groups::Vector{DeviceGroup}
     cal_machines::Int
@@ -34,14 +33,13 @@ mutable struct OnlineCluster
         single_devices = [d for d in devices_and_groups if d isa Device]
         device_groups = [d for d in devices_and_groups if d isa DeviceGroup]
 
-        all_devices = copy(single_devices)
-        for group in device_groups
-            append!(all_devices, group.devices)
-        end
-
-        new_onc = new(servers, all_devices, single_devices, device_groups, cal_machines, false, 1_000_000_000, 0)
+        new_onc = new(servers, single_devices, device_groups, cal_machines, false, 1_000_000_000, 0)
         return finalizer(new_onc) do onc
             close(new_onc)
+
+            for d in vcat(single_devices, device_groups)
+                finalize(d)
+            end
         end
     end
 end
@@ -52,22 +50,44 @@ function Base.close(onc::OnlineCluster)
     end
 end
 
-function generateproperty(type)
+function get_all_devices(devices_and_groups::Vector)
+    devices = Device[]
+
+    for d in devices_and_groups
+        if d isa Device
+            push!(devices, d)
+        elseif d isa DeviceGroup
+            append!(devices, d.devices)
+        else
+            throw(ArgumentError("Unrecognized object $(d) does not hold any devices"))
+        end
+    end
+
+    return devices
+end
+
+get_all_devices(onc::OnlineCluster) = get_all_devices(vcat(onc.single_devices, onc.device_groups))
+
+function generateproperty(value_hint)
     is_integer(dtype) = supertype(supertype(dtype)) == Integer
-    reasonable_rand(dtype) = is_integer(dtype) ? rand(Vector{type}(0:100)) : rand(type)
+    reasonable_rand(dtype) = is_integer(dtype) ? rand(Vector{value_hint}(0:100)) : rand(value_hint)
     reasonable_rand(dtype, dims) = is_integer(dtype) ? rand(Vector{dtype}(0:100), dims) : rand(dtype, dims)
 
-    if type isa DataType
-        return reasonable_rand(type)
-    elseif type isa Array
-        if isconcretetype(eltype(type)) && eltype(type) <: Number
-            dims = Tuple(Int(x) for x in type)
-            return reasonable_rand(eltype(type), dims)
+    if value_hint isa DataType
+        return reasonable_rand(value_hint)
+    elseif value_hint isa Array
+        if isconcretetype(eltype(value_hint)) && eltype(value_hint) <: Number
+            dims = Tuple(Int(x) for x in value_hint)
+            return reasonable_rand(eltype(value_hint), dims)
         else
-            return type
+            return value_hint
         end
-    elseif type isa Function
-        return type()
+    elseif value_hint isa ShmemHandle
+        return nextslot(value_hint)
+    elseif value_hint isa Function
+        return value_hint()
+    else
+        throw(ArgumentError("Could not generate property for value hint: $(value_hint)"))
     end
 end
 
@@ -107,14 +127,14 @@ function generatedevice(device::Device; timestamp=-1, trainid=0)
     return data, metadata
 end
 
-function generatetrain(single_devices::Vector{Device}, device_groups::Vector{DeviceGroup}, trainid=0)
+function generatetrain(onc::OnlineCluster)
+    timestamp = time()
+
     data = Dict()
     metadata = Dict()
 
-    timestamp = time()
-
-    # Generate the fake data
-    for device in single_devices
+    # Generate the fake trainmatcher data
+    for device in get_all_devices(onc)
         device_data, device_metadata = generatedevice(device; timestamp)
         merge!(data, device_data)
         merge!(metadata, device_metadata)
@@ -143,7 +163,7 @@ function startonc(onc::OnlineCluster, rate_hz::Real=10)
                     continue
                 end
 
-                data, metadata = generatetrain(onc.single_devices, onc.device_groups, onc.trainid)
+                data, metadata = generatetrain(onc)
 
                 # Send the data
                 put!(server, data, metadata)
