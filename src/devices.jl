@@ -1,4 +1,5 @@
 using Printf
+using InterProcessCommunication
 
 export Device, printschema, makedetector, makeagipd
 
@@ -16,13 +17,20 @@ export Device, printschema, makedetector, makeagipd
 
 Create an object representing a Karabo device, with property names and their types.
 """
-struct Device
+mutable struct Device
     name::String
     schema::Dict{String}
-    distributed_parts::Int
 
     function Device(name::String, schema::Pair{String}...)
-        new(name, Dict(schema), 0)
+        new_device = new(name, Dict(schema))
+
+        return finalizer(new_device) do device
+            for (property, value_hint) in device
+                if value_hint isa ShmemHandle
+                    finalize(value_hint)
+                end
+            end
+        end
     end
 end
 
@@ -37,7 +45,12 @@ struct DeviceGroup
                                 " this cannot be less than 1"))
         end
 
-        new(name, devices, distributed_parts)
+        new_dg = new(name, devices, distributed_parts)
+        return finalizer(new_dg) do dg
+            for device in dg.devices
+                finalize(device)
+            end
+        end
     end
 end
 
@@ -45,15 +58,24 @@ mutable struct ShmemHandle
     prefix::String
     num_slots::Int
     next_slot_index::Int
+    buffer::SharedMemory
+    array::WrappedArray
 
     function ShmemHandle(device_name::String, shape::Tuple;
-                         output_pipeline::String=":dataOutput", dtype=Float32, num_slots=10)
+                         output_pipeline::String="dataOutput", dtype=Float32, num_slots=10)
         shmem_name = "/" * replace("$(device_name):$(output_pipeline)", "/" => "_")
         dtype_str = type_to_dtype_str(dtype)
         shape_str = join((num_slots, shape...), ",")
         prefix = "$(shmem_name)\$$(dtype_str)\$$(shape_str)\$"
 
-        new(prefix, num_slots, 0)
+        buffer_size = prod(shape) * sizeof(dtype) * num_slots
+        buffer = SharedMemory(shmem_name, buffer_size)
+        array = WrappedArray(buffer, dtype, shape...)
+
+        new_handle = new(prefix, num_slots, 0, buffer, array)
+        return finalizer(new_handle) do handle
+            shmrm(handle.buffer)
+        end
     end
 end
 

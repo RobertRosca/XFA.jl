@@ -6,6 +6,7 @@ version = "0.1.0"
 [deps]
 Debugger = "31a5f54b-26ea-5ae9-a837-f05ce5417438"
 GLMakie = "e9467ef8-e4e7-5192-8a1a-b1aee30e663a"
+InterProcessCommunication = "a7427343-1d15-5490-a218-bfcb7db836a2"
 JET = "c3a54625-cd67-489e-a8e7-0a5a0ff4e31b"
 MsgPack = "99f44e22-a591-53d1-9472-aa23ef4bd671"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
