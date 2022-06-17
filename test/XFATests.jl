@@ -219,7 +219,7 @@ function sim_onc_test_state(f::Function, devices, ports)
 
     # Attach a client to the bridge server
     endpoint = first(keys(onc.servers))
-    client = KaraboBridgeClient(endpoint)
+    client = KaraboBridgeClient(endpoint; timeout=2)
 
     try
         f(onc, client)
