@@ -1,7 +1,10 @@
 using Printf
+using Random
+
+using EllipsisNotation
 using InterProcessCommunication
 
-export Device, ShmemHandle, get_instrument_sources, get_control_properties, printschema, makedetector, makeagipd
+export Device, ShmemHandle, get_instrument_sources, get_control_properties, printschema, makedetector, makeagipd, nextslot
 
 """
     Device("MID_EXP_EPIX-1/DET/RECEIVER", Dict(
@@ -60,34 +63,40 @@ end
 mutable struct ShmemHandle
     prefix::String
     num_slots::Int
-    next_slot_index::Int
+    current_slot_index::Int
     buffer::SharedMemory
     array::WrappedArray
+    generator::Function
 
-    function ShmemHandle(device_name::String, shape::Tuple;
+    function ShmemHandle(f::Function, device_name::String, shape::Tuple;
                          output_pipeline::String="dataOutput", dtype=Float32, num_slots=10)
         shmem_name = "/" * replace("$(device_name):$(output_pipeline)", "/" => "_")
         dtype_str = type_to_dtype_str(dtype)
-        shape_str = join((num_slots, shape...), ",")
+        shape_str = join((shape..., num_slots), ",")
         prefix = "$(shmem_name)\$$(dtype_str)\$$(shape_str)\$"
 
         buffer_size = prod(shape) * sizeof(dtype) * num_slots
         buffer = SharedMemory(shmem_name, buffer_size)
-        array = WrappedArray(buffer, dtype, shape...)
+        array = WrappedArray(buffer, dtype, shape..., num_slots)
 
-        new_handle = new(prefix, num_slots, 0, buffer, array)
+        new_handle = new(prefix, num_slots, 0, buffer, array, f)
         return finalizer(new_handle) do handle
             shmrm(handle.buffer)
         end
     end
 end
 
-function nextslot(handle::ShmemHandle)
-    shmem_name = handle.prefix * "$(handle.next_slot_index)"
+function ShmemHandle(device_name::String, shape::Tuple; dtype=Float32, kwargs...)
+    return ShmemHandle(device_name, shape; dtype, kwargs...) do trainid, out
+        rand!(out)
+    end
+end
 
-    handle.next_slot_index = (handle.next_slot_index % handle.num_slots) + 1
+function nextslot(handle::ShmemHandle, trainid::Int)
+    handle.current_slot_index = (handle.current_slot_index % handle.num_slots) + 1
+    handle.generator(trainid, @view handle.array[.., handle.current_slot_index])
 
-    return shmem_name
+    return handle.prefix * "$(handle.current_slot_index)"
 end
 
 function makedetector(prefix::String;

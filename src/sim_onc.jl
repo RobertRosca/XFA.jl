@@ -68,7 +68,7 @@ end
 
 get_all_devices(onc::OnlineCluster) = get_all_devices(vcat(onc.single_devices, onc.device_groups))
 
-function generateproperty(value_hint)
+function generateproperty(value_hint, trainid)
     is_integer(dtype) = supertype(supertype(dtype)) == Integer
     reasonable_rand(dtype) = is_integer(dtype) ? rand(Vector{value_hint}(0:100)) : rand(value_hint)
     reasonable_rand(dtype, dims) = is_integer(dtype) ? rand(Vector{dtype}(0:100), dims) : rand(dtype, dims)
@@ -83,7 +83,7 @@ function generateproperty(value_hint)
             return value_hint
         end
     elseif value_hint isa ShmemHandle
-        return nextslot(value_hint)
+        return nextslot(value_hint, trainid)
     elseif value_hint isa Function
         return value_hint()
     else
@@ -111,7 +111,7 @@ function generatedevice(device::Device; timestamp=-1, trainid=0)
         end
 
         source_dict = get!(data, source_name, Dict())
-        source_dict[prop_name] = generateproperty(prop_type)
+        source_dict[prop_name] = generateproperty(prop_type, trainid)
 
         # Add metadata
         if source_name ∉ keys(metadata)

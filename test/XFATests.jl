@@ -8,6 +8,7 @@ using Distributed
 
 using XFA
 using ReTest
+using EllipsisNotation
 using InterProcessCommunication
 
 function getavailableport(port_hint; interface=ip"127.0.0.1")
@@ -110,8 +111,13 @@ end
 # Helper function to handle setup/teardown. The main purpose of this is to
 # test ShmemHandle, so all other args/kwargs are forwarded to the
 # ShmemHandle constructor.
-function shmem_fixture(f::Function, name="foo", shape=(10, 10), args...; mkproc=false, kwargs...)
-    handle = ShmemHandle(name, shape, args...; kwargs...)
+function shmem_fixture(f::Function, name="foo", shape=(10, 10), args...; generator=nothing, mkproc=false, kwargs...)
+    if generator == nothing
+        handle = ShmemHandle(name, shape, args...; kwargs...)
+    else
+        handle = ShmemHandle(generator, name, shape, args...; kwargs...)
+    end
+
     module_path = dirname(@__DIR__)
     if mkproc
         pid = addprocs(1; exeflags="--project=$(module_path)")[1]
@@ -142,10 +148,11 @@ end
             @test_throws SystemError SharedMemory(shmid(handle.buffer))
         end
 
+        generator = (trainid, out) -> fill!(out, trainid)
         test_shape = (128, 512)
-        dtype = UInt8
-        num_slots = 20
-        shmem_fixture("foo", test_shape; mkproc=true, output_pipeline="bar", dtype, num_slots) do handle, pid
+        dtype = Float32
+        num_slots = 2
+        shmem_fixture("foo", test_shape; generator, mkproc=true, output_pipeline="bar", dtype, num_slots) do handle, pid
             # Check the shared mem ID
             @test shmid(handle.buffer) == "/foo:bar"
 
@@ -157,11 +164,25 @@ end
             @everywhere pid include(@__FILE__)
 
             remote_value = remotecall_fetch(access_shmem, pid,
-                                            shmid(handle.buffer), dtype, test_shape)
+                                            shmid(handle.buffer), dtype, (test_shape..., num_slots))
 
             # Check that that the other process can read from and write to the array
             @test remote_value == handle.array[1]
             @test handle.array[end] == handle.array[1] * 2
+
+            # Test data generation. Note that we hard-code the resulting string
+            # for the sake of clarity on what to expect it to look like, though
+            # the string will need to be updated if the tests are changed.
+            @test nextslot(handle, 1) == raw"/foo:bar$float32$128,512,2$1"
+            @test all(handle.array[.., 1] .== 1)
+
+            # Go to the next slot
+            @test nextslot(handle, 42) == raw"/foo:bar$float32$128,512,2$2"
+            @test all(handle.array[.., 2] .== 42)
+
+            # Wrap-around
+            @test nextslot(handle, 314) == raw"/foo:bar$float32$128,512,2$1"
+            @test all(handle.array[.., 1] .== 314)
         end
     end
 
