@@ -253,6 +253,53 @@ end
     end
 end
 
+@testset "trainmatching.jl" begin
+    # Initialize the matcher to look for only the slow data
+    tm = Trainmatcher([epix.name], 2)
+    data, metadata = XFA.generatedevice(epix; trainid=1)
+
+    matched_trains = match_train(tm, data, metadata)
+    @test length(matched_trains) == 1
+    @test epix.name ∈ keys(matched_trains[1][1])
+
+    # Now look for all the data
+    tm = Trainmatcher([epix.name, get_instrument_sources(epix)...], 2)
+    matched_trains = match_train(tm, data, metadata)
+    @test length(matched_trains) == 1
+    @test issetequal([epix.name, get_instrument_sources(epix)...], keys(matched_trains[1][1]))
+
+    # Configure it to look for both the epix and the motor
+    tm = Trainmatcher([epix.name, motor.name], 2)
+    matched_trains = match_train(tm, XFA.generatedevice(epix; trainid=1)...)
+
+    # Only the epix has been sent so far, so no trains should be matched
+    @test isempty(matched_trains)
+
+    # Now we add data from the motor and train 1 is fully matched
+    matched_trains = match_train(tm, XFA.generatedevice(motor; trainid=1)...)
+    @test length(matched_trains) == 1
+    @test [epix.name, motor.name] ⊆ keys(matched_trains[1][1])
+
+    # Advance by three trains with only epix data. The max_train_latency is 2 so
+    # nothing should be matched yet.
+    for tid in 2:4
+        matched_trains = match_train(tm, XFA.generatedevice(epix; trainid=tid)...)
+        @test isempty(matched_trains)
+    end
+
+    # But if we advance once more, the data for train 2 should be returned since
+    # it's passed the max_train_latency.
+    matched_trains = match_train(tm, XFA.generatedevice(epix; trainid=5)...)
+    @test length(matched_trains) == 1
+    @test 2 ∈ keys(matched_trains)
+
+    # And if we add motor data to the current oldest train, that train should be
+    # returned.
+    matched_trains = match_train(tm, XFA.generatedevice(motor; trainid=3)...)
+    @test length(matched_trains) == 1
+    @test 3 ∈ keys(matched_trains)
+end
+
 @testset "sim_onc.jl" begin
     # Create some devices
     devices = []
