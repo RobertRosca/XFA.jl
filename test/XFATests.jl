@@ -11,6 +11,24 @@ using ReTest
 using EllipsisNotation
 using InterProcessCommunication
 
+const epix = Device("MID_EXP_EPIX-1/DET/RECEIVER",
+                    ":foo" => (
+                        "bar" => Float16[100, 100],
+                        "baz" => Int),
+                    ":daqOutput" => (
+                        "data.image.pixels" => Float32[704, 768],
+                  "data.backTemp" => Float32),
+                    "rxConf" => (
+                        "rxLane" => Int,
+                        "rxVc" => Int,
+                        "save" => Bool),
+                    "relHumidity" => Float32)
+
+const motor = Device("MID_EXP_UPP/MOTOR/R1",
+                     "actualPosition" => Float32,
+                     "targetPosition" => Float32)
+
+
 function getavailableport(port_hint; interface=ip"127.0.0.1")
     port_range_end = min(65535, port_hint + 5000)
     available_port = -1
@@ -238,21 +256,6 @@ end
 @testset "sim_onc.jl" begin
     # Create some devices
     devices = []
-    epix = Device("MID_EXP_EPIX-1/DET/RECEIVER",
-                  ":foo" => (
-                      "bar" => Float16[100, 100],
-                      "baz" => Int),
-                  ":daqOutput" => (
-                      "data.image.pixels" => Float32[704, 768],
-                      "data.backTemp" => Float32),
-                  "rxConf" => (
-                      "rxLane" => Int,
-                      "rxVc" => Int,
-                      "save" => Bool),
-                  "relHumidity" => Float32)
-    motor = Device("MID_EXP_UPP/MOTOR/R1",
-                   "actualPosition" => Float32,
-                   "targetPosition" => Float32)
     push!(devices, epix)
 
     agipd = makeagipd("MID")
