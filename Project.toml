@@ -4,20 +4,21 @@ authors = ["JamesWrigley <james@puiterwijk.org>"]
 version = "0.1.0"
 
 [deps]
+CondaPkg = "992eb4ea-22a4-4c89-a5bb-47a3300528ab"
 Debugger = "31a5f54b-26ea-5ae9-a837-f05ce5417438"
 EllipsisNotation = "da5c29d0-fa7d-589e-88eb-ea29b0a81949"
 GLMakie = "e9467ef8-e4e7-5192-8a1a-b1aee30e663a"
 InterProcessCommunication = "a7427343-1d15-5490-a218-bfcb7db836a2"
-JET = "c3a54625-cd67-489e-a8e7-0a5a0ff4e31b"
 MsgPack = "99f44e22-a591-53d1-9472-aa23ef4bd671"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+PythonCall = "6099a3de-0909-46bc-b1f4-468b9a2dfc0d"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 ReTest = "e0db7c4e-2690-44b9-bad6-7687da720f89"
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
-UnicodePlots = "b8865327-cd53-5732-bb35-84acbb429228"
 ZMQ = "c2297ded-f4af-51ae-bb23-16f91089e4e1"
+ZeroMQ_jll = "8f1865be-045e-5c20-9c9f-bfbfb0764568"
 
 [compat]
 GLMakie = "0.7"
 InterProcessCommunication = "0.1"
-julia = "1.7"
+julia = "1.9"
