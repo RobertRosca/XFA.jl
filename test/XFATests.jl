@@ -411,19 +411,19 @@ end
 @testset "run_streamer.jl" begin
     @testset "mergechunks" begin
         # Small edge cases
-        @test XFA.mergechunks([0], [10]) == ([0], [10])
-        @test XFA.mergechunks([0, 10], [10, 5]) == ([0], [15])
-        @test XFA.mergechunks([0, 20], [10, 5]) == ([0, 20], [10, 5])
+        @test XFA.mergechunks([0], [10]) == ([0], [10], [1], [1])
+        @test XFA.mergechunks([0, 10], [10, 5]) == ([0], [15], [1], [2])
+        @test XFA.mergechunks([0, 20], [10, 5]) == ([0, 20], [10, 5], [1, 2], [1, 1])
 
         # Larger example with two chunks
         addrs = [0, 10, 20, 30, 50, 60]
         sizes = [10, 10, 10, 10, 10, 5]
-        @test XFA.mergechunks(addrs, sizes) == ([0, 50], [40, 15])
+        @test XFA.mergechunks(addrs, sizes) == ([0, 50], [40, 15], [1, 5], [4, 2])
 
         # Out of order chunks
         addrs = [20, 10]
         sizes = [10, 10]
-        @test XFA.mergechunks(addrs, sizes) == (addrs, sizes)
+        @test XFA.mergechunks(addrs, sizes) == (addrs, sizes, [1, 2], [1, 1])
     end
 
     @testset "loadchunks" begin
@@ -433,10 +433,10 @@ end
         # Create a dummy file containing an uncompressed float32 array and a
         # compressed uint16 array, to match the settings used by the calibration
         # pipeline.
-        float_data = rand(Float32, 128, 512, 10)
-        uint_data = rand(UInt16, size(float_data))
+        float_data = rand(Float32, 1, 2)
+        uint_data = rand(UInt16, 128, 512, 10)
         h5open(h5_path, "w") do f
-            f["float", chunk=(128, 512, 1)] = float_data
+            f["float", chunk=(1, 1)] = float_data
             f["uint", chunk=(128, 512, 1), shuffle=(), deflate=1] = uint_data
         end
 
