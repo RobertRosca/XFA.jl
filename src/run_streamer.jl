@@ -1,4 +1,5 @@
 using HDF5
+using Hwloc
 using LibDeflate
 using ThreadPinning
 
@@ -110,13 +111,47 @@ function loadchunks(ds::HDF5.Dataset, mapped_file::Vector{UInt8},
     chunk_groups = collect(Iterators.partition(1:length(merged_addrs),
                                                max(1, length(merged_addrs) ÷ n_readers)))
 
-    reader_tasks = [@tspawnat thread_id begin
-                        for i in group
-                            offset = dest_offsets[i]
-                            csize = merged_sizes[i]
+    decompression_buffers = [Vector{UInt8}(undef, chunk_size) for _ in 1:length(chunk_groups)]
+    # Check that the buffers are allocated at least a cacheline away
+    buffer_addrs = map(pointer, decompression_buffers)
+    buffer_shares_cacheline = [buffer_addrs[i] - buffer_addrs[i - 1] < cachelinesize().L1
+                               for i in 2:length(buffer_addrs)]
+    if any(buffer_shares_cacheline)
+        error("Decompression buffers sharing a cacheline")
+    end
 
-                            copyto!(chunks_dest, offset, mapped_file, merged_addrs[i] + 1, csize)
-                            put!(chunk_chnl, (i, offset, csize))
+    reader_tasks = [@tspawnat thread_id let thread_id = thread_id
+                        for i in group
+                            if is_compressed
+                                chunks_in_group = group_sizes[i]
+                                first_chunk = group_start_chunks[i]
+                                decompression_tmp::Vector{UInt8} = decompression_buffers[thread_id]
+
+                                c_offset = merged_addrs[i] + 1
+                                for group_chunk_idx in 1:chunks_in_group
+                                    global_chunk_idx = first_chunk + (group_chunk_idx - 1)
+                                    c_size = sizes[global_chunk_idx]
+
+                                    compressed_chunk = @view mapped_file[c_offset:c_offset + c_size - 1]
+                                    final_dest_addr = 1 + (global_chunk_idx - 1) * chunk_size
+                                    final_dest = @view dest[final_dest_addr:final_dest_addr + chunk_size - 1]
+
+                                    unsafe_zlib_decompress!(Base.HasLength(), codec,
+                                                            pointer(decompression_tmp), length(decompression_tmp),
+                                                            pointer(compressed_chunk), length(compressed_chunk))
+
+                                    deshuffle(decompression_tmp, final_dest, eltype_size)
+
+                                    c_offset += sizes[global_chunk_idx]
+                                end
+
+                            else
+                                offset = dest_offsets[i]
+                                csize = merged_sizes[i]
+
+                                copyto!(chunks_dest, offset, mapped_file, merged_addrs[i] + 1, csize)
+                            end
+                            # put!(chunk_chnl, (i, offset, csize))
                         end
                     end
                     for (thread_id, group) in enumerate(chunk_groups)]
@@ -130,31 +165,31 @@ function loadchunks(ds::HDF5.Dataset, mapped_file::Vector{UInt8},
         end
     end
 
-    decompression_tmp = Vector{UInt8}(undef, chunk_size)
-    for (i, dest_offset, size) in chunk_chnl
-        if is_compressed
-            chunks_in_group = group_sizes[i]
-            first_chunk = group_start_chunks[i]
+    # decompression_tmp = Vector{UInt8}(undef, chunk_size)
+    # for (i, dest_offset, size) in chunk_chnl
+    #     if is_compressed
+    #         chunks_in_group = group_sizes[i]
+    #         first_chunk = group_start_chunks[i]
 
-            c_offset = dest_offset
-            for group_chunk_idx in 1:chunks_in_group
-                global_chunk_idx = first_chunk + (group_chunk_idx - 1)
-                c_size = sizes[global_chunk_idx]
+    #         c_offset = dest_offset
+    #         for group_chunk_idx in 1:chunks_in_group
+    #             global_chunk_idx = first_chunk + (group_chunk_idx - 1)
+    #             c_size = sizes[global_chunk_idx]
 
-                compressed_chunk = @view chunks_dest[c_offset:c_offset + c_size - 1]
-                final_dest_addr = 1 + (global_chunk_idx - 1) * chunk_size
-                final_dest = @view dest[final_dest_addr:final_dest_addr + chunk_size - 1]
+    #             compressed_chunk = @view chunks_dest[c_offset:c_offset + c_size - 1]
+    #             final_dest_addr = 1 + (global_chunk_idx - 1) * chunk_size
+    #             final_dest = @view dest[final_dest_addr:final_dest_addr + chunk_size - 1]
 
-                unsafe_zlib_decompress!(Base.HasLength(), codec,
-                                        pointer(decompression_tmp), length(decompression_tmp),
-                                        pointer(compressed_chunk), length(compressed_chunk))
+    #             unsafe_zlib_decompress!(Base.HasLength(), codec,
+    #                                     pointer(decompression_tmp), length(decompression_tmp),
+    #                                     pointer(compressed_chunk), length(compressed_chunk))
 
-                deshuffle(decompression_tmp, final_dest, eltype_size)
+    #             deshuffle(decompression_tmp, final_dest, eltype_size)
 
-                c_offset += sizes[global_chunk_idx]
-            end
-        end
-    end
+    #             c_offset += sizes[global_chunk_idx]
+    #         end
+    #     end
+    # end
 
     fetch(fetcher)
 
