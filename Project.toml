@@ -4,6 +4,7 @@ authors = ["JamesWrigley <james@puiterwijk.org>"]
 version = "0.1.0"
 
 [deps]
+ChunkSplitters = "ae650224-84b6-46f8-82ea-d812ca08434e"
 CondaPkg = "992eb4ea-22a4-4c89-a5bb-47a3300528ab"
 Debugger = "31a5f54b-26ea-5ae9-a837-f05ce5417438"
 Distributed = "8ba89e20-285c-5b6f-9357-94700520ee1b"

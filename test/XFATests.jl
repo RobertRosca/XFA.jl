@@ -433,11 +433,11 @@ end
         # Create a dummy file containing an uncompressed float32 array and a
         # compressed uint16 array, to match the settings used by the calibration
         # pipeline.
-        float_data = rand(Float32, 1, 2)
+        float_data = rand(Float32, 2, 1)
         uint_data = rand(UInt16, 128, 512, 10)
         h5open(h5_path, "w") do f
             f["float", chunk=(1, 1)] = float_data
-            f["uint", chunk=(128, 512, 1), shuffle=(), deflate=1] = uint_data
+            f["uint", chunk=(128, 512, 1), shuffle=true, deflate=1] = uint_data
         end
 
         f = h5open(h5_path)
@@ -449,7 +449,7 @@ end
         dest = XFA.loadchunks(float_ds, mapped_file, addrs, sizes)
         loaded_float_data = reinterpret(eltype(float_data), dest)
 
-        @test vec(float_data) == loaded_float_data
+        @test float_data == loaded_float_data
 
         # Load the integer data
         uint_ds = f["uint"]
@@ -457,10 +457,36 @@ end
 
         dest = XFA.loadchunks(uint_ds, mapped_file, addrs, sizes)
         loaded_uint_data = reinterpret(eltype(uint_data), dest)
-        @test vec(uint_data) == loaded_uint_data
+        @test uint_data == loaded_uint_data
 
         close(f)
         rm(tmp_dir; recursive=true)
+    end
+
+    @testset "deshuffle" begin
+        # Test deshuffling a single-element array
+        data = UInt8[0x1, 0x2]
+        out = UInt16[0]
+        XFA.deshuffle(data, out)
+
+        out_bytes = reinterpret(UInt8, out)
+        @test out_bytes == UInt8[0x1, 0x2]
+
+        # Test deshuffling 2-byte types, in this case UInt16
+        data = UInt8[0x1, 0x2, 0x3, 0x4]
+        out = Vector{UInt16}(undef, length(data) ÷ 2)
+        XFA.deshuffle(data, out)
+
+        out_bytes = reinterpret(UInt8, out)
+        @test out_bytes == UInt8[0x1, 0x3, 0x2, 0x4]
+
+        # Now with UInt32, a 4-byte type
+        data = UInt8[0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8]
+        out = Vector{UInt32}(undef, length(data) ÷ 4)
+        XFA.deshuffle(data, out)
+
+        out_bytes = reinterpret(UInt8, out)
+        @test out_bytes == UInt8[0x1, 0x3, 0x5, 0x7, 0x2, 0x4, 0x6, 0x8]
     end
 end
 

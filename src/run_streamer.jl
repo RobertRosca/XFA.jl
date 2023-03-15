@@ -4,7 +4,8 @@ using HDF5
 using Hwloc
 using LibDeflate
 using ThreadPinning
-
+using ChunkSplitters
+using EllipsisNotation
 
 function mergechunks(addrs, sizes)
     if length(addrs) != length(sizes)
@@ -93,14 +94,14 @@ function deshuffle_impl(data, out::Type{A}) where A <: AbstractArray{T} where T
     eltype_size = sizeof(T)
 
     quote
-        byte_stride = length(data) ÷ $eltype_size
+        byte_stride = length(out)
+        # @show byte_stride, $eltype_size
         GC.@preserve out begin
             out_ptr = Base.unsafe_convert(Ptr{UInt8}, out)
-            out_bytes = unsafe_wrap(Array, out_ptr, sizeof(out))
+            out_bytes = unsafe_wrap(Array, out_ptr, length(data))
 
-            @inbounds for i in 1:byte_stride
+            for i in 1:byte_stride
                 out_i = 1 + (i - 1) * $eltype_size
-
                 Base.Cartesian.@nexprs $eltype_size j -> out_bytes[out_i + j - 1] = data[i + ((j - 1) * byte_stride)]
             end
         end
@@ -120,6 +121,15 @@ function iscompressed(ds::HDF5.Dataset)
     return Filters.Deflate in filter_types
 end
 
+function decompresschunk!(codec, compressed_chunk, chunk_dest, decompression_tmp)
+    decomp_ret = zlib_decompress!(codec, decompression_tmp, compressed_chunk, length(decompression_tmp))
+    if !(decomp_ret isa Int)
+        error("Decompression error: $(decomp_ret)")
+    end
+
+    deshuffle(decompression_tmp, chunk_dest)
+end
+
 function loadchunks(ds::HDF5.Dataset, mapped_file::Vector{UInt8},
                     addrs, sizes, dest=nothing;
                     n_readers::Int=-1)
@@ -137,18 +147,19 @@ function loadchunks(ds::HDF5.Dataset, mapped_file::Vector{UInt8},
     eltype_size::Int = sizeof(eltype(ds))
     n_bytes::Int = prod(size(ds)) * eltype_size
 
-    if dest === nothing
-        dest = Vector{UInt8}(undef, n_bytes)
-    end
-
-    if length(dest) != n_bytes
-        throw(ArgumentError("dest buffer can only hold $(length(dest)) elements, but it must have at least $(n_bytes)"))
-    end
-
     ds_properties = HDF5.get_create_properties(ds)
     chunk_size::Int = prod(ds_properties.chunk) * sizeof(eltype(ds))
 
-    codec = Decompressor()
+    if dest === nothing
+        dest = Array{eltype(ds)}(undef, (ds_properties.chunk..., HDF5.get_num_chunks(ds)))
+    end
+    dest_bytes = reinterpret(UInt8, dest)
+
+    if length(dest_bytes) != n_bytes
+        throw(ArgumentError("dest buffer can only hold $(length(dest)) elements, but it must have at least $(prod(size(ds)))"))
+    end
+
+    codecs = [Decompressor() for _ in 1:n_readers]
     is_compressed = false
     filters = ds_properties.filters
     if length(filters) > 0
@@ -160,20 +171,10 @@ function loadchunks(ds::HDF5.Dataset, mapped_file::Vector{UInt8},
         end
     end
 
-    chunks_dest = if is_compressed
-        Vector{UInt8}(undef, sum(sizes))
-    else
-        dest
-    end
+    chunk_offsets = 1 .+ circshift(cumsum(sizes), 1)
+    chunk_offsets[1] = 1
 
-    chunk_chnl = Channel{Tuple{Int, UInt64, UInt64}}(1000)
-
-    dest_offsets = 1 .+ circshift(cumsum(sizes), 1)
-    dest_offsets[1] = 1
-    chunk_groups = collect(Iterators.partition(1:length(merged_addrs),
-                                               max(1, length(merged_addrs) ÷ n_readers)))
-
-    decompression_buffers = [Vector{UInt8}(undef, chunk_size) for _ in 1:length(chunk_groups)]
+    decompression_buffers = [Vector{UInt8}(undef, chunk_size) for _ in 1:n_readers]
     # Check that the buffers are allocated at least a cacheline away
     buffer_addrs = map(pointer, decompression_buffers)
     buffer_shares_cacheline = [buffer_addrs[i] - buffer_addrs[i - 1] < cachelinesize().L1
@@ -182,80 +183,15 @@ function loadchunks(ds::HDF5.Dataset, mapped_file::Vector{UInt8},
         error("Decompression buffers sharing a cacheline")
     end
 
-    reader_tasks = [@tspawnat thread_id let thread_id = thread_id
-                        for i in group
-                            if is_compressed
-                                chunks_in_group = group_sizes[i]
-                                first_chunk = group_start_chunks[i]
-                                decompression_tmp::Vector{UInt8} = decompression_buffers[thread_id]
+    @sync for (idxs, thread_id) in chunks(merged_addrs, n_readers, :batch)
+        @tspawnat thread_id for chunk_group_idx in idxs
+            group_addr = merged_addrs[chunk_group_idx] + 1
+            group_size = merged_sizes[chunk_group_idx]
 
-                                c_offset = merged_addrs[i] + 1
-                                for group_chunk_idx in 1:chunks_in_group
-                                    global_chunk_idx = first_chunk + (group_chunk_idx - 1)
-                                    c_size = sizes[global_chunk_idx]
-
-                                    compressed_chunk = @view mapped_file[c_offset:c_offset + c_size - 1]
-                                    final_dest_addr = 1 + (global_chunk_idx - 1) * chunk_size
-                                    final_dest = @view dest[final_dest_addr:final_dest_addr + chunk_size - 1]
-                                    final_dest_typed = reinterpret(eltype(ds), final_dest)
-
-                                    unsafe_zlib_decompress!(Base.HasLength(), codec,
-                                                            pointer(decompression_tmp), length(decompression_tmp),
-                                                            pointer(compressed_chunk), length(compressed_chunk))
-
-                                    deshuffle(decompression_tmp, final_dest_typed)
-
-                                    c_offset += sizes[global_chunk_idx]
-                                end
-
-                            else
-                                offset = dest_offsets[i]
-                                csize = merged_sizes[i]
-
-                                copyto!(chunks_dest, offset, mapped_file, merged_addrs[i] + 1, csize)
-                            end
-                            # put!(chunk_chnl, (i, offset, csize))
-                        end
-                    end
-                    for (thread_id, group) in enumerate(chunk_groups)]
-
-    fetcher = Threads.@spawn begin
-        try
-            foreach(fetch, reader_tasks)
-        catch e
-            throw(e)
-        finally
-            close(chunk_chnl)
+            offset = chunk_offsets[group_start_chunks[chunk_group_idx]]
+            copyto!(dest_bytes, offset, mapped_file, group_addr, group_size)
         end
     end
 
-    # decompression_tmp = Vector{UInt8}(undef, chunk_size)
-    # for (i, dest_offset, size) in chunk_chnl
-    #     if is_compressed
-    #         chunks_in_group = group_sizes[i]
-    #         first_chunk = group_start_chunks[i]
-
-    #         c_offset = dest_offset
-    #         for group_chunk_idx in 1:chunks_in_group
-    #             global_chunk_idx = first_chunk + (group_chunk_idx - 1)
-    #             c_size = sizes[global_chunk_idx]
-
-    #             compressed_chunk = @view chunks_dest[c_offset:c_offset + c_size - 1]
-    #             final_dest_addr = 1 + (global_chunk_idx - 1) * chunk_size
-    #             final_dest = @view dest[final_dest_addr:final_dest_addr + chunk_size - 1]
-
-    #             unsafe_zlib_decompress!(Base.HasLength(), codec,
-    #                                     pointer(decompression_tmp), length(decompression_tmp),
-    #                                     pointer(compressed_chunk), length(compressed_chunk))
-
-    #             deshuffle(decompression_tmp, final_dest, eltype_size)
-
-    #             c_offset += sizes[global_chunk_idx]
-    #         end
-    #     end
-    # end
-
-    fetch(fetcher)
-
-    return dest
+    return reshape(dest, size(ds))
 end
