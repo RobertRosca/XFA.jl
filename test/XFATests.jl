@@ -437,7 +437,7 @@ end
         uint_data = rand(UInt16, 128, 512, 10)
         h5open(h5_path, "w") do f
             f["float", chunk=(1, 1)] = float_data
-            f["uint", chunk=(128, 512, 1), shuffle=true, deflate=1] = uint_data
+            f["uint", chunk=(128, 512, 1), shuffle=true, deflate=1, filters=[Filters.Fletcher32()]] = uint_data
         end
 
         f = h5open(h5_path)

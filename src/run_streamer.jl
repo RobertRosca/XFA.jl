@@ -48,6 +48,13 @@ function getchunkaddrs(ds::HDF5.Dataset)
         sizes[i] = info.size
     end
 
+    # If fletcher32 checksums are enabled, the last 4 bytes will be the checksum
+    # and should be skipped.
+    filters = typeof.(HDF5.get_create_properties(ds).filters)
+    if Filters.Fletcher32 in filters
+        sizes .-= 4
+    end
+
     return (addrs, sizes)
 end
 
@@ -164,8 +171,8 @@ function loadchunks(ds::HDF5.Dataset, mapped_file::Vector{UInt8},
     filters = ds_properties.filters
     if length(filters) > 0
         filter_types = typeof.(filters)
-        if length(filters) != 2 || !(Filters.Shuffle in filter_types && Filters.Deflate in filter_types)
-            error("Dataset $(HDF5.name(ds)) has filters enabled, which are not currently supported")
+        if Filters.Shuffle in filter_types && Filters.Deflate in filter_types
+            error("Dataset $(HDF5.name(ds)) is compressed, which is not currently supported: $(filters)")
         else
             is_compressed = true
         end
