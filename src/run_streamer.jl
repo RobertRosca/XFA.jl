@@ -160,7 +160,9 @@ function loadchunks(ds::HDF5.Dataset, mapped_file::Vector{UInt8},
     if dest === nothing
         dest = Array{eltype(ds)}(undef, (ds_properties.chunk..., HDF5.get_num_chunks(ds)))
     end
-    dest_bytes = reinterpret(UInt8, dest)
+
+    dest_ptr = Base.unsafe_convert(Ptr{UInt8}, dest)
+    dest_bytes = unsafe_wrap(Array, dest_ptr, sizeof(dest))
 
     if length(dest_bytes) != n_bytes
         throw(ArgumentError("dest buffer can only hold $(length(dest)) elements, but it must have at least $(prod(size(ds)))"))
@@ -196,7 +198,7 @@ function loadchunks(ds::HDF5.Dataset, mapped_file::Vector{UInt8},
             group_size = merged_sizes[chunk_group_idx]
 
             offset = chunk_offsets[group_start_chunks[chunk_group_idx]]
-            copyto!(dest_bytes, offset, mapped_file, group_addr, group_size)
+            unsafe_copyto!(dest_bytes, offset, mapped_file, group_addr, group_size)
         end
     end
 
