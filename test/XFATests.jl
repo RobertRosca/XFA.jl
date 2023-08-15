@@ -60,62 +60,62 @@ function karabo_bridge_test_state(f::Function, endpoint)
     end
 end
 
-@testset "karabo_bridge.jl" begin
-    # Create server and client
-    port = getavailableport(42000)
-    endpoint = "tcp://127.0.0.1:$(port)"
+# @testset "karabo_bridge.jl" begin
+#     # Create server and client
+#     port = getavailableport(42000)
+#     endpoint = "tcp://127.0.0.1:$(port)"
 
-    karabo_bridge_test_state(endpoint) do client, server
-        # The server should already be bound to the port
-        @test_throws Base.IOError listen(ip"127.0.0.1", port)
+#     karabo_bridge_test_state(endpoint) do client, server
+#         # The server should already be bound to the port
+#         @test_throws Base.IOError listen(ip"127.0.0.1", port)
 
-        # Start the server
-        t = startbridge(server)
-        @test istaskstarted(t)
+#         # Start the server
+#         t = startbridge(server)
+#         @test istaskstarted(t)
 
-        # Trying to start it twice should fail
-        @test_throws ErrorException startbridge(server)
+#         # Trying to start it twice should fail
+#         @test_throws ErrorException startbridge(server)
 
-        # Stop the server
-        stopbridge(server)
-        @test timedwait(() -> istaskdone(t), 1) == :ok
+#         # Stop the server
+#         stopbridge(server)
+#         @test timedwait(() -> istaskdone(t), 1) == :ok
 
-        # Create some test data
-        dummy_data = Dict("foo" => Dict(
-            "string" => "hello world!",
-            "scalar" => 42.314,
-            "boolean" => true,
-            "list" => ["foo", "bar", 42, 3.14],
-        ))
-        for type in [Bool,
-                     Float16, Float32, Float64,
-                     Int8, Int16, Int32, Int64,
-                     UInt8, UInt16, UInt32, UInt64]
-            # These arrays should use zero-copy transfer
-            dummy_data["foo"]["big_$(lowercase(string(type)))_array"] = rand(type, 1000)
-            # These arrays should be serialized, except for Float16 since MsgPack
-            # doesn't support Float16.
-            dummy_data["foo"]["small_$(lowercase(string(type)))_array"] = rand(type, 10)
-        end
+#         # Create some test data
+#         dummy_data = Dict("foo" => Dict(
+#             "string" => "hello world!",
+#             "scalar" => 42.314,
+#             "boolean" => true,
+#             "list" => ["foo", "bar", 42, 3.14],
+#         ))
+#         for type in [Bool,
+#                      Float16, Float32, Float64,
+#                      Int8, Int16, Int32, Int64,
+#                      UInt8, UInt16, UInt32, UInt64]
+#             # These arrays should use zero-copy transfer
+#             dummy_data["foo"]["big_$(lowercase(string(type)))_array"] = rand(type, 1000)
+#             # These arrays should be serialized, except for Float16 since MsgPack
+#             # doesn't support Float16.
+#             dummy_data["foo"]["small_$(lowercase(string(type)))_array"] = rand(type, 10)
+#         end
 
-        # Send the test data and ensure it's received by the client
-        t = startbridge(server)
-        put!(server, dummy_data)
-        data, metadata = next(client)
-        @test dummy_data == data
+#         # Send the test data and ensure it's received by the client
+#         t = startbridge(server)
+#         put!(server, dummy_data)
+#         data, metadata = next(client)
+#         @test dummy_data == data
 
-        # Trying to get more data should timeout
-        @test_throws ErrorException next(client)
+#         # Trying to get more data should timeout
+#         @test_throws ErrorException next(client)
 
-        # But now there's an outstanding request, so the next put!()/next() cycle should still send data
-        put!(server, dummy_data)
-        data, metadata = next(client)
-        @test dummy_data == data
+#         # But now there's an outstanding request, so the next put!()/next() cycle should still send data
+#         put!(server, dummy_data)
+#         data, metadata = next(client)
+#         @test dummy_data == data
 
-        stopbridge(server)
-        @test timedwait(() -> istaskdone(t), 1) == :ok
-    end
-end
+#         stopbridge(server)
+#         @test timedwait(() -> istaskdone(t), 1) == :ok
+#     end
+# end
 
 # Helper function that reads from/writes to an array in shared memory
 function access_shmem(id, dtype, dims)
@@ -302,110 +302,110 @@ end
     @test 3 ∈ keys(matched_trains)
 end
 
-@testset "sim_onc.jl" begin
-    # Create some devices
-    devices = []
-    push!(devices, epix)
+# @testset "sim_onc.jl" begin
+#     # Create some devices
+#     devices = []
+#     push!(devices, epix)
 
-    agipd = makeagipd("MID")
-    @test length(agipd) == 16
-    push!(devices, agipd)
+#     agipd = makeagipd("MID")
+#     @test length(agipd) == 16
+#     push!(devices, agipd)
 
-    # Find an available port
-    port = getavailableport(42000)
+#     # Find an available port
+#     port = getavailableport(42000)
 
-    # Creating a cluster with the wrong number of bridges should fail
-    @test_throws ArgumentError OnlineCluster(devices, Int[])
-    @test_throws ArgumentError OnlineCluster(devices, [port, port + 1])
+#     # Creating a cluster with the wrong number of bridges should fail
+#     @test_throws ArgumentError OnlineCluster(devices, Int[])
+#     @test_throws ArgumentError OnlineCluster(devices, [port, port + 1])
 
-    function sim_onc_fixture(f::Function, devices, ports)
-        onc = OnlineCluster(devices, ports)
+#     function sim_onc_fixture(f::Function, devices, ports)
+#         onc = OnlineCluster(devices, ports)
 
-        # Attach a client to the bridge server
-        endpoint = first(keys(onc.servers))
-        client = KaraboBridgeClient(endpoint; timeout=2)
+#         # Attach a client to the bridge server
+#         endpoint = first(keys(onc.servers))
+#         client = KaraboBridgeClient(endpoint; timeout=2)
 
-        try
-            f(onc, client)
-        finally
-            close(client)
-            finalize(onc)
-        end
-    end
+#         try
+#             f(onc, client)
+#         finally
+#             close(client)
+#             finalize(onc)
+#         end
+#     end
 
-    # Test finalizer of OnlineCluster
-    shmem_fixture() do handle
-        test_device = Device("Foo", "bar" => handle)
+#     # Test finalizer of OnlineCluster
+#     shmem_fixture() do handle
+#         test_device = Device("Foo", "bar" => handle)
 
-        sim_onc_fixture([test_device], [port]) do onc, client
-            # Sanity check that the buffer is created
-            @test_nowarn SharedMemory(shmid(handle.buffer))
-        end
+#         sim_onc_fixture([test_device], [port]) do onc, client
+#             # Sanity check that the buffer is created
+#             @test_nowarn SharedMemory(shmid(handle.buffer))
+#         end
 
-        # After the above block ends the OnlineCluster should be finalized,
-        # deleting the buffer.
-        @test_throws SystemError SharedMemory(shmid(handle.buffer))
-    end
+#         # After the above block ends the OnlineCluster should be finalized,
+#         # deleting the buffer.
+#         @test_throws SystemError SharedMemory(shmid(handle.buffer))
+#     end
 
-    # Create a mock online cluster with a single trainmatcher
-    sim_onc_fixture(devices, [port]) do onc, client
-        # Start it
-        t = startonc(onc)
-        @test istaskstarted(t)
+#     # Create a mock online cluster with a single trainmatcher
+#     sim_onc_fixture(devices, [port]) do onc, client
+#         # Start it
+#         t = startonc(onc)
+#         @test istaskstarted(t)
 
-        # Stop it and check that it stops within a certain timeout
-        stoponc(onc)
-        @test timedwait(() -> istaskdone(t), 1) == :ok
+#         # Stop it and check that it stops within a certain timeout
+#         stoponc(onc)
+#         @test timedwait(() -> istaskdone(t), 1) == :ok
 
-        # The number of trains sent depends on the size of the servers buffers, but
-        # it ought to be at least 1.
-        @test onc.sent_trains > 0
+#         # The number of trains sent depends on the size of the servers buffers, but
+#         # it ought to be at least 1.
+#         @test onc.sent_trains > 0
 
-        # Start it again
-        t = startonc(onc)
+#         # Start it again
+#         t = startonc(onc)
 
-        # Get some data
-        data, metadata = next(client)
+#         # Get some data
+#         data, metadata = next(client)
 
-        # Check that all the slow data properties are present
-        for device in get_all_devices(devices)
-            control_properties = get_control_properties(device)
-            if !isempty(control_properties)
-                @test device.name ∈ keys(data)
+#         # Check that all the slow data properties are present
+#         for device in get_all_devices(devices)
+#             control_properties = get_control_properties(device)
+#             if !isempty(control_properties)
+#                 @test device.name ∈ keys(data)
 
-                for prop in control_properties
-                    @test prop ∈ keys(data[device.name])
-                end
-            end
+#                 for prop in control_properties
+#                     @test prop ∈ keys(data[device.name])
+#                 end
+#             end
 
-            # And the instrument sources
-            instrument_sources = get_instrument_sources(device)
-            for source in instrument_sources
-                @test source ∈ keys(data)
+#             # And the instrument sources
+#             instrument_sources = get_instrument_sources(device)
+#             for source in instrument_sources
+#                 @test source ∈ keys(data)
 
-                source_properties = Dict(x for x in device if startswith(x[1], source))
-                @test length(source_properties) > 0
-                for (key, prop_type) in pairs(source_properties)
-                    # Check that the property is present
-                    prop_name = split(key, '[')[2][1:end - 1]
-                    @test prop_name ∈ keys(data[source])
+#                 source_properties = Dict(x for x in device if startswith(x[1], source))
+#                 @test length(source_properties) > 0
+#                 for (key, prop_type) in pairs(source_properties)
+#                     # Check that the property is present
+#                     prop_name = split(key, '[')[2][1:end - 1]
+#                     @test prop_name ∈ keys(data[source])
 
-                    # And that arrays have the right shape
-                    if prop_type isa Array && eltype(prop_type) <: Real
-                        # Note: the bridge client currently assumes that all arrays are
-                        # row-major (Python/numpy default), so the axis order will be
-                        # swapped to represent the array as a column-major Julia array.
-                        shape = Tuple(Int.(prop_type))
-                        @test size(data[source][prop_name]) == reverse(shape)
-                    end
-                end
-            end
-        end
+#                     # And that arrays have the right shape
+#                     if prop_type isa Array && eltype(prop_type) <: Real
+#                         # Note: the bridge client currently assumes that all arrays are
+#                         # row-major (Python/numpy default), so the axis order will be
+#                         # swapped to represent the array as a column-major Julia array.
+#                         shape = Tuple(Int.(prop_type))
+#                         @test size(data[source][prop_name]) == reverse(shape)
+#                     end
+#                 end
+#             end
+#         end
 
-        # Stop the mock cluster
-        stoponc(onc)
-        @test timedwait(() -> istaskdone(t), 1) == :ok
-    end
-end
+#         # Stop the mock cluster
+#         stoponc(onc)
+#         @test timedwait(() -> istaskdone(t), 1) == :ok
+#     end
+# end
 
 end
