@@ -5,23 +5,16 @@ version = "0.1.0"
 
 [deps]
 CondaPkg = "992eb4ea-22a4-4c89-a5bb-47a3300528ab"
-Debugger = "31a5f54b-26ea-5ae9-a837-f05ce5417438"
 Distributed = "8ba89e20-285c-5b6f-9357-94700520ee1b"
 EllipsisNotation = "da5c29d0-fa7d-589e-88eb-ea29b0a81949"
-HDF5 = "f67ccb44-e63f-5c2f-98bd-6dc0ccc4ba2f"
-Hwloc = "0e44f5e4-bd66-52a0-8798-143a42290a1d"
 InterProcessCommunication = "a7427343-1d15-5490-a218-bfcb7db836a2"
-LibDeflate = "9255714d-24a7-4b30-8ea3-d46a97f7e13b"
-Mmap = "a63ad114-7e13-5084-954f-fe012c677804"
 MsgPack = "99f44e22-a591-53d1-9472-aa23ef4bd671"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 PythonCall = "6099a3de-0909-46bc-b1f4-468b9a2dfc0d"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 ReTest = "e0db7c4e-2690-44b9-bad6-7687da720f89"
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
-ThreadPinning = "811555cd-349b-4f26-b7bc-1f208b848042"
 ZMQ = "c2297ded-f4af-51ae-bb23-16f91089e4e1"
-ZeroMQ_jll = "8f1865be-045e-5c20-9c9f-bfbfb0764568"
 
 [compat]
 InterProcessCommunication = "0.1"
