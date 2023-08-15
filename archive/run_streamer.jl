@@ -204,3 +204,85 @@ function loadchunks(ds::HDF5.Dataset, mapped_file::Vector{UInt8},
 
     return reshape(dest, size(ds))
 end
+
+@testset "run_streamer.jl" begin
+    @testset "mergechunks" begin
+        # Small edge cases
+        @test XFA.mergechunks([0], [10]) == ([0], [10], [1], [1])
+        @test XFA.mergechunks([0, 10], [10, 5]) == ([0], [15], [1], [2])
+        @test XFA.mergechunks([0, 20], [10, 5]) == ([0, 20], [10, 5], [1, 2], [1, 1])
+
+        # Larger example with two chunks
+        addrs = [0, 10, 20, 30, 50, 60]
+        sizes = [10, 10, 10, 10, 10, 5]
+        @test XFA.mergechunks(addrs, sizes) == ([0, 50], [40, 15], [1, 5], [4, 2])
+
+        # Out of order chunks
+        addrs = [20, 10]
+        sizes = [10, 10]
+        @test XFA.mergechunks(addrs, sizes) == (addrs, sizes, [1, 2], [1, 1])
+    end
+
+    @testset "loadchunks" begin
+        tmp_dir = mktempdir()
+        h5_path = joinpath(tmp_dir, "foo.h5")
+
+        # Create a dummy file containing an uncompressed float32 array and a
+        # compressed uint16 array, to match the settings used by the calibration
+        # pipeline.
+        float_data = rand(Float32, 2, 1)
+        uint_data = rand(UInt16, 128, 512, 10)
+        h5open(h5_path, "w") do f
+            f["float", chunk=(1, 1)] = float_data
+            f["uint", chunk=(128, 512, 1), shuffle=true, deflate=1, filters=[Filters.Fletcher32()]] = uint_data
+        end
+
+        f = h5open(h5_path)
+        mapped_file = mmap(h5_path)
+
+        # Load the float data
+        float_ds = f["float"]
+        addrs, sizes = XFA.getchunkaddrs(float_ds)
+        dest = XFA.loadchunks(float_ds, mapped_file, addrs, sizes)
+        loaded_float_data = reinterpret(eltype(float_data), dest)
+
+        @test float_data == loaded_float_data
+
+        # Load the integer data
+        uint_ds = f["uint"]
+        addrs, sizes = XFA.getchunkaddrs(uint_ds)
+
+        dest = XFA.loadchunks(uint_ds, mapped_file, addrs, sizes)
+        loaded_uint_data = reinterpret(eltype(uint_data), dest)
+        @test uint_data == loaded_uint_data
+
+        close(f)
+        rm(tmp_dir; recursive=true)
+    end
+
+    @testset "deshuffle" begin
+        # Test deshuffling a single-element array
+        data = UInt8[0x1, 0x2]
+        out = UInt16[0]
+        XFA.deshuffle(data, out)
+
+        out_bytes = reinterpret(UInt8, out)
+        @test out_bytes == UInt8[0x1, 0x2]
+
+        # Test deshuffling 2-byte types, in this case UInt16
+        data = UInt8[0x1, 0x2, 0x3, 0x4]
+        out = Vector{UInt16}(undef, length(data) ÷ 2)
+        XFA.deshuffle(data, out)
+
+        out_bytes = reinterpret(UInt8, out)
+        @test out_bytes == UInt8[0x1, 0x3, 0x2, 0x4]
+
+        # Now with UInt32, a 4-byte type
+        data = UInt8[0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8]
+        out = Vector{UInt32}(undef, length(data) ÷ 4)
+        XFA.deshuffle(data, out)
+
+        out_bytes = reinterpret(UInt8, out)
+        @test out_bytes == UInt8[0x1, 0x3, 0x5, 0x7, 0x2, 0x4, 0x6, 0x8]
+    end
+end
