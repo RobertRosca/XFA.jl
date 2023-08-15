@@ -6,7 +6,6 @@ version = "0.1.0"
 [deps]
 ChunkSplitters = "ae650224-84b6-46f8-82ea-d812ca08434e"
 CondaPkg = "992eb4ea-22a4-4c89-a5bb-47a3300528ab"
-Debugger = "31a5f54b-26ea-5ae9-a837-f05ce5417438"
 Distributed = "8ba89e20-285c-5b6f-9357-94700520ee1b"
 EllipsisNotation = "da5c29d0-fa7d-589e-88eb-ea29b0a81949"
 HDF5 = "f67ccb44-e63f-5c2f-98bd-6dc0ccc4ba2f"
@@ -21,8 +20,8 @@ Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 ReTest = "e0db7c4e-2690-44b9-bad6-7687da720f89"
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 ThreadPinning = "811555cd-349b-4f26-b7bc-1f208b848042"
+TimerOutputs = "a759f4b9-e2f1-59dc-863e-4aeb61b1ea8f"
 ZMQ = "c2297ded-f4af-51ae-bb23-16f91089e4e1"
-ZeroMQ_jll = "8f1865be-045e-5c20-9c9f-bfbfb0764568"
 
 [compat]
 InterProcessCommunication = "0.1"

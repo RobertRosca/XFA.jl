@@ -3,7 +3,7 @@ using Distributed
 using HDF5
 using Hwloc
 using LibDeflate
-using ThreadPinning
+import ThreadPinning: @tspawnat
 using ChunkSplitters
 using EllipsisNotation
 
