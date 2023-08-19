@@ -53,3 +53,18 @@ function type_to_dtype_str(type::DataType)
 end
 
 isfull(c::Channel) = length(c.data) >= c.sz_max
+
+function delete(a::NamedTuple{an}, field::Symbol) where {an}
+    names = diff_names(an, (field,))
+    NamedTuple{names}(a)
+end
+
+function strcpy!(out, in::String)
+    end_idx = length(in) + 1
+    if length(out) < end_idx
+        throw(ArgumentError("strcpy!() output is smaller than the input: $(length(out)) vs $(length(in))"))
+    end
+
+    copyto!(out, 1, in, 1, length(in))
+    out[end_idx] = 0
+end
