@@ -1,3 +1,5 @@
+module Util
+
 """
     wait_timeout(waitable, timeout::Real)
 
@@ -53,3 +55,26 @@ function type_to_dtype_str(type::DataType)
 end
 
 isfull(c::Channel) = length(c.data) >= c.sz_max
+
+function strcpy!(out, in::String)
+    end_idx = length(in) + 1
+    if length(out) < end_idx
+        throw(ArgumentError("strcpy!() output is smaller than the input: $(length(out)) vs $(length(in))"))
+    end
+
+    copyto!(out, 1, in, 1, length(in))
+    out[end_idx] = 0
+end
+
+function exception2str(ex, bt)
+    buf = IOBuffer()
+
+    # Note: this three-argument method is undocumented
+    showerror(buf, ex, bt)
+
+    # Skip the last character because showerror() inserts a \0, which causes
+    # problems with unsafe_convert() when converting to a Cstring.
+    return String(take!(buf))[1:end - 1]
+end
+
+end

@@ -4,16 +4,23 @@ authors = ["JamesWrigley <james@puiterwijk.org>"]
 version = "0.1.0"
 
 [deps]
+CImGui = "5d785b6c-b76f-510e-a07c-3070796c7e87"
 CondaPkg = "992eb4ea-22a4-4c89-a5bb-47a3300528ab"
-Distributed = "8ba89e20-285c-5b6f-9357-94700520ee1b"
 EllipsisNotation = "da5c29d0-fa7d-589e-88eb-ea29b0a81949"
+HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+ImGuiGLFWBackend = "623d79b3-9695-4e60-bd7e-2a5aabaa6933"
+ImGuiOpenGLBackend = "9d0819b4-44e7-43a2-ad03-8fb999128168"
+ImPlot = "e8efc688-5342-4ad4-b4ba-9025a731b363"
 InterProcessCommunication = "a7427343-1d15-5490-a218-bfcb7db836a2"
+JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
 MsgPack = "99f44e22-a591-53d1-9472-aa23ef4bd671"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 PythonCall = "6099a3de-0909-46bc-b1f4-468b9a2dfc0d"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 ReTest = "e0db7c4e-2690-44b9-bad6-7687da720f89"
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
+SumTypes = "8e1ec7a9-0e02-4297-b0fe-6433085c89f2"
+TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 ZMQ = "c2297ded-f4af-51ae-bb23-16f91089e4e1"
 
 [compat]
