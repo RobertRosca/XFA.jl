@@ -1,3 +1,5 @@
+module Util
+
 """
     wait_timeout(waitable, timeout::Real)
 
@@ -54,11 +56,6 @@ end
 
 isfull(c::Channel) = length(c.data) >= c.sz_max
 
-function delete(a::NamedTuple{an}, field::Symbol) where {an}
-    names = diff_names(an, (field,))
-    NamedTuple{names}(a)
-end
-
 function strcpy!(out, in::String)
     end_idx = length(in) + 1
     if length(out) < end_idx
@@ -67,4 +64,17 @@ function strcpy!(out, in::String)
 
     copyto!(out, 1, in, 1, length(in))
     out[end_idx] = 0
+end
+
+function exception2str(ex, bt)
+    buf = IOBuffer()
+
+    # Note: this three-argument method is undocumented
+    showerror(buf, ex, bt)
+
+    # Skip the last character because showerror() inserts a \0, which causes
+    # problems with unsafe_convert() when converting to a Cstring.
+    return String(take!(buf))[1:end - 1]
+end
+
 end

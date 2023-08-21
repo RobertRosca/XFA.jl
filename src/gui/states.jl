@@ -1,5 +1,6 @@
 module States
 
+import HTTP: WebSockets
 import SumTypes: @sum_type
 
 
@@ -12,8 +13,11 @@ end
 
 @kwdef mutable struct HeadNode
     address::String = ""
-    workerid::Int = -1
+    client_id::String = ""
+    worker_info::Dict = Dict()
+
     status::RemoteStatus = RemoteStatus'.UNCONNECTED
+    websocket::Union{WebSockets.WebSocket, Nothing} = nothing
     last_error::String = ""
 end
 

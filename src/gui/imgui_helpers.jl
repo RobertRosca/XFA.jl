@@ -1,6 +1,6 @@
 module ImGuiHelpers
 
-include("../util.jl")
+import ...Util
 
 export MenuItem, EditableComboBox, Spinner, SafeInputText, BoxedText, @guiasync, @Disabled
 
@@ -20,7 +20,7 @@ function EditableComboBox(label, text, completions;
 
     # Initialize a buffer to hold the input, and copy the initial text into it
     input = zeros(UInt8, max_len + 1)
-    strcpy!(input, text)
+    Util.strcpy!(input, text)
     enter_pressed = IG.InputText(label, pointer(input), max_len, flags)
 
     if IG.IsItemActivated()
@@ -40,7 +40,7 @@ function EditableComboBox(label, text, completions;
         for option in completions
             if IG.Selectable(option)
                 IG.igClearActiveID()
-                strcpy!(input, option)
+                Util.strcpy!(input, option)
             end
         end
 
@@ -58,7 +58,7 @@ end
 function SafeInputText(label; max_len=63, hint="", current_text="",
                        flags=IG.ImGuiInputTextFlags_EnterReturnsTrue)
     input = zeros(UInt8, max_len + 1) # Add 1 for the null pointer
-    strcpy!(input, current_text)
+    Util.strcpy!(input, current_text)
 
     if IG.InputTextWithHint(label, hint, pointer(input), length(input), flags)
         return true, unsafe_string(pointer(input))

@@ -3,8 +3,7 @@ module GUI
 include("renderer.jl")
 include("imgui_helpers.jl")
 include("states.jl")
-
-import Distributed: addprocs, @fetchfrom
+include("client.jl")
 
 import SumTypes: @cases
 
@@ -12,12 +11,14 @@ import ImPlot as PLT
 import CImGui as IG
 import CImGui: ImVec2, Begin, End
 import CImGui.CSyntax: @c
+import HTTP: WebSockets
 
 import .Renderer
 using .ImGuiHelpers
-using ..WebProxy
 import .States: HeadNode, RemoteStatus
-
+import .Client
+using ..WebProxy
+import ..Util
 
 const WEBPROXY_COMPLETIONS::Vector{String} = [
     "localhost:8484",
@@ -46,9 +47,9 @@ const WEBPROXY_COMPLETIONS::Vector{String} = [
     show_debug_log::Bool = false
 
     # Connections to remote things
+    headnode::HeadNode = HeadNode()
     connect_to_cluster::Bool = true
-    head_node::HeadNode
-    webproxy_client::WebProxyClient
+    # webproxy_client::WebProxyClient
 
     # Karabo status
     karabo_devices::Vector{String} = String[]
@@ -74,17 +75,6 @@ end
 
 ## Helper functions for the GUI
 
-function exception2str(ex, bt)
-    buf = IOBuffer()
-
-    # Note: this three-argument method is undocumented
-    showerror(buf, ex, bt)
-
-    # Skip the last character because showerror() inserts a \0, which causes
-    # problems with unsafe_convert() when converting to a Cstring.
-    return String(take!(buf))[1:end - 1]
-end
-
 function update_device_list(state)
     client = state.webproxy_client
     client.status = WebProxyClientStatus'.CONNECTING
@@ -95,7 +85,7 @@ function update_device_list(state)
         client.status = WebProxyClientStatus'.CONNECTED
     catch ex
         client.status = WebProxyClientStatus'.ERROR
-        client.last_error = exception2str(ex, catch_backtrace())
+        client.last_error = Util.exception2str(ex, catch_backtrace())
     end
 end
 
@@ -162,27 +152,6 @@ function draw_webproxy_connection(state)
     end
 end
 
-function setup_head_node(state)
-    head_node = state.head_node
-    head_node.status = RemoteStatus'.CONNECTING
-
-    try
-        # id = withenv("JULIA_WORKER_TIMEOUT" => 20) do
-        #     addprocs([head_node.address]; tunnel=true, dir="/tmp", exename="julia")
-        # end
-        # id = id[1]
-        id = 2
-
-        @fetchfrom id myid()
-
-        head_node.workerid = id
-        head_node.status = RemoteStatus'.CONNECTED
-    catch ex
-        head_node.last_error = exception2str(ex, catch_backtrace())
-        head_node.status = RemoteStatus'.ERROR
-    end
-end
-
 ## Main GUI function
 
 default(value, default="") = isnothing(value) ? default : value
@@ -206,38 +175,39 @@ function draw_gui(state)
         @c IG.Checkbox("Connect to cluster node:", &state.connect_to_cluster)
         IG.SameLine()
 
-        head_node = state.head_node
+        headnode = state.headnode
         @Disabled !state.connect_to_cluster begin
-            edited, new_address = SafeInputText("##head_node"; hint="exflonc24.desy.de",
-                                                current_text=default(head_node.address))
+            edited, new_address = SafeInputText("##headnode"; hint="exflonc24.desy.de",
+                                                current_text=default(headnode.address))
         end
 
         if edited && new_address != ""
-            head_node.address = new_address
+            headnode.address = new_address
         end
 
         IG.Spacing()
-        disable_connect = head_node.status == RemoteStatus'.CONNECTED || !state.connect_to_cluster || length(head_node.address) == 0
+        disable_connect = headnode.status == RemoteStatus'.CONNECTED || !state.connect_to_cluster || length(headnode.address) == 0
         @Disabled disable_connect begin
             if IG.Button("Connect")
-                @guiasync setup_head_node(state)
+                @guiasync Client.initialize_engine(state)
             end
         end
         IG.SameLine()
-        @Disabled head_node.status != RemoteStatus'.CONNECTED begin
-            if IG.Button("Disconnect")
-                println("Disconnecting")
+        @Disabled headnode.status != RemoteStatus'.CONNECTED begin
+            if IG.Button("Disconnect & shutdown")
+                Client.shutdown_server(state)
             end
         end
 
-        if head_node.status == RemoteStatus'.CONNECTING
+        IG.Dummy(0, 10)
+        if headnode.status == RemoteStatus'.CONNECTING
             Spinner("Connecting to cluster...")
-        elseif head_node.status == RemoteStatus'.ERROR
-            IG.Dummy(0, 10)
-            IG.Text("Error connecting to $(head_node.address):")
-            BoxedText("##head_node_last_error", head_node.last_error)
-        elseif head_node.status == RemoteStatus'.CONNECTED
-            IG.Text("Connected with workerid $(head_node.workerid)")
+            BoxedText("##headnode_cmd_output", String(take!(copy(state.headnode_cmd_output))))
+        elseif headnode.status == RemoteStatus'.ERROR
+            IG.Text("Error connecting to $(headnode.address):")
+            BoxedText("##headnode_last_error", headnode.last_error)
+        elseif headnode.status == RemoteStatus'.CONNECTED
+            IG.Text("Connected with client ID: $(headnode.client_id)")
         end
 
         # draw_webproxy_connection(state)
@@ -261,7 +231,7 @@ function draw_gui(state)
 end
 
 """Start the XFA GUI."""
-function start_gui()
+function start_gui(; local_test=false)
     app = Renderer.ImGuiApp(; title="XFA", fonts=[
         (joinpath(@__DIR__, "fonts", "JuliaMono-Regular.ttf"), 15),
         (joinpath(@__DIR__, "fonts", "JuliaMono-Regular.ttf"), 16)
@@ -278,9 +248,12 @@ function start_gui()
 
     webproxy_client = WebProxyClient(WEBPROXY_COMPLETIONS[1],
                                      WebProxyClientStatus'.UNCONNECTED, "")
-    head_node = HeadNode()
-    state::GuiState = GuiState(; app, webproxy_client, head_node)
+    state::GuiState = GuiState(; app)
     state.disable_rendering = false
+
+    empty!(wip_state)
+    state.headnode_cmd_output = IOBuffer()
+    state.local_test = local_test
 
     Renderer.render(app) do
         if state.disable_rendering
