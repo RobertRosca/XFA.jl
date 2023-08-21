@@ -1,1 +1,6 @@
+*.log
+*.ini
+*worker-info.toml
+.CondaPkg
 /Manifest.toml
+XfelAnalyserEngine/Manifest.toml
