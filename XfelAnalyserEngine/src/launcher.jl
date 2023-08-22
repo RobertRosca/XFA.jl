@@ -7,10 +7,12 @@ include("launcher_utils.jl")
 redirect_io()
 initialize_logger()
 
-# Add workers
-@info "Adding workers..."
-addprocs(2)
+# Throw InterruptExceptions for SIGINT (Ctrl + C) instead of immediately exiting
+Base.exit_on_sigint(false)
 
+# Add workers
+@info "Engine starting up 🌅 Adding workers..."
+addprocs(2)
 @info "Added $(extra_workers()) workers 💪"
 
 try
@@ -25,7 +27,7 @@ catch ex
     @error "Caught error, cleaning up workers and exiting" exception=ex
     throw(ex)
 finally
-    @info "Shutting down all workers..."
+    @info "Shutting down workers..."
     rmprocs(workers())
-    @info "All workers shutdown"
+    @info "All workers shutdown, goodbye 👋"
 end
