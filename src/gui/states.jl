@@ -18,6 +18,8 @@ end
 
     status::RemoteStatus = RemoteStatus'.UNCONNECTED
     websocket::Union{WebSockets.WebSocket, Nothing} = nothing
+    ssh_process::Union{Base.Process, Nothing} = nothing
+
     last_error::String = ""
 end
 

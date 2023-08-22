@@ -42,7 +42,7 @@ end
 
 @kwdef mutable struct EngineState
     websocket_port::Int
-    karabo_bridge_port::Int
+    karabo_bridge_port::Int = -1
     websocket_listener_task::Union{Task, Nothing} = nothing
     clients::Dict{String, ClientState} = Dict()
 
@@ -111,8 +111,7 @@ create_id() = "$(rand(ID_PREFIXES))-$(rand(ID_SUFFIXES))"
 
 function main()
     websocket_port = getavailableport(1331)
-    karabo_bridge_port = getavailableport(1332)
-    state = EngineState(; websocket_port, karabo_bridge_port)
+    state = EngineState(; websocket_port)
 
     ws_server = WebSockets.listen!("0.0.0.0", state.websocket_port) do ws
         try
@@ -133,13 +132,15 @@ function main()
 
     @info "Started listening on ws://$(gethostname()):$(websocket_port)"
 
+    state.karabo_bridge_port = getavailableport(1332)
+
     # Write configuration
     worker_info = [(string(p), @fetchfrom p Dict("pid"      => getpid(),
                                                  "hostname" => gethostname()))
                    for p in procs()]
     worker_info = Dict(worker_info)
     worker_info["1"]["websocket-port"] = websocket_port
-    worker_info["1"]["karabo-bridge-port"] = karabo_bridge_port
+    worker_info["1"]["karabo-bridge-port"] = state.karabo_bridge_port
 
     info_path = abspath("worker-info.toml")
     open(info_path, "w") do io

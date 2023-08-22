@@ -172,21 +172,27 @@ function draw_gui(state)
         # Draw the menubar
         draw_main_menubar(state)
 
-        @c IG.Checkbox("Connect to cluster node:", &state.connect_to_cluster)
-        IG.SameLine()
-
         headnode = state.headnode
-        @Disabled !state.connect_to_cluster begin
+
+        @Disabled headnode.status != RemoteStatus'.UNCONNECTED begin
+            @c IG.Checkbox("Connect to cluster node:", &state.connect_to_cluster)
+        end
+        IG.SameLine()
+        @Disabled !state.connect_to_cluster || headnode.status != RemoteStatus'.UNCONNECTED begin
             edited, new_address = SafeInputText("##headnode"; hint="exflonc24.desy.de",
                                                 current_text=default(headnode.address))
         end
 
-        if edited && new_address != ""
+        if edited
+            @info "New address: $(new_address)"
             headnode.address = new_address
         end
 
         IG.Spacing()
-        disable_connect = headnode.status == RemoteStatus'.CONNECTED || !state.connect_to_cluster || length(headnode.address) == 0
+        disable_connect = (headnode.status == RemoteStatus'.CONNECTED
+                           || headnode.status == RemoteStatus'.CONNECTING
+                           || !state.connect_to_cluster
+                           || length(headnode.address) == 0)
         @Disabled disable_connect begin
             if IG.Button("Connect")
                 @guiasync Client.initialize_engine(state)
@@ -231,7 +237,7 @@ function draw_gui(state)
 end
 
 """Start the XFA GUI."""
-function start_gui(; local_test=false)
+function start_gui()
     app = Renderer.ImGuiApp(; title="XFA", fonts=[
         (joinpath(@__DIR__, "fonts", "JuliaMono-Regular.ttf"), 15),
         (joinpath(@__DIR__, "fonts", "JuliaMono-Regular.ttf"), 16)
@@ -253,7 +259,6 @@ function start_gui(; local_test=false)
 
     empty!(wip_state)
     state.headnode_cmd_output = IOBuffer()
-    state.local_test = local_test
 
     Renderer.render(app) do
         if state.disable_rendering
