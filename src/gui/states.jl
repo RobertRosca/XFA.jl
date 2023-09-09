@@ -11,6 +11,12 @@ import SumTypes: @sum_type
     ERROR
 end
 
+@sum_type WebproxyStatus :hidden begin
+    IDLE
+    WAITING_FOR_DEVICES
+    ERROR
+end
+
 @kwdef mutable struct HeadNode
     address::String = ""
     client_id::String = ""
