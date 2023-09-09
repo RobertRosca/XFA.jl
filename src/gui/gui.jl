@@ -7,17 +7,17 @@ include("client.jl")
 
 import SumTypes: @cases
 
+import Revise
 import ImPlot as PLT
 import CImGui as IG
 import CImGui: ImVec2, Begin, End
 import CImGui.CSyntax: @c
-import HTTP: WebSockets
+import XfelAnalyserEngine.Protocol: Message, send
 
 import .Renderer
 using .ImGuiHelpers
-import .States: HeadNode, RemoteStatus
+import .States: HeadNode, RemoteStatus, WebproxyStatus
 import .Client
-using ..WebProxy
 import ..Util
 
 const WEBPROXY_COMPLETIONS::Vector{String} = [
@@ -49,10 +49,11 @@ const WEBPROXY_COMPLETIONS::Vector{String} = [
     # Connections to remote things
     headnode::HeadNode = HeadNode()
     connect_to_cluster::Bool = true
-    # webproxy_client::WebProxyClient
+    webproxy::String = WEBPROXY_COMPLETIONS[1]
+    webproxy_status::WebproxyStatus = WebproxyStatus'.IDLE
 
     # Karabo status
-    karabo_devices::Vector{String} = String[]
+    karabo_devices::Dict{String, Any} = Dict()
 end
 
 wip_state::Dict{Symbol, Any} = Dict()
@@ -75,22 +76,33 @@ end
 
 ## Helper functions for the GUI
 
-function update_device_list(state)
-    client = state.webproxy_client
-    client.status = WebProxyClientStatus'.CONNECTING
+# function update_device_list(state)
+#     client = state.webproxy_client
+#     client.status = WebProxyClientStatus'.CONNECTING
 
-    try
-        devices = WebProxy.get_devices(state.webproxy_client)
-        state.karabo_devices = keys(devices)
-        client.status = WebProxyClientStatus'.CONNECTED
-    catch ex
-        client.status = WebProxyClientStatus'.ERROR
-        client.last_error = Util.exception2str(ex, catch_backtrace())
+#     try
+#         devices = WebProxy.get_devices(state.webproxy_client)
+#         state.karabo_devices = keys(devices)
+#         client.status = WebProxyClientStatus'.CONNECTED
+#     catch ex
+#         client.status = WebProxyClientStatus'.ERROR
+#         client.last_error = Util.exception2str(ex, catch_backtrace())
+#     end
+# end
+
+function draw_revise()
+    can_revise = length(Revise.revision_queue) > 0
+    @Disabled !can_revise begin
+        if IG.Button(can_revise ? "Revise*" : "Revise")
+            Revise.retry()
+        end
     end
 end
 
 function draw_main_menubar(state)
     if IG.BeginMenuBar()
+        draw_revise()
+
         if IG.BeginMenu("Tools")
             if IG.BeginMenu("Demos")
                 @c MenuItem("ImGui demo", &state.show_imgui_demo)
@@ -112,43 +124,51 @@ end
 
 function draw_webproxy_connection(state)
     # Set up connection to a Karabo WebProxy
-    webproxy = state.webproxy_client
-    webproxy_is_connecting = webproxy.status == WebProxyClientStatus'.CONNECTING
-    IG.Text("Select a web proxy:")
+    IG.Text("Select a default web proxy:")
     IG.SameLine()
 
-    @Disabled webproxy_is_connecting begin
+    @Disabled state.webproxy_status == WebproxyStatus'.WAITING_FOR_DEVICES begin
         edited, new_endpoint = EditableComboBox("##select_webproxy",
-                                                webproxy.endpoint,
+                                                state.webproxy,
                                                 WEBPROXY_COMPLETIONS)
         IG.SameLine()
         if IG.Button("Reload")
-            @guiasync update_device_list(state)
+            Client.get_devices(state)
+            state.current_trainmatcher = Cint(0)
         end
     end
 
     # Connect immediately if changed
-    endpoint_changed = edited && new_endpoint != webproxy.endpoint
-    if endpoint_changed || webproxy.status == WebProxyClientStatus'.UNCONNECTED
-        webproxy.endpoint = new_endpoint
-        @guiasync update_device_list(state)
+    endpoint_changed = edited && new_endpoint != state.webproxy
+    if endpoint_changed
+        state.webproxy = new_endpoint
+        Client.get_devices(state)
+        state.current_trainmatcher = Cint(0)
     end
 
     # Display webproxy status
-    if webproxy.status == WebProxyClientStatus'.ERROR
-        IG.Dummy(0, 10)
+    IG.Dummy(0, 10)
+    if state.webproxy_status == WebproxyStatus'.IDLE
+        trainmatchers = sort([name for (name, properties) in state.karabo_devices
+                                  if properties["classId"] ∈ ("TrainMatcher", "ShmemTrainMatcher")])
+
+        if length(trainmatchers) > 0
+            IG.Text("Selected trainmatcher: $(trainmatchers[state.current_trainmatcher + 1])")
+            @c IG.ListBox("$(length(trainmatchers)) trainmatchers available", &state.current_trainmatcher,
+                          trainmatchers, length(trainmatchers), 10)
+        else
+            IG.Text("No trainmatchers found out of $(length(state.karabo_devices)) devices 😞")
+        end
+    elseif state.webproxy_status == WebproxyStatus'.WAITING_FOR_DEVICES
+        Spinner("Waiting for device list")
+    elseif state.webproxy_status == WebproxyStatus'.ERROR
         IG.Text("Error connecting to the webproxy:")
         IG.SameLine()
         if IG.SmallButton("Copy to clipboard")
-            IG.SetClipboardText(webproxy.last_error)
+            # IG.SetClipboardText(webproxy.last_error)
         end
 
-        BoxedText("##webproxy_last_error", webproxy.last_error)
-    elseif webproxy.status == WebProxyClientStatus'.CONNECTED
-        IG.Spacing()
-        IG.Text("Found $(length(state.karabo_devices)) devices!")
-    else
-        Spinner("Connecting to WebProxy")
+        BoxedText("##webproxy_last_error", "Foo")
     end
 end
 
@@ -174,11 +194,13 @@ function draw_gui(state)
 
         headnode = state.headnode
 
-        @Disabled headnode.status != RemoteStatus'.UNCONNECTED begin
+        can_connect = (headnode.status != RemoteStatus'.CONNECTING &&
+            headnode.status != RemoteStatus'.CONNECTED)
+        @Disabled !can_connect begin
             @c IG.Checkbox("Connect to cluster node:", &state.connect_to_cluster)
         end
         IG.SameLine()
-        @Disabled !state.connect_to_cluster || headnode.status != RemoteStatus'.UNCONNECTED begin
+        @Disabled !state.connect_to_cluster || !can_connect begin
             edited, new_address = SafeInputText("##headnode"; hint="exflonc24.desy.de",
                                                 current_text=default(headnode.address))
         end
@@ -210,13 +232,16 @@ function draw_gui(state)
             Spinner("Connecting to cluster...")
             BoxedText("##headnode_cmd_output", String(take!(copy(state.headnode_cmd_output))))
         elseif headnode.status == RemoteStatus'.ERROR
-            IG.Text("Error connecting to $(headnode.address):")
+            IG.Text("Error connecting to node:")
             BoxedText("##headnode_last_error", headnode.last_error)
         elseif headnode.status == RemoteStatus'.CONNECTED
             IG.Text("Connected with client ID: $(headnode.client_id)")
         end
 
-        # draw_webproxy_connection(state)
+        if headnode.status == RemoteStatus'.CONNECTED
+            IG.Spacing()
+            draw_webproxy_connection(state)
+        end
 
         End()
     end
@@ -252,17 +277,25 @@ function start_gui()
     # io.WantSaveIniSettings = false
     # io.IniFilename = C_NULL
 
-    webproxy_client = WebProxyClient(WEBPROXY_COMPLETIONS[1],
-                                     WebProxyClientStatus'.UNCONNECTED, "")
     state::GuiState = GuiState(; app)
     state.disable_rendering = false
 
     empty!(wip_state)
     state.headnode_cmd_output = IOBuffer()
+    state.current_trainmatcher = Cint(0)
 
     Renderer.render(app) do
         if state.disable_rendering
+            # Occasionally an exception will occur in the middle of a disabled
+            # section, which helpfully also disables the continue button
+            # below. So here we check if we're currently disabled and end it if
+            # so.
+            if IsItemDisabled()
+                IG.igEndDisabled()
+            end
+
             IG.Text("Render loop crashed, continue when ready:")
+            draw_revise()
             IG.SameLine()
             state.disable_rendering = !IG.Button("Continue")
             return

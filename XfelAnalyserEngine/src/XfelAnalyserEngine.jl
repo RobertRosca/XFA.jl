@@ -1,11 +1,18 @@
 module XfelAnalyserEngine
 
+include("protocol.jl")
+include("webproxy.jl")
+
 import TOML
 import Sockets: listen, close, @ip_str
 import Distributed: @fetchfrom, workers, procs
+using Serialization
 
 import HTTP
 import HTTP: WebSockets
+import SumTypes: @cases
+import .Protocol: Message, send
+import .WebProxy
 
 
 """Find the closest available port to `port_hint`."""
@@ -68,7 +75,7 @@ function Base.setproperty!(state::EngineState, sym::Symbol, value)
 end
 
 """Close connections to all clients and optionally the websocket listener."""
-function teardown(state::EngineState, ws_server=nothing)
+function shutdown(state::EngineState, ws_server=nothing)
     if ws_server != nothing
         close(ws_server)
     end
@@ -78,8 +85,39 @@ function teardown(state::EngineState, ws_server=nothing)
     end
 end
 
-"""Handle communication of a single client."""
-function client_handler(state::EngineState, id)
+function handle_message(msg::Message, state::EngineState, id)
+    client_state = state.clients[id]
+    ws = client_state.websocket
+
+    @cases msg begin
+        PING => begin
+            client_state.last_heartbeat = time()
+            send(ws, Message'.PONG)
+        end
+
+        HCF => begin
+            @info "Received shutdown request from client $(id)"
+            shutdown(state)
+            notify(state.halt_and_catch_fire)
+        end
+
+        GET_DEVICES(address) => begin
+            try
+                devices = WebProxy.get_devices(address)
+                send(ws, Message'.DEVICES(devices))
+                @info "Responded to GET_DEVICES from $(id)"
+            catch ex
+                @error "Error in GET_DEVICES, requested by $(id)" exception=(ex, catch_backtrace())
+                send(ws, Message'.DEVICES(ex))
+            end
+        end
+
+        [PONG, DEVICES] => @error "Received unsupported message"
+    end
+end
+
+"""Handle a single client."""
+function handle_client(state::EngineState, id)
     client_state = state.clients[id]
     ws = client_state.websocket
 
@@ -87,17 +125,10 @@ function client_handler(state::EngineState, id)
     WebSockets.send(ws, id)
     @info "Connected to new client: $(id) 🙋"
 
-    for msg in ws
-        if msg == "ping"
-            client_state.last_heartbeat = time()
-            WebSockets.send(ws, "pong")
-        elseif msg == "hcf"
-            @info "Received shutdown request from client $(id)"
-            teardown(state)
-            notify(state.halt_and_catch_fire)
-        else
-            @info "Message from client $(id): $(msg)"
-        end
+    for msg_bytes in ws
+        buffer = IOBuffer(msg_bytes)
+        msg = deserialize(buffer)
+        @invokelatest handle_message(msg, state, id)
     end
 
     delete!(state.clients, id)
@@ -109,9 +140,9 @@ const ID_PREFIXES = ["bothersome", "droopy", "deleterious", "morbid", "snobbish"
 const ID_SUFFIXES = ["elf", "balrog", "wizard", "hobbit", "dwarf", "ent", "troll", "goblin", "tom", "dragon"]
 create_id() = "$(rand(ID_PREFIXES))-$(rand(ID_SUFFIXES))"
 
-function main()
+function main(halt_and_catch_fire=Base.Event())
     websocket_port = getavailableport(1331)
-    state = EngineState(; websocket_port)
+    state = EngineState(; websocket_port, halt_and_catch_fire)
 
     ws_server = WebSockets.listen!("0.0.0.0", state.websocket_port) do ws
         try
@@ -124,9 +155,9 @@ function main()
             # Create a client
             client = ClientState(; websocket=ws, last_heartbeat=time())
             state.clients[id] = client
-            client_handler(state, id)
+            handle_client(state, id)
         catch ex
-            @error "Error while handling client connecton: $(ex)"
+            @error "Error while handling client connecton" exception=(ex, catch_backtrace())
         end
     end
 
@@ -158,7 +189,7 @@ function main()
             @error "Exception thrown in main loop: $(ex)"
         end
     finally
-        teardown(state, ws_server)
+        shutdown(state, ws_server)
         if isopen(ws_server)
             HTTP.forceclose(ws_server)
         end

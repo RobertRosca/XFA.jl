@@ -1,11 +1,13 @@
 module Client
 
 import TOML
+using Serialization
 
 import HTTP
 import HTTP: WebSockets
-
-import ..States: RemoteStatus, HeadNode
+import SumTypes: @cases
+import XfelAnalyserEngine.Protocol: Message, send
+import ..States: RemoteStatus, HeadNode, WebproxyStatus
 import ..ImGuiHelpers: @guiasync
 import ...Util
 
@@ -40,8 +42,8 @@ function initialize_engine(state)
                         withenv("http_proxy" => proxy, "https_proxy" => proxy) do
                             # Pkg.add(path=joinpath(homedir(), "git/XFA"), subdir="XfelAnalyserEngine")
                             Pkg.develop(path=joinpath(homedir(), "git/XFA/XfelAnalyserEngine"))
-                            # Pkg.add(url="https://github.com/JamesWrigley/LoggingExtras.jl", rev="large-resolutions")
                             Pkg.add("LoggingFormats")
+                            Pkg.add("LoggingExtras")
                             Pkg.instantiate()
                         end
                     end
@@ -133,7 +135,7 @@ function shutdown_server(state)
     headnode = state.headnode
 
     if !WebSockets.isclosed(headnode.websocket)
-        WebSockets.send(headnode.websocket, "hcf")
+        send(headnode.websocket, Message'.HCF)
         # close(headnode.websocket)
         headnode.status = RemoteStatus'.UNCONNECTED
     end
@@ -151,6 +153,23 @@ function shutdown_server(state)
     # Kill the SSH tunnel
     if headnode.ssh_process != nothing && process_running(headnode.ssh_process)
         kill(headnode.ssh_process)
+    end
+end
+
+function handle_msg(state, msg)
+    @cases msg begin
+        PONG => nothing
+        DEVICES(data) => begin
+            if data isa Exception
+                @error "Error from server with DEVICES" exception=data
+                state.webproxy_status = WebproxyStatus'.ERROR
+            else
+                state.karabo_devices = data
+                state.webproxy_status = WebproxyStatus'.IDLE
+            end
+        end
+
+        [PING, HCF, GET_DEVICES] => nothing
     end
 end
 
@@ -177,8 +196,10 @@ function handle_server(state)
 
                 headnode.status = RemoteStatus'.CONNECTED
 
-                for msg in ws
-                    @info "Message from server: $(msg)"
+                for msg_bytes in ws
+                    buffer = IOBuffer(msg_bytes)
+                    msg::Message = deserialize(buffer)
+                    @invokelatest handle_msg(state, msg)
                 end
 
                 @info "Connection to server closed ❌"
@@ -212,6 +233,11 @@ function handle_server(state)
         # Otherwise we've disconnected normally
         headnode.status = RemoteStatus'.UNCONNECTED
     end
+end
+
+function get_devices(state)
+    send(state.headnode.websocket, Message'.GET_DEVICES(state.webproxy))
+    state.webproxy_status = WebproxyStatus'.WAITING_FOR_DEVICES
 end
 
 end

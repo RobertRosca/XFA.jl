@@ -2,7 +2,7 @@ module ImGuiHelpers
 
 import ...Util
 
-export MenuItem, EditableComboBox, Spinner, SafeInputText, BoxedText, @guiasync, @Disabled
+export MenuItem, EditableComboBox, Spinner, SafeInputText, BoxedText, @guiasync, @Disabled, IsItemDisabled
 
 import CImGui as IG
 import CImGui: IM_COL32, ImVec2
@@ -101,6 +101,12 @@ macro Disabled(cond, expr)
             IG.igEndDisabled()
         end
     end
+end
+
+# Stolen from: https://github.com/ocornut/imgui/pull/4675
+function IsItemDisabled()
+    imgui_ctx = unsafe_load(IG.GetCurrentContext())
+    return (imgui_ctx.LastItemData.InFlags & IG.ImGuiItemFlags_Disabled) != 0
 end
 
 end
