@@ -2,6 +2,7 @@ module XfelAnalyserEngine
 
 include("protocol.jl")
 include("webproxy.jl")
+include("context.jl")
 
 import TOML
 import Sockets: listen, close, @ip_str
