@@ -1,12 +1,12 @@
-module XfelAnalyserEngineTests
+module XfaEngineTests
 
 __revise_mode__ = :eval
 
 import Statistics: mean
 import ReTest: @testset, @test, @test_throws
 
-import XfelAnalyserEngine.Context
-import XfelAnalyserEngine.Context: @Variable, @karabo_str, Dependency, KaraboDependency, SubvariableDependency, XfaContextException
+import XfaEngine.Context
+import XfaEngine.Context: @Variable, @karabo_str, Dependency, KaraboDependency, SubvariableDependency, XfaContextException
 
 
 @testset "KaraboDependency" begin

@@ -259,7 +259,7 @@ function load_context(ctx_str::AbstractString)
     ctx_module._xfa_variables = Dict{String, Vector{Any}}()
     ctx_module._xfa_subvariables = Dict{String, Vector{String}}()
 
-    exprs = Expr[:(using XfelAnalyserEngine.Context)]
+    exprs = Expr[:(using XfaEngine.Context)]
 
     # Parse everything
     expr, pos = Meta.parse(ctx_str, 1)

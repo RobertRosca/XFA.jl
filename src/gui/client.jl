@@ -6,7 +6,7 @@ using Serialization
 import HTTP
 import HTTP: WebSockets
 import SumTypes: @cases
-import XfelAnalyserEngine.Protocol: Message, send
+import XfaEngine.Protocol: Message, send
 import ..States: RemoteStatus, HeadNode, WebproxyStatus
 import ..ImGuiHelpers: @guiasync
 import ...Util
@@ -37,11 +37,11 @@ function initialize_engine(state)
                     Pkg.activate("xfa-default"; shared=true)
                     proxy = "exflproxy01:3128"
                     if $(is_local)
-                        Pkg.develop(path=joinpath(homedir(), "git/XFA/XfelAnalyserEngine"))
+                        Pkg.develop(path=joinpath(homedir(), "git/XFA/XfaEngine"))
                     else
                         withenv("http_proxy" => proxy, "https_proxy" => proxy) do
-                            # Pkg.add(path=joinpath(homedir(), "git/XFA"), subdir="XfelAnalyserEngine")
-                            Pkg.develop(path=joinpath(homedir(), "git/XFA/XfelAnalyserEngine"))
+                            # Pkg.add(path=joinpath(homedir(), "git/XFA"), subdir="XfaEngine")
+                            Pkg.develop(path=joinpath(homedir(), "git/XFA/XfaEngine"))
                             Pkg.add("LoggingFormats")
                             Pkg.add("LoggingExtras")
                             Pkg.instantiate()
@@ -64,8 +64,8 @@ function initialize_engine(state)
 
                     # Launch the engine if necessary
                     if !isfile(toml_path)
-                        import XfelAnalyserEngine
-                        launcher_script = joinpath(dirname(pathof(XfelAnalyserEngine)), "launcher.jl")
+                        import XfaEngine
+                        launcher_script = joinpath(dirname(pathof(XfaEngine)), "launcher.jl")
                         mkpath(working_dir)
                         cd(working_dir) do
                             cmd = `julia --project="@xfa-default" --color=no --startup-file=no \$(launcher_script)`

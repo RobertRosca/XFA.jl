@@ -1,4 +1,4 @@
-name = "XfelAnalyserEngine"
+name = "XfaEngine"
 uuid = "df4d7780-7f2f-4694-8ef1-2cbac230b49a"
 authors = ["JamesWrigley <james.wrigley@xfel.eu>"]
 version = "0.1.0"

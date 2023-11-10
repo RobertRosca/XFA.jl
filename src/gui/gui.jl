@@ -12,7 +12,7 @@ import ImPlot as PLT
 import CImGui as IG
 import CImGui: ImVec2, Begin, End
 import CImGui.CSyntax: @c
-import XfelAnalyserEngine.Protocol: Message, send
+import XfaEngine.Protocol: Message, send
 
 import .Renderer
 using .ImGuiHelpers

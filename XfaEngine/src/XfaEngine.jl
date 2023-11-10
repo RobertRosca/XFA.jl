@@ -1,4 +1,4 @@
-module XfelAnalyserEngine
+module XfaEngine
 
 include("protocol.jl")
 include("webproxy.jl")

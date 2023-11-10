@@ -22,7 +22,7 @@ Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 SumTypes = "8e1ec7a9-0e02-4297-b0fe-6433085c89f2"
 TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
-XfelAnalyserEngine = "df4d7780-7f2f-4694-8ef1-2cbac230b49a"
+XfaEngine = "df4d7780-7f2f-4694-8ef1-2cbac230b49a"
 ZMQ = "c2297ded-f4af-51ae-bb23-16f91089e4e1"
 
 [compat]
