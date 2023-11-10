@@ -6,7 +6,7 @@ import Statistics: mean
 import ReTest: @testset, @test, @test_throws
 
 import XfelAnalyserEngine.Context
-import XfelAnalyserEngine.Context: @Variable, @karabo_str, Dependency, KaraboDependency, SubvariableDependency
+import XfelAnalyserEngine.Context: @Variable, @karabo_str, Dependency, KaraboDependency, SubvariableDependency, XfaContextException
 
 
 @testset "KaraboDependency" begin
@@ -106,6 +106,27 @@ end
     @test Set(keys(ctx.functions)) == Set(["foo", "quux"])
     @test ctx.subvariables["foo"] == ["foo.bar"]
     @test ctx.dag["quux"] == [SubvariableDependency("foo", "bar")]
+end
+
+@testset "Scheduler" begin
+    # Test sorting a DAG with a cycle
+    dag = Dict("foo" => ["bar"], "bar" => ["foo"])
+    @test_throws XfaContextException Context.topological_sort(dag)
+
+    # Sort an empty DAG
+    @test Context.topological_sort(Dict("foo" => [])) == ["foo"]
+
+    # Test that external dependencies aren't considered during sorting
+    dag = Dict("camera" => [karabo"foo.bar", karabo"baz.quux"])
+    @test Context.topological_sort(dag) == ["camera"]
+
+    # Subvariables should be ignored too
+    dag = Dict("camera" => [], "foo" => [SubvariableDependency("camera", "bar")])
+    @test Context.topological_sort(dag) == ["camera", "foo"]
+
+    # Test that sorting actually works
+    dag = Dict("camera" => [karabo"foo.bar"], "foo" => ["camera"], "bar" => ["foo"])
+    @test Context.topological_sort(dag) == ["camera", "foo", "bar"]
 end
 
 end
