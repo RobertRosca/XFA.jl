@@ -6,20 +6,28 @@ import MacroTools
 import MacroTools: @capture, postwalk, prettify
 
 
-abstract type AbstractDependency end
-
-struct KaraboDependency <: AbstractDependency
-    source::String
-    property::String
+struct XfaContextException <: Exception
+    msg::String
 end
+
+abstract type AbstractDependency end
 
 struct Dependency <: AbstractDependency
     name::String
 end
 
+Base.string(dep::Dependency) = dep.name
+
 struct SubvariableDependency <: AbstractDependency
     parent::String
     name::String
+end
+
+Base.string(dep::SubvariableDependency) = "$(dep.parent).$(dep.name)"
+
+struct KaraboDependency <: AbstractDependency
+    source::String
+    property::String
 end
 
 function KaraboDependency(str::AbstractString)
@@ -180,6 +188,11 @@ end
 
 XfaContext = XfaContext4
 
+function Base.show(io::IO, ctx::XfaContext)
+    n_variables = length(ctx.functions)
+    print(io, "<XfaContext with $(n_variables) variables>")
+end
+
 function external_dependencies(ctx::XfaContext)
     ext_deps = Set()
     for (_, deps) in ctx.dag
@@ -193,10 +206,51 @@ function external_dependencies(ctx::XfaContext)
     return ext_deps
 end
 
-function Base.show(io::IO, ctx::XfaContext)
-    n_variables = length(ctx.functions)
-    print(io, "<XfaContext with $(n_variables) variables>")
+"""
+Return a sorted order of functions in the context to execute.
+
+Subvariables are taken into account, but excluded from the output since only
+their parents are functions that can be executed.
+"""
+function topological_sort(dag)
+    # First we create a copy of the DAG with some changes:
+    # - All external dependencies (i.e from Karabo) removed
+    # - All subvariables represented by their parent function
+    # - All dependencies converted to strings for simplicity
+    internal_dag = Dict{String, Vector{String}}()
+    for (name, deps) in dag
+        internal_dag[name] = [x isa SubvariableDependency ? x.parent : string(x) for x in deps
+                              if !(x isa KaraboDependency)]
+    end
+
+    sorted_graph = String[]
+    working_set = Set([name for (name, deps) in internal_dag if isempty(deps)])
+
+    while !isempty(working_set)
+        variable = pop!(working_set)
+        push!(sorted_graph, variable)
+
+        for (name, deps) in internal_dag
+            idxs = findall(x -> x == variable, deps)
+
+            if !isempty(idxs)
+                deleteat!(deps, idxs)
+
+                if isempty(deps)
+                    push!(working_set, name)
+                end
+            end
+        end
+    end
+
+    if !all(isempty.(values(internal_dag)))
+        throw(XfaContextException("Context graph has a cycle, cannot construct a DAG"))
+    end
+
+    return sorted_graph
 end
+
+topological_sort(ctx::XfaContext) = topological_sort(ctx.dag)
 
 
 function load_context(ctx_str::AbstractString)
@@ -237,6 +291,9 @@ function load_context(ctx_str::AbstractString)
             push!(dag[name], dep)
         end
     end
+
+    # Check that it has no cycles by attempting to sort it
+    topological_sort(dag)
 
     return XfaContext(functions, dag, ctx_module._xfa_subvariables, exprs)
 end
