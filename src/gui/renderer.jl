@@ -1,7 +1,10 @@
 module Renderer
 
+import ..ImNodes
+
 import ImPlot
 import CImGui
+import LibCImGui as LCIG
 import ImGuiGLFWBackend
 import ImGuiOpenGLBackend as GLBackend
 import ImGuiGLFWBackend.LibGLFW as GLFW
@@ -16,6 +19,7 @@ struct ImGuiApp
     window::Ptr{ImGuiGLFWBackend.GLFWwindow}
     imgui_ctx::Ptr{CImGui.ImGuiContext}
     implot_ctx::Ptr{ImPlot.ImPlotContext}
+    imnodes_ctx::Ptr{ImNodes.ImNodesContext}
     glfw_ctx::ImGuiGLFWBackend.Context
     opengl_ctx::GLBackend.Context
 
@@ -59,6 +63,9 @@ struct ImGuiApp
         implot_ctx = ImPlot.CreateContext()
         ImPlot.SetImGuiContext(imgui_ctx)
 
+        # Setup ImNodes
+        imnodes_ctx = ImNodes.CreateContext()
+
         # Setup Dear ImGui style
         CImGui.StyleColorsDark()
 
@@ -83,7 +90,7 @@ struct ImGuiApp
         # disable it again by default.
         io.ConfigFlags = unsafe_load(io.ConfigFlags) & ~CImGui.ImGuiConfigFlags_ViewportsEnable
 
-        return new(window, imgui_ctx, implot_ctx, glfw_ctx, opengl_ctx)
+        return new(window, imgui_ctx, implot_ctx, imnodes_ctx, glfw_ctx, opengl_ctx)
     end
 end
 
@@ -140,6 +147,7 @@ function renderloop(app::ImGuiApp, ui=()->nothing; hotloading=false, on_exit=()-
 
         GLBackend.shutdown(app.opengl_ctx)
         ImGuiGLFWBackend.shutdown(app.glfw_ctx)
+        ImNodes.DestroyContext(app.imnodes_ctx)
         ImPlot.DestroyContext(app.implot_ctx)
         CImGui.DestroyContext(app.imgui_ctx)
         GLFW.glfwDestroyWindow(app.window)

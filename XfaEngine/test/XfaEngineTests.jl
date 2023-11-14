@@ -9,6 +9,16 @@ import XfaEngine.Context
 import XfaEngine.Context: @Variable, @karabo_str, Dependency, KaraboDependency, SubvariableDependency, XfaContextException, Parameter
 
 
+@testset "Engine" begin
+    launcher_script = joinpath(dirname(dirname(@__FILE__)), "src/launcher.jl")
+    executable = Base.julia_cmd()[1]
+    environment = dirname(Base.active_project())
+
+    # mktempdir() do
+    #     engine = run(`$(executable) --project=$(environment) --startup-file=no --color=no $(launcher_script)`; wait=false)
+    # end
+end
+
 @testset "KaraboDependency" begin
     @test karabo"foo.bar" == KaraboDependency("foo", "bar")
     @test karabo"foo.bar.baz" == KaraboDependency("foo", "bar.baz")

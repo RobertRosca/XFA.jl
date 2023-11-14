@@ -240,6 +240,11 @@ function external_dependencies(ctx::XfaContext)
     return ext_deps
 end
 
+function to_dict(ctx::XfaContext)
+    return Dict("dag" => ctx.dag,
+                "subvariables" => ctx.subvariables)
+end
+
 """
 Return a sorted order of functions in the context to execute.
 
