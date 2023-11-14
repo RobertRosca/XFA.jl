@@ -264,6 +264,7 @@ end
 """Start the XFA GUI."""
 function start_gui()
     app = Renderer.ImGuiApp(; title="XFA", fonts=[
+        (joinpath(@__DIR__, "fonts", "Inter-Regular.otf"), 17),
         (joinpath(@__DIR__, "fonts", "JuliaMono-Regular.ttf"), 15),
         (joinpath(@__DIR__, "fonts", "JuliaMono-Regular.ttf"), 16)
     ])
