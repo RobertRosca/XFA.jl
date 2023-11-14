@@ -20,7 +20,8 @@ try
     @everywhere workers() include("launcher_utils.jl")
     @everywhere workers() redirect_io()
 
-    @everywhere import XfelAnalyserEngine as Engine
+    @everywhere import Revise
+    @everywhere import XfaEngine as Engine
 
     Engine.main()
 catch ex

@@ -6,11 +6,12 @@ include("context.jl")
 
 import TOML
 import Sockets: listen, close, @ip_str
-import Distributed: @fetchfrom, workers, procs
+import Distributed: @everywhere, @fetchfrom, workers, procs
 using Serialization
 
 import HTTP
 import HTTP: WebSockets
+import Revise
 import SumTypes: @cases
 import .Protocol: Message, send
 import .WebProxy
@@ -114,6 +115,10 @@ function handle_message(msg::Message, state::EngineState, id)
         end
 
         [PONG, DEVICES] => @error "Received unsupported message"
+        REVISE => begin
+            @everywhere Revise.retry()
+            @info "Revised source code"
+        end
     end
 end
 

@@ -36,14 +36,21 @@ function initialize_engine(state)
                     # Install the package
                     Pkg.activate("xfa-default"; shared=true)
                     proxy = "exflproxy01:3128"
+                    dependencies = ["Revise", "LoggingFormats", "LoggingExtras"]
+
                     if $(is_local)
                         Pkg.develop(path=joinpath(homedir(), "git/XFA/XfaEngine"))
+                        for pkg in dependencies
+                            Pkg.add(pkg)
+                        end
+                        Pkg.instantiate()
                     else
                         withenv("http_proxy" => proxy, "https_proxy" => proxy) do
                             # Pkg.add(path=joinpath(homedir(), "git/XFA"), subdir="XfaEngine")
                             Pkg.develop(path=joinpath(homedir(), "git/XFA/XfaEngine"))
-                            Pkg.add("LoggingFormats")
-                            Pkg.add("LoggingExtras")
+                            for pkg in dependencies
+                                Pkg.add(pkg)
+                            end
                             Pkg.instantiate()
                         end
                     end

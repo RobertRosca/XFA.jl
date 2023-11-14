@@ -11,6 +11,7 @@ import SumTypes: @sum_type
     PING
     HCF
     GET_DEVICES(::String) # Holds webproxy endpoint
+    REVISE
 
     # Messages that the server can send
     PONG

@@ -91,18 +91,23 @@ end
 #     end
 # end
 
-function draw_revise()
+function draw_revise(state)
     can_revise = length(Revise.revision_queue) > 0
     @Disabled !can_revise begin
         if IG.Button(can_revise ? "Revise*" : "Revise")
             Revise.retry()
+
+            headnode = state.headnode
+            if headnode.status == RemoteStatus'.CONNECTED
+                Client.revise_engine(state)
+            end
         end
     end
 end
 
 function draw_main_menubar(state)
     if IG.BeginMenuBar()
-        draw_revise()
+        draw_revise(state)
 
         if IG.BeginMenu("Tools")
             if IG.BeginMenu("Demos")
@@ -304,7 +309,7 @@ function start_gui()
             end
 
             IG.Text("Render loop crashed, continue when ready:")
-            draw_revise()
+            draw_revise(state)
             IG.SameLine()
             state.disable_rendering = !IG.Button("Continue")
             return
