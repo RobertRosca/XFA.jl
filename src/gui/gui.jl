@@ -12,6 +12,7 @@ import ImPlot as PLT
 import CImGui as IG
 import CImGui: ImVec2, Begin, End
 import CImGui.CSyntax: @c
+import HTTP: WebSockets
 import XfaEngine.Protocol: Message, send
 
 import .Renderer
@@ -285,7 +286,14 @@ function start_gui()
     state.headnode_cmd_output = IOBuffer()
     state.current_trainmatcher = Cint(0)
 
-    Renderer.render(app) do
+    function on_exit()
+        ws = state.headnode.websocket
+        if ws != nothing && !WebSockets.isclosed(ws)
+            close(ws)
+        end
+    end
+
+    Renderer.render(app; on_exit) do
         if state.disable_rendering
             # Occasionally an exception will occur in the middle of a disabled
             # section, which helpfully also disables the continue button

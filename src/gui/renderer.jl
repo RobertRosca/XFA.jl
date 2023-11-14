@@ -87,7 +87,7 @@ struct ImGuiApp
     end
 end
 
-function renderloop(app::ImGuiApp, ui=()->nothing; hotloading=false)
+function renderloop(app::ImGuiApp, ui=()->nothing; hotloading=false, on_exit=()->nothing)
     io = CImGui.GetIO()
 
     try
@@ -132,6 +132,12 @@ function renderloop(app::ImGuiApp, ui=()->nothing; hotloading=false)
         @error "Error in renderloop!" exception=e
         Base.show_backtrace(stderr, catch_backtrace())
     finally
+        try
+            on_exit()
+        catch exit_ex
+            @error "Error in on_exit() function!" exception=exit_ex
+        end
+
         GLBackend.shutdown(app.opengl_ctx)
         ImGuiGLFWBackend.shutdown(app.glfw_ctx)
         ImPlot.DestroyContext(app.implot_ctx)
@@ -145,8 +151,8 @@ function render(ui, args...; hotloading=false, kwargs...)
     return render(ui, app; hotloading)
 end
 
-function render(ui, app::ImGuiApp; hotloading=false)
-    t = Threads.@spawn :interactive renderloop(app, ui; hotloading)
+function render(ui, app::ImGuiApp; hotloading=false, on_exit=()->nothing)
+    t = Threads.@spawn :interactive renderloop(app, ui; hotloading, on_exit)
     return errormonitor(t)
 end
 
