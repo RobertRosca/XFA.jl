@@ -1,6 +1,6 @@
 module Context
 
-export @karabo_str, @Variable
+export @karabo_str, @Variable, @Parameter
 
 import MacroTools
 import MacroTools: @capture, postwalk, prettify
@@ -111,7 +111,7 @@ function _variable(ctx_module, expr, side_effects)
                                 # Otherwise, we convert all non-Karabo
                                 # dependencies (i.e. variable and maybe future
                                 # parameter dependencies) into Dependency's.
-                                value = :(Context.Dependency(string($value)))
+                                value = :(Context.Dependency($("$value")))
                             end
                             push!(dependencies, value)
 
@@ -179,14 +179,48 @@ macro Variable(expr)
 end
 
 
-mutable struct XfaContext4
+struct Parameter{T}
+    name::String
+    value::T
+end
+
+Base.:(==)(one::Parameter{T}, two::Parameter{T}) where T = one.name == two.name && one.value == two.value
+
+function _parameter(ctx_module, expr, side_effects)
+    if !(expr isa Expr)
+        throw(ArgumentError("Must pass an Expr to @Parameter"))
+    end
+
+    if @capture(expr, name_::T_ -> value_)
+        body = quote
+            if $side_effects
+                push!(_xfa_parameters, Context.Parameter($("$name"), $value::$T))
+            end
+        end
+        return esc(body)
+    end
+
+    throw(ArgumentError("Could not construct parameter from expression: $(prettify(expr))"))
+end
+
+"""
+Mark things as parameters.
+"""
+macro Parameter(expr)
+    side_effects = :_xfa_generated_module in names(__module__; all=true)
+    _parameter(__module__, expr, side_effects)
+end
+
+
+mutable struct XfaContext5
     functions::Dict{String, Any}
     dag::Dict{String, Vector{Any}}
     subvariables::Dict{String, Vector{String}}
+    parameters::Dict{String, Parameter}
     exprs::Vector{Expr}
 end
 
-XfaContext = XfaContext4
+XfaContext = XfaContext5
 
 function Base.show(io::IO, ctx::XfaContext)
     n_variables = length(ctx.functions)
@@ -214,13 +248,15 @@ their parents are functions that can be executed.
 """
 function topological_sort(dag)
     # First we create a copy of the DAG with some changes:
+    # - Remove all Parameter dependencies (TODO: don't do this when parameter
+    #   functions are implemented)
     # - All external dependencies (i.e from Karabo) removed
     # - All subvariables represented by their parent function
     # - All dependencies converted to strings for simplicity
     internal_dag = Dict{String, Vector{String}}()
     for (name, deps) in dag
         internal_dag[name] = [x isa SubvariableDependency ? x.parent : string(x) for x in deps
-                              if !(x isa KaraboDependency)]
+                              if !(x isa KaraboDependency) && !(x isa Parameter)]
     end
 
     sorted_graph = String[]
@@ -253,11 +289,12 @@ end
 topological_sort(ctx::XfaContext) = topological_sort(ctx.dag)
 
 
-function load_context(ctx_str::AbstractString)
+function load_from_string(ctx_str::AbstractString)
     ctx_module = Module()
     ctx_module._xfa_generated_module = true
     ctx_module._xfa_variables = Dict{String, Vector{Any}}()
     ctx_module._xfa_subvariables = Dict{String, Vector{String}}()
+    ctx_module._xfa_parameters = Parameter[]
 
     exprs = Expr[:(using XfaEngine.Context)]
 
@@ -271,6 +308,21 @@ function load_context(ctx_str::AbstractString)
     # Evaluate all exprs
     for expr in exprs
         @eval ctx_module $expr
+    end
+
+    # Check if we have any duplicate parameters
+    if !allunique([param.name for param in ctx_module._xfa_parameters])
+        throw(XfaContextException("Duplicate @Parameter's exist"))
+    end
+
+    parameters = Dict([param.name => param for param in ctx_module._xfa_parameters])
+
+    # Check if there are any parameters with the same name as a variable
+    common_var_param_names = intersect(keys(ctx_module._xfa_variables),
+                                       keys(parameters))
+    if !isempty(common_var_param_names)
+        names_str = join(common_var_param_names, ", ")
+        throw(XfaContextException("@Variable's and @Parameter's exist with the same name: $(names_str)"))
     end
 
     # Look up all the functions that will be called
@@ -288,6 +340,10 @@ function load_context(ctx_str::AbstractString)
                 throw(ArgumentError("Dependency of type '$(typeof(dep))' is not allowed"))
             end
 
+            if dep isa Dependency && haskey(parameters, dep.name)
+                dep = parameters[dep.name]
+            end
+
             push!(dag[name], dep)
         end
     end
@@ -295,7 +351,15 @@ function load_context(ctx_str::AbstractString)
     # Check that it has no cycles by attempting to sort it
     topological_sort(dag)
 
-    return XfaContext(functions, dag, ctx_module._xfa_subvariables, exprs)
+    return XfaContext(functions, dag, ctx_module._xfa_subvariables, parameters, exprs)
+end
+
+function load_from_file(ctx_path::AbstractString)
+    if !isfile(ctx_path)
+        throw(ArgumentError("$(ctx_path) is not a file!"))
+    end
+
+    return load_from_string(read(ctx_path, String))
 end
 
 end

@@ -6,7 +6,7 @@ import Statistics: mean
 import ReTest: @testset, @test, @test_throws
 
 import XfaEngine.Context
-import XfaEngine.Context: @Variable, @karabo_str, Dependency, KaraboDependency, SubvariableDependency, XfaContextException
+import XfaEngine.Context: @Variable, @karabo_str, Dependency, KaraboDependency, SubvariableDependency, XfaContextException, Parameter
 
 
 @testset "KaraboDependency" begin
@@ -22,7 +22,7 @@ end
 
 @testset "@Variable" begin
     # Smoke test for basic functionality
-    ctx = Context.load_context("""
+    ctx = Context.load_from_string("""
     using Statistics
 
     @Variable cam4 -> karabo"MID_EXP_SAM/CAM/CAM4:output[data.image.pixels]"
@@ -42,7 +42,7 @@ end
     @test ctx.dag["xgm"] == [KaraboDependency("SA2_XTD1_XGM/XGM/DOOCS:output", "data.intensityTD")]
 
     # Test generating variables dynamically
-    ctx = Context.load_context(raw"""
+    ctx = Context.load_from_string(raw"""
     function xgm()
         for x in [:foo, :bar, :baz]
             @eval @Variable $x -> $(karabo"$x.data")
@@ -63,7 +63,7 @@ end
     @test Context.external_dependencies(ctx) == Set([karabo"foo.data", karabo"bar.data", karabo"baz.data"])
 
     # Test variables depending on each other
-    ctx = Context.load_context(raw"""
+    ctx = Context.load_from_string(raw"""
     @Variable foo -> karabo"foo.bar"
 
     @Variable function bar(data -> foo)
@@ -92,7 +92,7 @@ end
                                                              false)
 
     # Test creating a subvariable
-    ctx = Context.load_context(raw"""
+    ctx = Context.load_from_string(raw"""
     @Variable function foo(data -> karabo"device.property")
         bar = @Variable(mean(data))
 
@@ -106,6 +106,50 @@ end
     @test Set(keys(ctx.functions)) == Set(["foo", "quux"])
     @test ctx.subvariables["foo"] == ["foo.bar"]
     @test ctx.dag["quux"] == [SubvariableDependency("foo", "bar")]
+
+    # Test loading from a file
+    ctx_code = raw"""
+    @Variable foo -> karabo"foo.bar"
+    """
+    ctx_from_str = Context.load_from_string(ctx_code)
+    path, io = mktemp()
+    write(io, ctx_code)
+    close(io)
+    @test Context.load_from_file(path).dag == ctx_from_str.dag
+end
+
+@testset "@Parameter" begin
+    @test_throws ArgumentError Context._parameter(@__MODULE__, 10, false)
+
+    ctx = Context.load_from_string(raw"""
+    @Parameter photon_energy::Int -> 0
+    @Parameter device::String -> "foo"
+    """)
+    @test ctx.parameters == Dict("photon_energy" => Parameter("photon_energy", 0),
+                                 "device" => Parameter("device", "foo"))
+
+    # Don't allow variables and parameters with the same name
+    @test_throws XfaContextException Context.load_from_string(raw"""
+    @Parameter foo::Int -> 0
+    @Variable foo -> karabo"foo.bar"
+    """)
+
+    # Don't allow duplicate parameters
+    @test_throws XfaContextException Context.load_from_string(raw"""
+    @Parameter foo::Int -> 0
+    @Parameter foo::Float64 -> 2π
+    """)
+
+    # Allow parameters as dependencies of variables
+    ctx = Context.load_from_string(raw"""
+    @Parameter period::Float64 -> 2π
+    @Variable function foo(period -> period)
+        period * 2
+    end
+    """)
+
+    @test ctx.parameters == Dict("period" => Parameter("period", 2π))
+    @test ctx.dag["foo"] == [Parameter("period", 2π)]
 end
 
 @testset "Scheduler" begin
@@ -127,6 +171,26 @@ end
     # Test that sorting actually works
     dag = Dict("camera" => [karabo"foo.bar"], "foo" => ["camera"], "bar" => ["foo"])
     @test Context.topological_sort(dag) == ["camera", "foo", "bar"]
+end
+
+@testset "Serialization" begin
+    ctx = Context.load_from_string(raw"""
+    @Variable xgm -> karabo"xgm.intensity"
+    @Variable function foo() 42 end
+    @Variable function bar(data -> xgm)
+        max_data = @Variable(max(data))
+
+        mean(data)
+    end
+    """)
+
+    @test Context.to_dict(ctx) == Dict("dag" =>          Dict("xgm" => [karabo"xgm.intensity"],
+                                                              "foo" => [],
+                                                              "bar" => [Dependency("xgm")]),
+
+                                       "subvariables" => Dict("xgm" => [],
+                                                              "foo" => [],
+                                                              "bar" => ["bar.max_data"]))
 end
 
 end
