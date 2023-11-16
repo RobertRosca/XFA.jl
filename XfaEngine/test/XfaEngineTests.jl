@@ -3,7 +3,10 @@ module XfaEngineTests
 __revise_mode__ = :eval
 
 import Statistics: mean
+import Test: with_logger, TestLogger
 import ReTest: @testset, @test, @test_throws
+
+import OrderedCollections: OrderedDict as OD
 
 import XfaEngine.Context
 import XfaEngine.Context: @Variable, @karabo_str, Dependency, KaraboDependency, SubvariableDependency, XfaContextException, Parameter
@@ -41,15 +44,17 @@ end
         return mean(intensity)
     end
     """)
+
     expected_variables = Set(["cam4", "xgm"])
     @test Set(keys(ctx.functions)) == expected_variables
     @test ctx.functions["cam4"](10) == 10
     @test ctx.functions["xgm"](1:10) == mean(1:10)
 
+
     @test Set(keys(ctx.dag)) == expected_variables
 
-    @test ctx.dag["cam4"] == [KaraboDependency("MID_EXP_SAM/CAM/CAM4:output", "data.image.pixels")]
-    @test ctx.dag["xgm"] == [KaraboDependency("SA2_XTD1_XGM/XGM/DOOCS:output", "data.intensityTD")]
+    @test ctx.dag["cam4"] == OD("data" => karabo"MID_EXP_SAM/CAM/CAM4:output[data.image.pixels]")
+    @test ctx.dag["xgm"] == OD("intensity" => karabo"SA2_XTD1_XGM/XGM/DOOCS:output[data.intensityTD]")
 
     # Test generating variables dynamically
     ctx = Context.load_from_string(raw"""
@@ -68,7 +73,7 @@ end
 
     # And their dependencies should have been marked
     for name in expected_variables
-        @test ctx.dag[name] == [KaraboDependency(name, "data")]
+        @test ctx.dag[name] == OD("data" => KaraboDependency(name, "data"))
     end
     @test Context.external_dependencies(ctx) == Set([karabo"foo.data", karabo"bar.data", karabo"baz.data"])
 
@@ -81,8 +86,8 @@ end
     end
     """)
 
-    @test ctx.dag["bar"] == [Dependency("foo")]
-    @test ctx.dag["foo"] == [karabo"foo.bar"]
+    @test ctx.dag["bar"] == OD("data" => Dependency("foo"))
+    @test ctx.dag["foo"] == OD("data" => karabo"foo.bar")
 
     # Creating a short-hand variable pointing to anything other than a proper
     # dependency should fail. We test the internal function here because it's
@@ -115,7 +120,7 @@ end
     """)
     @test Set(keys(ctx.functions)) == Set(["foo", "quux"])
     @test ctx.subvariables["foo"] == ["foo.bar"]
-    @test ctx.dag["quux"] == [SubvariableDependency("foo", "bar")]
+    @test ctx.dag["quux"] == OD("data" => SubvariableDependency("foo", "bar"))
 
     # Test loading from a file
     ctx_code = raw"""
@@ -159,7 +164,7 @@ end
     """)
 
     @test ctx.parameters == Dict("period" => Parameter("period", 2π))
-    @test ctx.dag["foo"] == [Parameter("period", 2π)]
+    @test ctx.dag["foo"] == OD("period" => Parameter("period", 2π))
 end
 
 @testset "Scheduler" begin
@@ -181,10 +186,46 @@ end
     # Test that sorting actually works
     dag = Dict("camera" => [karabo"foo.bar"], "foo" => ["camera"], "bar" => ["foo"])
     @test Context.topological_sort(dag) == ["camera", "foo", "bar"]
+
+    ctx = Context.load_from_string(raw"""
+    @Variable camera -> karabo"camera.data"
+    """)
+    # Variables shouldn't be executed unless they have all their dependencies
+    @test length(Context.execute(ctx, Dict())) == 0
+    @test Context.execute(ctx, Dict("camera.data" => 1)) == Dict("camera" => 1)
+
+    # Variables that throw shouldn't cause execution of the other variables to
+    # fail.
+    ctx = Context.load_from_string(raw"""
+    @Variable function foo()
+        error("foo")
+    end
+
+    @Variable function bar()
+        42
+    end
+    """)
+    log = TestLogger()
+    with_logger(log) do
+        @test Context.execute(ctx, Dict()) == Dict("bar" => 42)
+    end
+    @test length(log.logs) == 1
+    @test occursin("Error executing", log.logs[1].message)
+
+    # Test that dependencies are passed correctly
+    ctx = Context.load_from_string(raw"""
+    @Parameter norm::Int -> 1
+    @Variable foo -> karabo"foo.bar"
+    @Variable function bar(data -> foo, norm -> norm)
+        return (2 * data, norm)
+    end
+    """)
+    @test Context.execute(ctx, Dict("foo.bar" => 1)) == Dict("foo" => 1, "bar" => (2, 1))
 end
 
 @testset "Serialization" begin
     ctx = Context.load_from_string(raw"""
+    @Parameter period::Float64 -> 2π
     @Variable xgm -> karabo"xgm.intensity"
     @Variable function foo() 42 end
     @Variable function bar(data -> xgm)
@@ -194,13 +235,13 @@ end
     end
     """)
 
-    @test Context.to_dict(ctx) == Dict("dag" =>          Dict("xgm" => [karabo"xgm.intensity"],
-                                                              "foo" => [],
-                                                              "bar" => [Dependency("xgm")]),
-
+    @test Context.to_dict(ctx) == Dict("dag" =>          Dict("xgm" => OD("data" => karabo"xgm.intensity"),
+                                                              "foo" => OD(),
+                                                              "bar" => OD("data" => Dependency("xgm"))),
                                        "subvariables" => Dict("xgm" => [],
                                                               "foo" => [],
-                                                              "bar" => ["bar.max_data"]))
+                                                              "bar" => ["bar.max_data"]),
+                                       "parameters" => Dict("period" => Parameter("period", 2π)))
 end
 
 end

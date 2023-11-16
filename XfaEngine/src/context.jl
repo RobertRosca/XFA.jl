@@ -4,6 +4,7 @@ export @karabo_str, @Variable, @Parameter
 
 import MacroTools
 import MacroTools: @capture, postwalk, prettify
+import OrderedCollections: OrderedDict
 
 
 struct XfaContextException <: Exception
@@ -113,7 +114,7 @@ function _variable(ctx_module, expr, side_effects)
                                 # parameter dependencies) into Dependency's.
                                 value = :(Context.Dependency($("$value")))
                             end
-                            push!(dependencies, value)
+                            push!(dependencies, :(($("$arg_name"), $value)))
 
                             # Replace the original argument expression with just
                             # the argument name.
@@ -179,12 +180,13 @@ macro Variable(expr)
 end
 
 
-struct Parameter{T}
-    name::String
+mutable struct Parameter{T}
+    const name::String
     value::T
 end
 
 Base.:(==)(one::Parameter{T}, two::Parameter{T}) where T = one.name == two.name && one.value == two.value
+Base.string(param::Parameter{T}) where T = param.name
 
 function _parameter(ctx_module, expr, side_effects)
     if !(expr isa Expr)
@@ -212,25 +214,29 @@ macro Parameter(expr)
 end
 
 
-mutable struct XfaContext5
+mutable struct XfaContext6
     functions::Dict{String, Any}
-    dag::Dict{String, Vector{Any}}
+    dag::Dict{String, OrderedDict}
     subvariables::Dict{String, Vector{String}}
     parameters::Dict{String, Parameter}
     exprs::Vector{Expr}
 end
 
-XfaContext = XfaContext5
+XfaContext = XfaContext6
 
 function Base.show(io::IO, ctx::XfaContext)
     n_variables = length(ctx.functions)
-    print(io, "<XfaContext with $(n_variables) variables>")
+    n_params = length(ctx.parameters)
+    print(io, "<XfaContext with $(n_variables) variables and $(n_params) parameters>")
 end
 
+"""
+Finds all external dependencies (i.e. from Karabo) required by the context.
+"""
 function external_dependencies(ctx::XfaContext)
-    ext_deps = Set()
+    ext_deps = Set{KaraboDependency}()
     for (_, deps) in ctx.dag
-        for dep in deps
+        for dep in values(deps)
             if dep isa KaraboDependency
                 push!(ext_deps, dep)
             end
@@ -242,7 +248,8 @@ end
 
 function to_dict(ctx::XfaContext)
     return Dict("dag" => ctx.dag,
-                "subvariables" => ctx.subvariables)
+                "subvariables" => ctx.subvariables,
+                "parameters" => ctx.parameters)
 end
 
 """
@@ -260,7 +267,7 @@ function topological_sort(dag)
     # - All dependencies converted to strings for simplicity
     internal_dag = Dict{String, Vector{String}}()
     for (name, deps) in dag
-        internal_dag[name] = [x isa SubvariableDependency ? x.parent : string(x) for x in deps
+        internal_dag[name] = [x isa SubvariableDependency ? x.parent : string(x) for x in values(deps)
                               if !(x isa KaraboDependency) && !(x isa Parameter)]
     end
 
@@ -292,6 +299,44 @@ function topological_sort(dag)
 end
 
 topological_sort(ctx::XfaContext) = topological_sort(ctx.dag)
+
+function execute(ctx::XfaContext, inputs::Dict)
+    execution_order = topological_sort(ctx)
+    results = Dict{String, Any}()
+
+    for name in execution_order
+        # Build up the argument list
+        args = []
+        for dep in values(ctx.dag[name])
+            dep_key = string(dep)
+
+            if dep isa KaraboDependency
+                if haskey(inputs, dep_key)
+                    push!(args, inputs[dep_key])
+                end
+            elseif dep isa Dependency
+                if haskey(results, dep_key)
+                    push!(args, results[dep_key])
+                end
+            elseif dep isa Parameter
+                push!(args, ctx.parameters[dep_key].value)
+            else
+                throw(XfaContextException("Unrecognized dependency type: $(typeof(dep))"))
+            end
+        end
+
+        # Call the function
+        if length(args) == length(ctx.dag[name])
+            try
+                results[name] = ctx.functions[name](args...)
+            catch ex
+                @error "Error executing $(name)!" exception=ex
+            end
+        end
+    end
+
+    return results
+end
 
 
 function load_from_string(ctx_str::AbstractString)
@@ -337,10 +382,10 @@ function load_from_string(ctx_str::AbstractString)
     end
 
     # Create the DAG (it's just an adjaceny list)
-    dag = Dict{String, Vector{Any}}()
+    dag = Dict{String, OrderedDict}()
     for (name, deps) in ctx_module._xfa_variables
-        dag[name] = []
-        for dep in deps
+        dag[name] = OrderedDict()
+        for (arg_name, dep) in deps
             if !(dep isa AbstractDependency)
                 throw(ArgumentError("Dependency of type '$(typeof(dep))' is not allowed"))
             end
@@ -349,7 +394,7 @@ function load_from_string(ctx_str::AbstractString)
                 dep = parameters[dep.name]
             end
 
-            push!(dag[name], dep)
+            dag[name][arg_name] = dep
         end
     end
 
