@@ -13,6 +13,7 @@ using ReTest
 using EllipsisNotation
 using InterProcessCommunication
 
+
 const epix = Device("MID_EXP_EPIX-1/DET/RECEIVER",
                     ":foo" => (
                         "bar" => Float16[100, 100],
@@ -29,93 +30,6 @@ const epix = Device("MID_EXP_EPIX-1/DET/RECEIVER",
 const motor = Device("MID_EXP_UPP/MOTOR/R1",
                      "actualPosition" => Float32,
                      "targetPosition" => Float32)
-
-
-function getavailableport(port_hint; interface=ip"127.0.0.1")
-    port_range_end = min(65535, port_hint + 5000)
-    available_port = -1
-
-    for port in port_hint:port_range_end
-        try
-            s = listen(interface, port)
-            close(s)
-            return port
-        catch
-            continue
-        end
-    end
-
-    error("Could not find an available port between $(port_hint) and $(port_range_end)")
-end
-
-function karabo_bridge_test_state(f::Function, endpoint)
-    server = KaraboBridgeServer(endpoint)
-    client = KaraboBridgeClient(endpoint)
-
-    try
-        f(client, server)
-    finally
-        close(client)
-        close(server)
-    end
-end
-
-# @testset "karabo_bridge.jl" begin
-#     # Create server and client
-#     port = getavailableport(42000)
-#     endpoint = "tcp://127.0.0.1:$(port)"
-
-#     karabo_bridge_test_state(endpoint) do client, server
-#         # The server should already be bound to the port
-#         @test_throws Base.IOError listen(ip"127.0.0.1", port)
-
-#         # Start the server
-#         t = startbridge(server)
-#         @test istaskstarted(t)
-
-#         # Trying to start it twice should fail
-#         @test_throws ErrorException startbridge(server)
-
-#         # Stop the server
-#         stopbridge(server)
-#         @test timedwait(() -> istaskdone(t), 1) == :ok
-
-#         # Create some test data
-#         dummy_data = Dict("foo" => Dict(
-#             "string" => "hello world!",
-#             "scalar" => 42.314,
-#             "boolean" => true,
-#             "list" => ["foo", "bar", 42, 3.14],
-#         ))
-#         for type in [Bool,
-#                      Float16, Float32, Float64,
-#                      Int8, Int16, Int32, Int64,
-#                      UInt8, UInt16, UInt32, UInt64]
-#             # These arrays should use zero-copy transfer
-#             dummy_data["foo"]["big_$(lowercase(string(type)))_array"] = rand(type, 1000)
-#             # These arrays should be serialized, except for Float16 since MsgPack
-#             # doesn't support Float16.
-#             dummy_data["foo"]["small_$(lowercase(string(type)))_array"] = rand(type, 10)
-#         end
-
-#         # Send the test data and ensure it's received by the client
-#         t = startbridge(server)
-#         put!(server, dummy_data)
-#         data, metadata = next(client)
-#         @test dummy_data == data
-
-#         # Trying to get more data should timeout
-#         @test_throws ErrorException next(client)
-
-#         # But now there's an outstanding request, so the next put!()/next() cycle should still send data
-#         put!(server, dummy_data)
-#         data, metadata = next(client)
-#         @test dummy_data == data
-
-#         stopbridge(server)
-#         @test timedwait(() -> istaskdone(t), 1) == :ok
-#     end
-# end
 
 # Helper function that reads from/writes to an array in shared memory
 function access_shmem(id, dtype, dims)

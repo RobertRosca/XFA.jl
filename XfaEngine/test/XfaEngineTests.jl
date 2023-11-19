@@ -2,6 +2,8 @@ module XfaEngineTests
 
 __revise_mode__ = :eval
 
+import Sockets
+import Sockets: @ip_str
 import Statistics: mean
 import Test: with_logger, TestLogger
 import ReTest: @testset, @test, @test_throws
@@ -10,6 +12,8 @@ import OrderedCollections: OrderedDict as OD
 
 import XfaEngine.Context
 import XfaEngine.Context: @Variable, @karabo_str, Dependency, KaraboDependency, SubvariableDependency, XfaContextException, Parameter
+import XfaEngine.KaraboBridge
+import XfaEngine.KaraboBridge: KaraboBridgeClient, KaraboBridgeServer
 
 
 @testset "Engine" begin
@@ -20,6 +24,92 @@ import XfaEngine.Context: @Variable, @karabo_str, Dependency, KaraboDependency, 
     # mktempdir() do
     #     engine = run(`$(executable) --project=$(environment) --startup-file=no --color=no $(launcher_script)`; wait=false)
     # end
+end
+
+function getavailableport(port_hint; interface=ip"127.0.0.1")
+    port_range_end = min(65535, port_hint + 100)
+    available_port = -1
+
+    for port in port_hint:port_range_end
+        try
+            s = Sockets.listen(interface, port)
+            close(s)
+            return port
+        catch ex
+            continue
+        end
+    end
+
+    error("Could not find an available port between $(port_hint) and $(port_range_end)")
+end
+
+function karabo_bridge_test_state(f::Function, endpoint)
+    server = KaraboBridgeServer(endpoint)
+    client = KaraboBridgeClient(endpoint)
+
+    try
+        f(client, server)
+    finally
+        close(client)
+        close(server)
+    end
+end
+
+@testset "Karabo bridge" begin
+    # Create server and client
+    port = getavailableport(42000)
+    endpoint = "tcp://127.0.0.1:$(port)"
+
+    karabo_bridge_test_state(endpoint) do client, server
+        # Start the server
+        KaraboBridge.startbridge(server)
+        @test isopen(server.channel)
+
+        # The server should now be bound to the port
+        @test_throws Base.IOError Sockets.listen(ip"127.0.0.1", port)
+
+        # Trying to start it twice should fail
+        @test_throws ErrorException KaraboBridge.startbridge(server)
+
+        # Stop the server
+        KaraboBridge.stopbridge(server)
+        @test timedwait(() -> !server.is_running, 5) == :ok
+
+        # Create some test data
+        dummy_data = Dict("foo" => Dict(
+            "string" => "hello world!",
+            "scalar" => 42.314,
+            "boolean" => true,
+            "list" => ["foo", "bar", 42, 3.14],
+        ))
+        for type in [Bool,
+                     Float16, Float32, Float64,
+                     Int8, Int16, Int32, Int64,
+                     UInt8, UInt16, UInt32, UInt64]
+            # These arrays should use zero-copy transfer
+            dummy_data["foo"]["big_$(lowercase(string(type)))_array"] = rand(type, 1000)
+            # These arrays should be serialized, except for Float16 since MsgPack
+            # doesn't support Float16.
+            dummy_data["foo"]["small_$(lowercase(string(type)))_array"] = rand(type, 10)
+        end
+
+        # Send the test data and ensure it's received by the client
+        KaraboBridge.startbridge(server)
+        put!(server, dummy_data)
+        data, metadata = KaraboBridge.next(client)
+        @test dummy_data == data
+
+        # # Trying to get more data should timeout
+        # @test_throws ErrorException next(client)
+
+        # # But now there's an outstanding request, so the next put!()/next() cycle should still send data
+        # put!(server, dummy_data)
+        # data, metadata = next(client)
+        # @test dummy_data == data
+
+        # stopbridge(server)
+        # @test timedwait(() -> istaskdone(t), 1) == :ok
+    end
 end
 
 @testset "KaraboDependency" begin

@@ -1,5 +1,6 @@
 module XfaEngine
 
+include("karabo_bridge.jl")
 include("protocol.jl")
 include("webproxy.jl")
 include("context.jl")
