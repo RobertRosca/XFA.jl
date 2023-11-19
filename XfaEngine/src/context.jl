@@ -1,6 +1,6 @@
 module Context
 
-export @karabo_str, @Variable, @Parameter
+export @karabo_str, @Variable, @Parameter, @Input, @Group
 
 import MacroTools
 import MacroTools: @capture, postwalk, prettify
@@ -26,9 +26,18 @@ end
 
 Base.string(dep::SubvariableDependency) = "$(dep.parent).$(dep.name)"
 
+struct GroupDependency <: AbstractDependency
+    struct_name::String
+end
+
 struct KaraboDependency <: AbstractDependency
     source::String
     property::String
+end
+
+struct FunctionArgument
+    name::String
+    type::Union{Nothing, Type}
 end
 
 function KaraboDependency(str::AbstractString)
@@ -68,6 +77,55 @@ macro karabo_str(str)
 end
 
 
+"""
+Helper function to parse the arguments of a function.
+"""
+function _parse_function_args(args; is_input=false)
+    dependencies = []
+    new_args = [postwalk(arg) do arg_expr
+                    if @capture(arg_expr, arg_name_ -> value_)
+                        # Strip quote nodes etc
+                        value = MacroTools.unblock(value)
+
+                        if @capture(value, head_.tail_)
+                            # If it's of the form `head.tail`, that's a
+                            # subvariable and we convert it to a string so it's
+                            # not evaluated.
+                            value = :(Context.SubvariableDependency($("$head"), $("$tail")))
+                        elseif !(value isa AbstractDependency || @capture(value, @karabo_str _))
+                            # Otherwise, we convert all non-Karabo
+                            # dependencies (i.e. variable and maybe future
+                            # parameter dependencies) into Dependency's.
+                            value = :(Context.Dependency($("$value")))
+                        end
+                        push!(dependencies, :(($("$arg_name"), $value)))
+
+                        # Replace the original argument expression with just
+                        # the argument name.
+                        return arg_name
+
+                    elseif @capture(arg_expr, (::T_) | (arg_name_::T_))
+                        arg_name_expr = isnothing(arg_name) ? :(nothing) : :($("$arg_name"))
+
+                        if !is_input || (is_input && i == 1 && length(args) == 2)
+                            # If the first argument has a type and no explicit
+                            # dependency, then we assume it belongs to a group.
+                            push!(dependencies, :(($arg_name_expr, Context.GroupDependency($("$T")))))
+                        else
+                            # Otherwise it's just a regular function argument
+                            push!(dependencies, :(($arg_name_expr, Context.FunctionArgument($arg_name_expr, $T))))
+                        end
+
+                        return arg_expr
+                    else
+                        return arg_expr
+                    end
+                end
+                for (i, arg) in enumerate(args)]
+
+    return dependencies, new_args
+end
+
 function _variable(ctx_module, expr, side_effects)
     if !(expr isa Expr)
         throw(ArgumentError("Must pass an Expr to @Variable"))
@@ -97,33 +155,7 @@ function _variable(ctx_module, expr, side_effects)
         # And now we handle explicit function declarations
 
         # Extract dependency information
-        dependencies = []
-        new_args = [postwalk(arg) do arg_expr
-                        if @capture(arg_expr, arg_name_ -> value_)
-                            # Strip quote nodes etc
-                            value = MacroTools.unblock(value)
-
-                            if @capture(value, head_.tail_)
-                                # If it's of the form `head.tail`, that's a
-                                # subvariable and we convert it to a string so it's
-                                # not evaluated.
-                                value = :(Context.SubvariableDependency($("$head"), $("$tail")))
-                            elseif !(value isa AbstractDependency || @capture(value, @karabo_str _))
-                                # Otherwise, we convert all non-Karabo
-                                # dependencies (i.e. variable and maybe future
-                                # parameter dependencies) into Dependency's.
-                                value = :(Context.Dependency($("$value")))
-                            end
-                            push!(dependencies, :(($("$arg_name"), $value)))
-
-                            # Replace the original argument expression with just
-                            # the argument name.
-                            return arg_name
-                        else
-                            return arg_expr
-                        end
-                    end
-                    for arg in args]
+        dependencies, new_args = _parse_function_args(args)
 
         # Look through the body for subvariables, and replace all the toplevel
         # ones.
@@ -214,15 +246,114 @@ macro Parameter(expr)
 end
 
 
-mutable struct XfaContext6
+function _input(ctx_module, expr, side_effects)
+    if !(expr isa Expr)
+        throw(ArgumentError("Must pass an Expr to @Input"))
+    end
+
+    if @capture(expr, function name_(args__) body_ end)
+        dependencies, new_args = _parse_function_args(args; is_input=true)
+        if length(dependencies) == 2
+            if !@capture(dependencies[1], (_, Context.GroupDependency(_)))
+                throw(XfaContextException("The first argument of a two-argument @Input must be a @Group"))
+            end
+        elseif length(dependencies) != 1
+            throw(XfaContextException("@Input functions must accept 1-2 arguments, '$(name)' has $(length(args)) arguments"))
+        end
+
+        dependencies_expr = Expr(:vect, dependencies...)
+        new_expr = quote
+            function $name($(args...))
+                $body
+            end
+
+            if $side_effects
+                _xfa_inputs[$("$name")] = $dependencies_expr
+            end
+        end
+
+        return esc(new_expr)
+    end
+
+    throw(ArgumentError("Could not construct an input from expression: $(prettify(expr))"))
+end
+
+"""
+Mark a function as an input (i.e a trigger).
+"""
+macro Input(expr)
+    side_effects = :_xfa_generated_module in names(__module__; all=true)
+    _input(__module__, expr, side_effects)
+end
+
+
+struct Group
+    name::String
+    type::DataType
+    parameters::Dict{Symbol, DataType}
+    variables::Vector{String}
+end
+
+function Base.:(==)(x::Group, y::Group)
+    x.name == y.name && x.parameters == y.parameters && x.variables == y.variables
+end
+
+function _group(ctx_module, expr, side_effects)
+    if !(expr isa Expr)
+        throw(ArgumentError("Must pass an Expr to @Group"))
+    end
+
+    if @capture(expr, struct name_ fields__ end)
+        # Look through the fields for parameters
+        param_fields = []
+        new_fields = [if @capture(field, @Parameter field_name_::T_)
+                          push!(param_fields, field_name)
+                          :($field_name::$T)
+                      else
+                          field
+                      end
+                      for field in fields]
+
+        new_expr = quote
+            if $side_effects
+                _xfa_groups[$("$name")] = $param_fields
+            end
+
+            struct $name
+                $(new_fields...)
+            end
+        end
+
+        return esc(new_expr)
+    end
+
+    throw(ArgumentError("Could not construct a group from expression: $(prettify(expr))"))
+end
+
+"""
+Mark a struct as a group of @Variable's.
+"""
+macro Group(expr)
+    side_effects = :_xfa_generated_module in names(__module__; all=true)
+    _group(__module__, expr, side_effects)
+end
+
+
+@kwdef mutable struct XfaContext10
     functions::Dict{String, Any}
+    group_types::Dict{String, Group}
+    groups::Dict{String, Any}
     dag::Dict{String, OrderedDict}
     subvariables::Dict{String, Vector{String}}
     parameters::Dict{String, Parameter}
     exprs::Vector{Expr}
+
+    input_functions::Dict{String, Any}
+    ext_inputs_channel::Channel = Channel()
+    exec_task::Union{Task, Nothing} = nothing
 end
 
-XfaContext = XfaContext6
+XfaContext = XfaContext10
 
 function Base.show(io::IO, ctx::XfaContext)
     n_variables = length(ctx.functions)
@@ -265,10 +396,11 @@ function topological_sort(dag)
     # - All external dependencies (i.e from Karabo) removed
     # - All subvariables represented by their parent function
     # - All dependencies converted to strings for simplicity
+    # - All group object arguments are removed
     internal_dag = Dict{String, Vector{String}}()
     for (name, deps) in dag
         internal_dag[name] = [x isa SubvariableDependency ? x.parent : string(x) for x in values(deps)
-                              if !(x isa KaraboDependency) && !(x isa Parameter)]
+                              if !(x isa KaraboDependency) && !(x isa Parameter) && !(x isa GroupDependency)]
     end
 
     sorted_graph = String[]
@@ -300,7 +432,7 @@ end
 
 topological_sort(ctx::XfaContext) = topological_sort(ctx.dag)
 
-function execute(ctx::XfaContext, inputs::Dict)
+function execute_variables(ctx::XfaContext, inputs::Dict)
     execution_order = topological_sort(ctx)
     results = Dict{String, Any}()
 
@@ -320,6 +452,8 @@ function execute(ctx::XfaContext, inputs::Dict)
                 end
             elseif dep isa Parameter
                 push!(args, ctx.parameters[dep_key].value)
+            elseif dep isa GroupDependency
+                push!(args, ctx.groups[dep.struct_name])
             else
                 throw(XfaContextException("Unrecognized dependency type: $(typeof(dep))"))
             end
@@ -345,6 +479,8 @@ function load_from_string(ctx_str::AbstractString)
     ctx_module._xfa_variables = Dict{String, Vector{Any}}()
     ctx_module._xfa_subvariables = Dict{String, Vector{String}}()
     ctx_module._xfa_parameters = Parameter[]
+    ctx_module._xfa_inputs = Dict{String, Any}()
+    ctx_module._xfa_groups = Dict{String, Any}()
 
     exprs = Expr[:(using XfaEngine.Context)]
 
@@ -365,6 +501,14 @@ function load_from_string(ctx_str::AbstractString)
         throw(XfaContextException("Duplicate @Parameter's exist"))
     end
 
+    # Load the group types
+    group_types = Dict{String, Group}()
+    for (group_name, param_fields) in ctx_module._xfa_groups
+        group_struct = getproperty(ctx_module, Symbol(group_name))
+        parameters = Dict([field => fieldtype(group_struct, field) for field in param_fields])
+        group_types[group_name] = Group(group_name, group_struct, parameters, String[])
+    end
+
     parameters = Dict([param.name => param for param in ctx_module._xfa_parameters])
 
     # Check if there are any parameters with the same name as a variable
@@ -383,25 +527,109 @@ function load_from_string(ctx_str::AbstractString)
 
     # Create the DAG (it's just an adjaceny list)
     dag = Dict{String, OrderedDict}()
-    for (name, deps) in ctx_module._xfa_variables
-        dag[name] = OrderedDict()
-        for (arg_name, dep) in deps
-            if !(dep isa AbstractDependency)
-                throw(ArgumentError("Dependency of type '$(typeof(dep))' is not allowed"))
+    for (name, deps) in mergewith(_ -> throw(XfaContextException("Found Variable's and Input's with duplicate names")),
+                                  ctx_module._xfa_variables, ctx_module._xfa_inputs)
+        # If it's a group dependency, we don't schedule it yet. That's done at
+        # the end only for the instantiated group structs.
+        if length(deps) > 0 && deps[1][2] isa GroupDependency
+            push!(group_types[deps[1][2].struct_name].variables, name)
+            continue
+        end
+
+        # Don't add inputs to the DAG, only variables
+        if haskey(ctx_module._xfa_variables, name)
+            dag[name] = _get_deps(name, parameters, ctx_module)
+        end
+    end
+
+    # At this point we've added all the non-grouped variables to the DAG and we
+    # know which variables belong to which group, so we can schedule all the
+    # instantiated groups.
+    groups = Dict{String, Any}()
+    inputs = Dict{String, Any}()
+
+    # Look at all the top-level names and check if they're groups
+    for (group_name, group_type_name, object) in _get_group_objects(ctx_module, group_types)
+        # value = getproperty(ctx_module, group_name)
+        # group_type_name = findfirst(g -> value isa g.type, group_types)
+        # if group_type_name == nothing
+        #     continue
+        # end
+
+        groups[group_name] = object
+
+        # If so, then add all their variables to the DAG
+        for variable_name in group_types[group_type_name].variables
+            # If it's an input, handle it later
+            if haskey(ctx_module._xfa_inputs, variable_name)
+                continue
             end
 
-            if dep isa Dependency && haskey(parameters, dep.name)
-                dep = parameters[dep.name]
-            end
+            dag_deps = _get_deps(variable_name, parameters, ctx_module)
 
-            dag[name][arg_name] = dep
+            # Replace the GroupDependency that originally contained the group
+            # type name, with a GroupDependency that names the instatiated
+            # group.
+            argument_names = collect(keys(dag_deps))
+            arg_idx = findfirst(key -> dag_deps[key] == GroupDependency(group_type_name),
+                                argument_names)
+            dag_deps[argument_names[arg_idx]] = GroupDependency(group_name)
+
+            group_var_name = "$group_name.$variable_name"
+            dag[group_var_name] = dag_deps
+            functions[group_var_name] = functions[variable_name]
+
+            # Dependencies of the form `foo.bar` are saved as
+            # SubvariableDependency's. But these may also refer to groups, so
+            # now we go through all the dependencies for all variables and check
+            # if any are actually group variables instead of subvariables.
+            for var_deps in values(dag)
+                for i in eachindex(var_deps)
+                    if var_deps[i] == SubvariableDependency(group_name, variable_name)
+                        var_deps[i] = Dependency(group_var_name)
+                    end
+                end
+            end
+        end
+
+        # And add all the parameters too
+        for (param_sym, param_type) in group_types[group_type_name].parameters
+            param_name = "$group_name.$param_sym"
+            parameters[param_name] = Parameter(param_name, getproperty(object, param_sym))
+        end
+
+        # And all the inputs
+        for (input_name, deps) in ctx_module._xfa_inputs
+            if length(deps) == 2
+                input_group_type_name = deps[1][2].struct_name
+                if input_group_type_name == group_type_name
+                    group_input_name = "$group_name.$input_name"
+                    new_deps = OrderedDict(deps)
+                    # Similarly to variables, we replace the GroupDependency
+                    # that contained the group type name with one that contains
+                    # the instantiated name.
+                    new_deps[first(keys(new_deps))] = GroupDependency(group_name)
+                    inputs[group_input_name] = new_deps
+                end
+            end
+        end
+    end
+
+    # Now we do the same for the inputs: go through all of the declared ones and
+    # add them to the context if they're not part of a group. All the grouped
+    # inputs should already have been added.
+    for (name, deps) in ctx_module._xfa_inputs
+        if length(deps) == 1
+            inputs[name] = Dict(deps)
         end
     end
 
     # Check that it has no cycles by attempting to sort it
     topological_sort(dag)
 
-    return XfaContext(functions, dag, ctx_module._xfa_subvariables, parameters, exprs)
+    return XfaContext(; functions, group_types, groups, dag,
+                      subvariables=ctx_module._xfa_subvariables, parameters, exprs,
+                      input_functions=inputs)
 end
 
 function load_from_file(ctx_path::AbstractString)
@@ -412,32 +640,36 @@ function load_from_file(ctx_path::AbstractString)
     return load_from_string(read(ctx_path, String))
 end
 
+function _get_group_objects(ctx_module, group_types)
+    group_objects = Tuple{String, String, Any}[]
+
+    for name in names(ctx_module; all=true)
+        object = getproperty(ctx_module, name)
+        group_type_name = findfirst(g -> object isa g.type, group_types)
+        if group_type_name != nothing
+            push!(group_objects, (string(name), group_type_name, object))
+        end
+    end
+
+    return group_objects
 end
 
-## Example context file
+function _get_deps(var_name, parameters, ctx_module)
+    final_deps = OrderedDict()
 
-# @Parameter energy_cutoff::Int => 0
+    for (arg_name, dep) in ctx_module._xfa_variables[var_name]
+        if !(dep isa AbstractDependency)
+            throw(ArgumentError("Dependency of type '$(typeof(dep))' is not allowed"))
+        end
 
-# @Parameter function peak_roi(image)::RectROI
-#     return RectROI(0, 0, 100, 100)
-# end
+        if dep isa Dependency && haskey(parameters, dep.name)
+            dep = parameters[dep.name]
+        end
 
-# @Parameter peak2_roi::RectROI => RectROI(0, 0, 100, 100)
+        final_deps[arg_name] = dep
+    end
 
-# @Variable t4 => karabo"MID_EXP_UPP/MOTOR/T4.actualPosition"
+    return final_deps
+end
 
-# @Variable function xgm(intensity => karabo"SA2_XTD10_XGM/DOOCS/XGM:output[data.intensityTD]",
-#                        energy => karabo"SA2_XTD10_XGM/DOOCS/XGM.photonFlux.photonEnergy",
-#                        t4 => t4,
-#                        energy_cutoff => energy_cutoff)
-#     pulse_mean = nanmean(intensity, dims=1)
-
-#     return intensity, @Variable(pulse_mean; style="-", title="Foo", max_points=10_000, vline=energy_cutoff)
-# end
-
-# @Variable function camera_roi(data::Array, roi::RectROI)
-#     roi_data = data[roi]
-#     roi_mean = nanmean(roi_data)
-
-#     return roi_data, @Variable(roi_mean; name="intensity")
-# end
+end

@@ -11,7 +11,8 @@ import ReTest: @testset, @test, @test_throws
 import OrderedCollections: OrderedDict as OD
 
 import XfaEngine.Context
-import XfaEngine.Context: @Variable, @karabo_str, Dependency, KaraboDependency, SubvariableDependency, XfaContextException, Parameter
+import XfaEngine.Context: @Variable, @karabo_str, Dependency, KaraboDependency,
+    GroupDependency, SubvariableDependency, XfaContextException, Parameter, FunctionArgument
 import XfaEngine.KaraboBridge
 import XfaEngine.KaraboBridge: KaraboBridgeClient, KaraboBridgeServer
 
@@ -257,6 +258,92 @@ end
     @test ctx.dag["foo"] == OD("period" => Parameter("period", 2π))
 end
 
+@testset "@Input" begin
+    @test_throws ArgumentError Context._input(@__MODULE__, "foo", false)
+    @test_throws ArgumentError Context._input(@__MODULE__, :(1 + 1), false)
+
+    # Test a standalone input function
+    ctx = Context.load_from_string(raw"""
+    @Input function bridge(output::Channel)
+        put!(output, 42)
+    end
+    """)
+    @test isempty(ctx.dag)
+    @test ctx.input_functions["bridge"] == Dict("output" => FunctionArgument("output", Channel))
+
+    # And a input function that's part of a group
+    ctx = Context.load_from_string(raw"""
+    @Group struct Foo end
+    @Input function bridge(::Foo, output::Channel{Int})
+        put!(output, 42)
+    end
+
+    foo = Foo()
+    """)
+    @test haskey(ctx.input_functions, "foo.bridge")
+    @test ctx.input_functions == Dict("foo.bridge" => OD(nothing => GroupDependency("foo"),
+                                                         "output" => FunctionArgument("output", Channel{Int})))
+
+    # But not one with arbitrary arguments
+    @test_throws XfaContextException Context._input(@__MODULE__,
+                                                    quote
+                                                        function foo(output, bar)
+                                                            42
+                                                        end
+                                                    end, false)
+end
+
+@testset "@Group" begin
+    @test_throws ArgumentError Context._group(@__MODULE__, "foo", false)
+    @test_throws ArgumentError Context._group(@__MODULE__, :(1 + 1), false)
+
+    ctx = Context.load_from_string(raw"""
+    @Group struct Foo end
+
+    @Variable function foo(::Foo)
+        42
+    end
+    """)
+    # Creating a group should add it to the group definitions
+    @test haskey(ctx.group_types, "Foo")
+    @test ctx.group_types["Foo"].variables == ["foo"]
+    # But it shouldn't actually schedule anything
+    @test isempty(ctx.dag)
+
+    # Test instantiating and executing a group
+    ctx = Context.load_from_string(raw"""
+    @Group struct Foo
+        @Parameter bar::Int
+    end
+    @Variable function foo(data::Foo)
+        data.bar
+    end
+
+    foo_group = Foo(42)
+    """)
+
+    @test ctx.dag == Dict("foo_group.foo" => OD("data" => Context.GroupDependency("foo_group")))
+    @test ctx.parameters == Dict("foo_group.bar" => Context.Parameter("foo_group.bar", 42))
+    @test Context.execute_variables(ctx, Dict()) == Dict("foo_group.foo" => 42)
+
+    # Test that the struct can be used as a dependency
+    ctx = Context.load_from_string(raw"""
+    @Group struct Foo
+        value::Float64
+    end
+    @Variable function foo(data::Foo)
+        data.value
+    end
+
+    foo_group = Foo(2π)
+
+    @Variable function bar(data -> foo_group.foo)
+        data
+    end
+    """)
+    @test Context.execute_variables(ctx, Dict()) == Dict("foo_group.foo" => 2π, "bar" => 2π)
+end
+
 @testset "Scheduler" begin
     # Test sorting a DAG with a cycle
     dag = Dict("foo" => ["bar"], "bar" => ["foo"])
@@ -280,9 +367,9 @@ end
     ctx = Context.load_from_string(raw"""
     @Variable camera -> karabo"camera.data"
     """)
-    # Variables shouldn't be executed unless they have all their dependencies
-    @test length(Context.execute(ctx, Dict())) == 0
-    @test Context.execute(ctx, Dict("camera.data" => 1)) == Dict("camera" => 1)
+    # Variables shouldn't be execute_variablesd unless they have all their dependencies
+    @test length(Context.execute_variables(ctx, Dict())) == 0
+    @test Context.execute_variables(ctx, Dict("camera.data" => 1)) == Dict("camera" => 1)
 
     # Variables that throw shouldn't cause execution of the other variables to
     # fail.
@@ -297,7 +384,7 @@ end
     """)
     log = TestLogger()
     with_logger(log) do
-        @test Context.execute(ctx, Dict()) == Dict("bar" => 42)
+        @test Context.execute_variables(ctx, Dict()) == Dict("bar" => 42)
     end
     @test length(log.logs) == 1
     @test occursin("Error executing", log.logs[1].message)
@@ -310,7 +397,7 @@ end
         return (2 * data, norm)
     end
     """)
-    @test Context.execute(ctx, Dict("foo.bar" => 1)) == Dict("foo" => 1, "bar" => (2, 1))
+    @test Context.execute_variables(ctx, Dict("foo.bar" => 1)) == Dict("foo" => 1, "bar" => (2, 1))
 end
 
 @testset "Serialization" begin
