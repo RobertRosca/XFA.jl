@@ -15,7 +15,7 @@ import CImGui: ImVec2, ImVec4, Begin, End
 import CImGui.CSyntax: @c
 import HTTP: WebSockets
 
-import XfaEngine.Context: KaraboDependency
+import XfaEngine.Context: KaraboDependency, Parameter
 import XfaEngine.Protocol: Message, send
 
 import .ImNodes
@@ -113,7 +113,7 @@ function draw_main_menubar(state)
     if IG.BeginMenuBar()
         draw_revise(state)
 
-        @Disabled !state.context_path_valid begin
+        @Disabled state.headnode.status != RemoteStatus'.CONNECTED || !state.context_path_valid begin
             if IG.Button("Apply context")
                 Client.load_context(state)
             end
@@ -138,6 +138,16 @@ function draw_main_menubar(state)
     end
 end
 
+function draw_parameter(param::Parameter{Float64})
+    @c IG.InputDouble(param.name, &param.value)
+end
+
+function draw_parameter(param::Parameter{Int})
+    int32_value = Int32(param.value)
+    @c IG.InputInt(param.name, &int32_value)
+    param.value = Int(int32_value)
+end
+
 function draw_dag(state)
     ImNodes.BeginNodeEditor()
 
@@ -146,21 +156,45 @@ function draw_dag(state)
         min_node_width = 150
         node_id = var_data["id"]
 
+        # Draw titlebar
         ImNodes.BeginNode(node_id)
         ImNodes.BeginNodeTitleBar()
         IG.Text(name)
         ImNodes.EndNodeTitleBar()
 
-        for (dep_id, dep) in var_data["dependencies"]
+        # Draw parameters
+        if !isempty(var_data["parameters"])
+            IG.Text("Parameters:")
+        end
+        for param in values(var_data["parameters"])
+            draw_parameter(param)
+        end
+
+        IG.Dummy(min_node_width, 10)
+
+        # Draw dependencies
+        deps = var_data["dependencies"]
+        for (dep_id, dep_pair) in deps
+            arg_name, dep = dep_pair
+            # Don't draw pins for parameters
+            if dep isa Parameter
+                continue
+            end
+
             pin_shape = dep isa KaraboDependency ? ImNodes.ImNodesPinShape_TriangleFilled : ImNodes.ImNodesPinShape_CircleFilled
 
             ImNodes.BeginInputAttribute(dep_id, pin_shape)
-            IG.Text(string(dep))
+            IG.Text(arg_name)
+            if dep isa KaraboDependency
+                IG.SameLine()
+                InfoMarker(string(dep), "Karabo")
+            end
             ImNodes.EndInputAttribute()
         end
 
         IG.Dummy(min_node_width, 10)
 
+        # Draw outputs
         for (output_id, output) in var_data["outputs"]
             label = string(output)
             ImNodes.BeginOutputAttribute(output_id, ImNodes.ImNodesPinShape_CircleFilled)
@@ -274,6 +308,37 @@ function draw_gui(state)
                 if !state.context_path_valid
                     IG.TextColored(ImVec4(1, 0.2, 0.5, 1), "Path does not point to a valid file!")
                 end
+
+                # Get the webproxy address
+                IG.Text("Use webproxy:")
+                IG.SameLine()
+                edited, new_webproxy_addr = EditableComboBox("##webproxy-address",
+                                                             state.webproxy, WEBPROXY_COMPLETIONS)
+                if edited
+                    state.webproxy = new_webproxy_addr
+                end
+
+                # Update the list of devices
+                if IG.Button("Update device list")
+                    Client.get_devices(state)
+                end
+                IG.SameLine()
+                @cases state.webproxy_status begin
+                    IDLE => IG.Text("Found $(length(state.karabo_devices)) Karabo devices")
+                    WAITING_FOR_DEVICES => Spinner("")
+                    ERROR => IG.Text("Error! Check backend logs.")
+                end
+
+                IG.Dummy(0, 10)
+
+                # Show a list of trainmatchers
+                IG.Text("Found $(length(state.trainmatchers)) matchers:")
+                if IG.BeginListBox("")
+                    for matcher in sort(collect(keys(state.trainmatchers)))
+                        IG.Selectable(matcher)
+                    end
+                    IG.EndListBox()
+                end
             end
         end
 
@@ -331,6 +396,7 @@ function main()
     state.context_path_valid = false
     state.engine_environment = "@xfa-default"
     state.context_state = Dict{String, Any}()
+    state.trainmatchers = Dict{String, Any}()
 
     function on_exit()
         ws = state.headnode.websocket

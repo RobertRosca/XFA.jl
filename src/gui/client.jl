@@ -7,7 +7,7 @@ import HTTP
 import HTTP: WebSockets
 import SumTypes: @cases
 
-import XfaEngine.Context: Dependency
+import XfaEngine.Context: Dependency, Parameter
 import XfaEngine.Protocol: Message, send
 import ..States: RemoteStatus, HeadNode, WebproxyStatus
 import ..ImGuiHelpers: @guiasync
@@ -206,7 +206,19 @@ function build_context_state(state, ctx_info)
 
         new_ctx_state[name]["dependencies"] = []
         new_ctx_state[name]["outputs"] = []
-        for (value_name, current_values) in [("dependencies", deps),
+
+        old_params = var_exists ? ctx_state[name]["parameters"] : Dict()
+        params = Dict([dep.name => dep for dep in values(deps) if dep isa Parameter])
+        for param in values(params)
+            if haskey(old_params, param.name) && typeof(param.value) == typeof(old_params[param.name].value)
+                params[param.name] = old_params[param.name]
+            end
+        end
+
+        new_ctx_state[name]["parameters"] = params
+        non_param_deps = [dep for dep in deps if !(dep isa Parameter)]
+
+        for (value_name, current_values) in [("dependencies", non_param_deps),
                                              ("outputs", ["output", ctx_info["subvariables"][name]...])]
             old_values = var_exists ? map(x -> x[2], ctx_state[name][value_name]) : []
 
@@ -225,7 +237,8 @@ function build_context_state(state, ctx_info)
 
     new_links = []
     for (name, deps) in ctx_info["dag"]
-        for (i, dep) in enumerate(deps)
+        for (i, dep_pair) in enumerate(deps)
+            dep = dep_pair.second
             if dep isa Dependency
                 link_start_id = new_ctx_state[dep.name]["outputs"][1][1]
                 link_end_id = new_ctx_state[name]["dependencies"][i][1]
@@ -250,6 +263,8 @@ function handle_msg(state, msg)
             else
                 state.karabo_devices = data
                 state.webproxy_status = WebproxyStatus'.IDLE
+                state.trainmatchers = filter(x -> occursin("Matcher", x.second["classId"]),
+                                             state.karabo_devices)
             end
         end
 
@@ -358,6 +373,8 @@ end
 function get_devices(state)
     send(state.headnode.websocket, Message'.GET_DEVICES(state.webproxy))
     state.webproxy_status = WebproxyStatus'.WAITING_FOR_DEVICES
+    empty!(state.karabo_devices)
+    empty!(state.trainmatchers)
 end
 
 function load_context(state)
