@@ -269,7 +269,7 @@ end
     end
     """)
     @test isempty(ctx.dag)
-    @test ctx.input_functions["bridge"] == Dict("output" => FunctionArgument("output", Channel))
+    @test ctx.inputs["bridge"] == Dict("output" => FunctionArgument("output", Channel))
 
     # And a input function that's part of a group
     ctx = Context.load_from_string(raw"""
@@ -280,8 +280,8 @@ end
 
     foo = Foo()
     """)
-    @test haskey(ctx.input_functions, "foo.bridge")
-    @test ctx.input_functions == Dict("foo.bridge" => OD(nothing => GroupDependency("foo"),
+    @test haskey(ctx.inputs, "foo.bridge")
+    @test ctx.inputs == Dict("foo.bridge" => OD(nothing => GroupDependency("foo"),
                                                          "output" => FunctionArgument("output", Channel{Int})))
 
     # But not one with arbitrary arguments
@@ -398,6 +398,19 @@ end
     end
     """)
     @test Context.execute_variables(ctx, Dict("foo.bar" => 1)) == Dict("foo" => 1, "bar" => (2, 1))
+
+    # Test executing a complete context file
+    ctx = Context.load_from_string(raw"""
+    @Input function fakecamera(output::Channel)
+        tid = 0
+        data = Dict("camera" => rand(100, 100))
+        while true
+            put!(output, (tid, data))
+            tid += 1
+        end
+    end
+    """)
+    # @show Context.execute_stream(ctx)
 end
 
 @testset "Serialization" begin

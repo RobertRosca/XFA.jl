@@ -11,6 +11,10 @@ struct XfaContextException <: Exception
     msg::String
 end
 
+struct XfaExecutionException <: Exception
+    msg::String
+end
+
 abstract type AbstractDependency end
 
 struct Dependency <: AbstractDependency
@@ -348,9 +352,11 @@ end
     parameters::Dict{String, Parameter}
     exprs::Vector{Expr}
 
-    input_functions::Dict{String, Any}
-    ext_inputs_channel::Channel = Channel()
+    inputs::Dict{String, Any}
+    ext_inputs_channel::Union{Channel, Nothing} = nothing
+    inputs_tasks::Dict{String, Task} = Dict()
     exec_task::Union{Task, Nothing} = nothing
+    variable_outputs_channel::Union{Channel, Nothing} = nothing
 end
 
 XfaContext = XfaContext10
@@ -358,7 +364,7 @@ XfaContext = XfaContext10
 function Base.show(io::IO, ctx::XfaContext)
     n_variables = length(ctx.functions)
     n_params = length(ctx.parameters)
-    print(io, "<XfaContext with $(n_variables) variables and $(n_params) parameters>")
+    print(io, "XfaContext($(n_variables) variables, $(n_params) parameters)")
 end
 
 """
@@ -472,6 +478,67 @@ function execute_variables(ctx::XfaContext, inputs::Dict)
     return results
 end
 
+function _execute_input(ctx::XfaContext, input_name)
+    deps = ctx.inputs[input_name]
+    args = []
+    if length(deps) == 2
+        push!(args, ctx.groups[deps[1].struct_name])
+    end
+    push!(args, ctx.ext_inputs_channel)
+
+    try
+        ctx.functions[input_name](args...)
+    catch ex
+        @error "Error executing input $(input_name)!" exception=ex
+    end
+end
+
+function _execute_pipeline(ctx::XfaContext)
+    train_inputs = OrderedDict{Int, Any}()
+    wake_condition = Threads.Condition()
+
+    reader_task = Threads.@spawn begin
+        for (train_id, data) in ctx.ext_inputs_channel
+            train_inputs[train_id] = merge(get(train_inputs, train_id, Dict()), data)
+            @lock wake_condition notify(wake_condition)
+        end
+
+        empty!(train_inputs)
+        @lock wake_condition notify(wake_condition)
+    end
+
+    while !istaskdone(reader_task)
+        @lock wake_condition wait(wake_condition)
+
+        # If there are no inputs, that's the sign that a stop has been requested
+        if isempty(train_inputs)
+            break
+        end
+
+        execute_variables(ctx, popfirst!(train_inputs))
+    end
+end
+
+function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50)
+    required_inputs = external_dependencies(ctx)
+
+    # Clear any state from previous executions
+    if !isnothing(ctx.ext_inputs_channel) && isopen(ctx.ext_inputs_channel)
+        throw(XfaExecutionException("Context is still being executed, cannot start it twice"))
+    end
+    ctx.ext_inputs_channel = Channel(input_buffer_size)
+
+    empty!(ctx.inputs_tasks)
+    for name in keys(ctx.inputs)
+        ctx.inputs_tasks[name] = Threads.@spawn _execute_input(ctx, name)
+    end
+
+    ctx.exec_task = Threads.@spawn _execute_pipeline(ctx)
+end
+
+function stop_pipeline(ctx::XfaContext; timeout=5)
+    close(ctx.ext_inputs_channel)
+end
 
 function load_from_string(ctx_str::AbstractString)
     ctx_module = Module()
@@ -629,7 +696,7 @@ function load_from_string(ctx_str::AbstractString)
 
     return XfaContext(; functions, group_types, groups, dag,
                       subvariables=ctx_module._xfa_subvariables, parameters, exprs,
-                      input_functions=inputs)
+                      inputs)
 end
 
 function load_from_file(ctx_path::AbstractString)
