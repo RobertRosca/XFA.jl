@@ -6,7 +6,9 @@ using Serialization
 import HTTP
 import HTTP: WebSockets
 import SumTypes: @cases
-import XfelAnalyserEngine.Protocol: Message, send
+
+import XfaEngine.Context: Dependency, Parameter
+import XfaEngine.Protocol: Message, send
 import ..States: RemoteStatus, HeadNode, WebproxyStatus
 import ..ImGuiHelpers: @guiasync
 import ...Util
@@ -27,23 +29,37 @@ function initialize_engine(state)
         is_local = headnode.address == "localhost"
         working_dir = is_local ? pwd() : "/scratch/xfa"
 
+        environment = state.engine_environment
+        is_shared_environment = startswith(environment, "@")
+        if is_shared_environment
+            environment = environment[2:end]
+        end
+
         # Warning: do not put single quotes in this string! It'll break the
         # escaping into the SSH command.
         bootstrap = """
                     import Pkg
                     import TOML
+                    using Printf
 
                     # Install the package
-                    Pkg.activate("xfa-default"; shared=true)
+                    Pkg.activate("$(environment)"; shared=$(is_shared_environment))
                     proxy = "exflproxy01:3128"
+                    dependencies = ["Revise", "LoggingFormats", "LoggingExtras"]
+
                     if $(is_local)
-                        Pkg.develop(path=joinpath(homedir(), "git/XFA/XfelAnalyserEngine"))
+                        Pkg.develop(path=joinpath(homedir(), "git/XFA/XfaEngine"))
+                        for pkg in dependencies
+                            Pkg.add(pkg)
+                        end
+                        Pkg.instantiate()
                     else
                         withenv("http_proxy" => proxy, "https_proxy" => proxy) do
-                            # Pkg.add(path=joinpath(homedir(), "git/XFA"), subdir="XfelAnalyserEngine")
-                            Pkg.develop(path=joinpath(homedir(), "git/XFA/XfelAnalyserEngine"))
-                            Pkg.add("LoggingFormats")
-                            Pkg.add("LoggingExtras")
+                            # Pkg.add(path=joinpath(homedir(), "git/XFA"), subdir="XfaEngine")
+                            Pkg.develop(path=joinpath(homedir(), "git/XFA/XfaEngine"))
+                            for pkg in dependencies
+                                Pkg.add(pkg)
+                            end
                             Pkg.instantiate()
                         end
                     end
@@ -64,11 +80,11 @@ function initialize_engine(state)
 
                     # Launch the engine if necessary
                     if !isfile(toml_path)
-                        import XfelAnalyserEngine
-                        launcher_script = joinpath(dirname(pathof(XfelAnalyserEngine)), "launcher.jl")
+                        import XfaEngine
+                        launcher_script = joinpath(dirname(pathof(XfaEngine)), "launcher.jl")
                         mkpath(working_dir)
                         cd(working_dir) do
-                            cmd = `julia --project="@xfa-default" --color=no --startup-file=no \$(launcher_script)`
+                            cmd = `julia --project="$(state.engine_environment)" --color=no --startup-file=no \$(launcher_script)`
                             println("Launching: " * string(cmd))
                             run(detach(cmd); wait=false)
                         end
@@ -76,12 +92,13 @@ function initialize_engine(state)
 
                     # Wait for up to 30s for it to start
                     start = time()
-                    while !isfile(toml_path)
+                    while !isfile(toml_path) || filesize(toml_path) == 0
                         elapsed = time() - start
                         if elapsed > 30
                             error("Timeout while waiting for engine to start in \$(working_dir)")
                         else
-                            println("Waiting for engine to start... \$(elapsed)s")
+                            elapsed_str = @sprintf "%.2fs" elapsed
+                            println("Waiting for engine to start... \$(elapsed_str)")
                             sleep(1)
                         end
                     end
@@ -133,6 +150,9 @@ end
 
 function shutdown_server(state)
     headnode = state.headnode
+    if headnode.websocket == nothing
+        return
+    end
 
     if !WebSockets.isclosed(headnode.websocket)
         send(headnode.websocket, Message'.HCF)
@@ -156,9 +176,86 @@ function shutdown_server(state)
     end
 end
 
+function build_context_state(state, ctx_info)
+    ctx_state = state.context_state
+    new_ctx_state = Dict{String, Any}()
+
+    used_ids = Set()
+    for (name, value) in ctx_state
+        push!(used_ids, value["id"])
+        for (dep_id, _) in value["dependencies"]
+            push!(used_ids, dep_id)
+        end
+        for (output_id, _) in value["outputs"]
+            push!(used_ids, output_id)
+        end
+        for (link_id, _, _) in value["links"]
+            push!(used_ids, link_id)
+        end
+    end
+
+    id_pool = setdiff(Set(1:999), used_ids)
+
+    for (name, deps) in ctx_info["dag"]
+        var_exists = haskey(ctx_state, name)
+        if var_exists
+            new_ctx_state[name] = ctx_state[name]
+        else
+            new_ctx_state[name] = Dict{String, Any}("id" => pop!(id_pool))
+        end
+
+        new_ctx_state[name]["dependencies"] = []
+        new_ctx_state[name]["outputs"] = []
+
+        old_params = var_exists ? ctx_state[name]["parameters"] : Dict()
+        params = Dict([dep.name => dep for dep in values(deps) if dep isa Parameter])
+        for param in values(params)
+            if haskey(old_params, param.name) && typeof(param.value) == typeof(old_params[param.name].value)
+                params[param.name] = old_params[param.name]
+            end
+        end
+
+        new_ctx_state[name]["parameters"] = params
+        non_param_deps = [dep for dep in deps if !(dep isa Parameter)]
+
+        for (value_name, current_values) in [("dependencies", non_param_deps),
+                                             ("outputs", ["output", ctx_info["subvariables"][name]...])]
+            old_values = var_exists ? map(x -> x[2], ctx_state[name][value_name]) : []
+
+            for value in current_values
+                old_idx = findfirst(==(value), old_values)
+
+                if old_idx != nothing
+                    push!(new_ctx_state[name][value_name],
+                          ctx_state[name][value_name][old_idx])
+                else
+                    push!(new_ctx_state[name][value_name], (pop!(id_pool), value))
+                end
+            end
+        end
+    end
+
+    new_links = []
+    for (name, deps) in ctx_info["dag"]
+        for (i, dep_pair) in enumerate(deps)
+            dep = dep_pair.second
+            if dep isa Dependency
+                link_start_id = new_ctx_state[dep.name]["outputs"][1][1]
+                link_end_id = new_ctx_state[name]["dependencies"][i][1]
+                push!(new_links, (pop!(id_pool), link_start_id, link_end_id))
+            end
+        end
+
+        new_ctx_state[name]["links"] = new_links
+    end
+
+    return new_ctx_state
+end
+
 function handle_msg(state, msg)
     @cases msg begin
         PONG => nothing
+
         DEVICES(data) => begin
             if data isa Exception
                 @error "Error from server with DEVICES" exception=data
@@ -166,10 +263,16 @@ function handle_msg(state, msg)
             else
                 state.karabo_devices = data
                 state.webproxy_status = WebproxyStatus'.IDLE
+                state.trainmatchers = filter(x -> occursin("Matcher", x.second["classId"]),
+                                             state.karabo_devices)
             end
         end
 
-        [PING, HCF, GET_DEVICES] => nothing
+        CONTEXT_INFO(info) => begin
+            state.context_state = build_context_state(state, info)
+        end
+
+        [PING, HCF, GET_DEVICES, LOAD_CONTEXT, REVISE] => nothing
     end
 end
 
@@ -199,7 +302,12 @@ function handle_server(state)
                 for msg_bytes in ws
                     buffer = IOBuffer(msg_bytes)
                     msg::Message = deserialize(buffer)
-                    @invokelatest handle_msg(state, msg)
+
+                    try
+                        @invokelatest handle_msg(state, msg)
+                    catch ex
+                        @error "Error handling message!" exception=(ex, catch_backtrace())
+                    end
                 end
 
                 @info "Connection to server closed ❌"
@@ -235,9 +343,46 @@ function handle_server(state)
     end
 end
 
+"""
+Simple function to create a client and print server messages.
+
+This is an internal function meant to help with debugging.
+"""
+function test_connect(port=1331)
+    headnode = HeadNode()
+    headnode.address = "ws://localhost:$(port)"
+
+    t = Threads.@spawn WebSockets.open(headnode.address) do ws
+        headnode.websocket = ws
+
+        id = WebSockets.receive(ws)
+        headnode.client_id = id
+
+        for msg_bytes in ws
+            buffer = IOBuffer(msg_bytes)
+            msg::Message = deserialize(buffer)
+            @show msg
+        end
+
+        @info "Connection to $(headnode.address) closed"
+    end
+
+    return headnode, errormonitor(t)
+end
+
 function get_devices(state)
     send(state.headnode.websocket, Message'.GET_DEVICES(state.webproxy))
     state.webproxy_status = WebproxyStatus'.WAITING_FOR_DEVICES
+    empty!(state.karabo_devices)
+    empty!(state.trainmatchers)
+end
+
+function load_context(state)
+    send(state.headnode.websocket, Message'.LOAD_CONTEXT(state.context_path))
+end
+
+function revise_engine(state)
+    send(state.headnode.websocket, Message'.REVISE)
 end
 
 end

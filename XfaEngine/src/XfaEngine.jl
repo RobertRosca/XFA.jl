@@ -1,19 +1,23 @@
-module XfelAnalyserEngine
+module XfaEngine
 
+include("karabo_bridge.jl")
 include("protocol.jl")
 include("webproxy.jl")
 include("context.jl")
 
 import TOML
 import Sockets: listen, close, @ip_str
-import Distributed: @fetchfrom, workers, procs
+import Distributed: @everywhere, @fetchfrom, workers, procs
 using Serialization
 
 import HTTP
 import HTTP: WebSockets
+import Revise
 import SumTypes: @cases
+
 import .Protocol: Message, send
 import .WebProxy
+import .Context: XfaContext
 
 
 """Find the closest available port to `port_hint`."""
@@ -53,6 +57,7 @@ end
     karabo_bridge_port::Int = -1
     websocket_listener_task::Union{Task, Nothing} = nothing
     clients::Dict{String, ClientState} = Dict()
+    ctx::Union{XfaContext, Nothing} = nothing
 
     halt_and_catch_fire::Base.Event = Base.Event()
 end
@@ -113,7 +118,18 @@ function handle_message(msg::Message, state::EngineState, id)
             end
         end
 
-        [PONG, DEVICES] => @error "Received unsupported message"
+        LOAD_CONTEXT(context_path) => begin
+            state.ctx = Context.load_from_file(context_path)
+            send(ws, Message'.CONTEXT_INFO(Context.to_dict(state.ctx)))
+            @info "Loaded context file $(context_path): $(state.ctx)"
+        end
+
+        REVISE => begin
+            @everywhere Revise.retry()
+            @info "Revised source code"
+        end
+
+        [PONG, DEVICES, CONTEXT_INFO] => @error "Received unsupported message"
     end
 end
 
@@ -129,7 +145,12 @@ function handle_client(state::EngineState, id)
     for msg_bytes in ws
         buffer = IOBuffer(msg_bytes)
         msg = deserialize(buffer)
-        @invokelatest handle_message(msg, state, id)
+
+        try
+            @invokelatest handle_message(msg, state, id)
+        catch ex
+            @error "Caught exception when handling message from $(id)" exception=(ex, catch_backtrace())
+        end
     end
 
     delete!(state.clients, id)
@@ -158,7 +179,11 @@ function main(halt_and_catch_fire=Base.Event())
             state.clients[id] = client
             handle_client(state, id)
         catch ex
-            @error "Error while handling client connecton" exception=(ex, catch_backtrace())
+            if ex isa EOFError
+                @info "Client $(id) disconnected"
+            else
+                @error "Error while handling client connecton" exception=(ex, catch_backtrace())
+            end
         end
     end
 

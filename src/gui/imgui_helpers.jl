@@ -2,7 +2,7 @@ module ImGuiHelpers
 
 import ...Util
 
-export MenuItem, EditableComboBox, Spinner, SafeInputText, BoxedText, @guiasync, @Disabled, IsItemDisabled
+export MenuItem, EditableComboBox, Spinner, SafeInputText, BoxedText, @guiasync, @Disabled, IsItemDisabled, InfoMarker
 
 import CImGui as IG
 import CImGui: IM_COL32, ImVec2
@@ -34,6 +34,7 @@ function EditableComboBox(label, text, completions;
     popup_flags |= IG.ImGuiWindowFlags_ChildWindow
 
     edited = false
+    current_input = unsafe_string(pointer(input))
     if IG.BeginPopup(label, popup_flags)
         # If the widget isn't active or we've finished editing, close the popup
         # Otherwise, build the list of completions
@@ -107,6 +108,14 @@ end
 function IsItemDisabled()
     imgui_ctx = unsafe_load(IG.GetCurrentContext())
     return (imgui_ctx.LastItemData.InFlags & IG.ImGuiItemFlags_Disabled) != 0
+end
+
+function InfoMarker(message::AbstractString, marker::AbstractString="?")
+    IG.TextDisabled("[$(marker)]")
+    if IG.IsItemHovered() && IG.BeginTooltip()
+        IG.Text(message)
+        IG.EndTooltip()
+    end
 end
 
 end

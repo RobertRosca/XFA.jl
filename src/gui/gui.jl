@@ -1,5 +1,6 @@
 module GUI
 
+include("imnodes.jl")
 include("renderer.jl")
 include("imgui_helpers.jl")
 include("states.jl")
@@ -10,10 +11,14 @@ import SumTypes: @cases
 import Revise
 import ImPlot as PLT
 import CImGui as IG
-import CImGui: ImVec2, Begin, End
+import CImGui: ImVec2, ImVec4, Begin, End
 import CImGui.CSyntax: @c
-import XfelAnalyserEngine.Protocol: Message, send
+import HTTP: WebSockets
 
+import XfaEngine.Context: KaraboDependency, Parameter
+import XfaEngine.Protocol: Message, send
+
+import .ImNodes
 import .Renderer
 using .ImGuiHelpers
 import .States: HeadNode, RemoteStatus, WebproxyStatus
@@ -90,18 +95,29 @@ end
 #     end
 # end
 
-function draw_revise()
+function draw_revise(state)
     can_revise = length(Revise.revision_queue) > 0
     @Disabled !can_revise begin
         if IG.Button(can_revise ? "Revise*" : "Revise")
             Revise.retry()
+
+            headnode = state.headnode
+            if headnode.status == RemoteStatus'.CONNECTED
+                Client.revise_engine(state)
+            end
         end
     end
 end
 
 function draw_main_menubar(state)
     if IG.BeginMenuBar()
-        draw_revise()
+        draw_revise(state)
+
+        @Disabled state.headnode.status != RemoteStatus'.CONNECTED || !state.context_path_valid begin
+            if IG.Button("Apply context")
+                Client.load_context(state)
+            end
+        end
 
         if IG.BeginMenu("Tools")
             if IG.BeginMenu("Demos")
@@ -122,54 +138,82 @@ function draw_main_menubar(state)
     end
 end
 
-function draw_webproxy_connection(state)
-    # Set up connection to a Karabo WebProxy
-    IG.Text("Select a default web proxy:")
-    IG.SameLine()
+function draw_parameter(param::Parameter{Float64})
+    @c IG.InputDouble(param.name, &param.value)
+end
 
-    @Disabled state.webproxy_status == WebproxyStatus'.WAITING_FOR_DEVICES begin
-        edited, new_endpoint = EditableComboBox("##select_webproxy",
-                                                state.webproxy,
-                                                WEBPROXY_COMPLETIONS)
-        IG.SameLine()
-        if IG.Button("Reload")
-            Client.get_devices(state)
-            state.current_trainmatcher = Cint(0)
+function draw_parameter(param::Parameter{Int})
+    int32_value = Int32(param.value)
+    @c IG.InputInt(param.name, &int32_value)
+    param.value = Int(int32_value)
+end
+
+function draw_dag(state)
+    ImNodes.BeginNodeEditor()
+
+    ctx_state = state.context_state
+    for (name, var_data) in ctx_state
+        min_node_width = 150
+        node_id = var_data["id"]
+
+        # Draw titlebar
+        ImNodes.BeginNode(node_id)
+        ImNodes.BeginNodeTitleBar()
+        IG.Text(name)
+        ImNodes.EndNodeTitleBar()
+
+        # Draw parameters
+        if !isempty(var_data["parameters"])
+            IG.Text("Parameters:")
+        end
+        for param in values(var_data["parameters"])
+            draw_parameter(param)
+        end
+
+        IG.Dummy(min_node_width, 10)
+
+        # Draw dependencies
+        deps = var_data["dependencies"]
+        for (dep_id, dep_pair) in deps
+            arg_name, dep = dep_pair
+            # Don't draw pins for parameters
+            if dep isa Parameter
+                continue
+            end
+
+            pin_shape = dep isa KaraboDependency ? ImNodes.ImNodesPinShape_TriangleFilled : ImNodes.ImNodesPinShape_CircleFilled
+
+            ImNodes.BeginInputAttribute(dep_id, pin_shape)
+            IG.Text(arg_name)
+            if dep isa KaraboDependency
+                IG.SameLine()
+                InfoMarker(string(dep), "Karabo")
+            end
+            ImNodes.EndInputAttribute()
+        end
+
+        IG.Dummy(min_node_width, 10)
+
+        # Draw outputs
+        for (output_id, output) in var_data["outputs"]
+            label = string(output)
+            ImNodes.BeginOutputAttribute(output_id, ImNodes.ImNodesPinShape_CircleFilled)
+            IG.Indent(min_node_width - IG.CalcTextSize(label).x)
+            IG.Text(label)
+            ImNodes.EndOutputAttribute()
+        end
+
+        ImNodes.EndNode()
+    end
+
+    for var_data in values(ctx_state)
+        for (link_id, start_id, end_id) in var_data["links"]
+            ImNodes.Link(link_id, start_id, end_id)
         end
     end
 
-    # Connect immediately if changed
-    endpoint_changed = edited && new_endpoint != state.webproxy
-    if endpoint_changed
-        state.webproxy = new_endpoint
-        Client.get_devices(state)
-        state.current_trainmatcher = Cint(0)
-    end
-
-    # Display webproxy status
-    IG.Dummy(0, 10)
-    if state.webproxy_status == WebproxyStatus'.IDLE
-        trainmatchers = sort([name for (name, properties) in state.karabo_devices
-                                  if properties["classId"] ∈ ("TrainMatcher", "ShmemTrainMatcher")])
-
-        if length(trainmatchers) > 0
-            IG.Text("Selected trainmatcher: $(trainmatchers[state.current_trainmatcher + 1])")
-            @c IG.ListBox("$(length(trainmatchers)) trainmatchers available", &state.current_trainmatcher,
-                          trainmatchers, length(trainmatchers), 10)
-        else
-            IG.Text("No trainmatchers found out of $(length(state.karabo_devices)) devices 😞")
-        end
-    elseif state.webproxy_status == WebproxyStatus'.WAITING_FOR_DEVICES
-        Spinner("Waiting for device list")
-    elseif state.webproxy_status == WebproxyStatus'.ERROR
-        IG.Text("Error connecting to the webproxy:")
-        IG.SameLine()
-        if IG.SmallButton("Copy to clipboard")
-            # IG.SetClipboardText(webproxy.last_error)
-        end
-
-        BoxedText("##webproxy_last_error", "Foo")
-    end
+    ImNodes.MiniMap()
+    ImNodes.EndNodeEditor()
 end
 
 ## Main GUI function
@@ -187,61 +231,125 @@ function draw_gui(state)
     main_window_flags |= IG.ImGuiWindowFlags_MenuBar
     main_window_flags |= IG.ImGuiWindowFlags_HorizontalScrollbar
 
+    headnode = state.headnode
+
     # Draw the main window
     if Begin("Main window", C_NULL, main_window_flags)
         # Draw the menubar
         draw_main_menubar(state)
 
-        headnode = state.headnode
+        IG.BeginTabBar("main-tab-bar")
+        if IG.BeginTabItem("Setup")
+            IG.EndTabItem()
 
-        can_connect = (headnode.status != RemoteStatus'.CONNECTING &&
-            headnode.status != RemoteStatus'.CONNECTED)
-        @Disabled !can_connect begin
-            @c IG.Checkbox("Connect to cluster node:", &state.connect_to_cluster)
-        end
-        IG.SameLine()
-        @Disabled !state.connect_to_cluster || !can_connect begin
-            edited, new_address = SafeInputText("##headnode"; hint="exflonc24.desy.de",
-                                                current_text=default(headnode.address))
-        end
-
-        if edited
-            @info "New address: $(new_address)"
-            headnode.address = new_address
-        end
-
-        IG.Spacing()
-        disable_connect = (headnode.status == RemoteStatus'.CONNECTED
-                           || headnode.status == RemoteStatus'.CONNECTING
-                           || !state.connect_to_cluster
-                           || length(headnode.address) == 0)
-        @Disabled disable_connect begin
-            if IG.Button("Connect")
-                @guiasync Client.initialize_engine(state)
+            can_connect = (headnode.status != RemoteStatus'.CONNECTING &&
+                headnode.status != RemoteStatus'.CONNECTED)
+            @Disabled !can_connect begin
+                @c IG.Checkbox("Connect to cluster node:", &state.connect_to_cluster)
             end
-        end
-        IG.SameLine()
-        @Disabled headnode.status != RemoteStatus'.CONNECTED begin
-            if IG.Button("Disconnect & shutdown")
-                Client.shutdown_server(state)
+            IG.SameLine()
+            @Disabled !state.connect_to_cluster || !can_connect begin
+                edited, new_address = SafeInputText("##headnode"; hint="exflonc24.desy.de",
+                                                    current_text=default(headnode.address))
+
+                IG.Text("Use environment:")
+                IG.SameLine()
+                env_edited, new_environment = SafeInputText("##engine-environment";
+                                                            current_text=default(state.engine_environment))
             end
-        end
 
-        IG.Dummy(0, 10)
-        if headnode.status == RemoteStatus'.CONNECTING
-            Spinner("Connecting to cluster...")
-            BoxedText("##headnode_cmd_output", String(take!(copy(state.headnode_cmd_output))))
-        elseif headnode.status == RemoteStatus'.ERROR
-            IG.Text("Error connecting to node:")
-            BoxedText("##headnode_last_error", headnode.last_error)
-        elseif headnode.status == RemoteStatus'.CONNECTED
-            IG.Text("Connected with client ID: $(headnode.client_id)")
-        end
+            if edited
+                headnode.address = new_address
+            end
+            if env_edited
+                state.engine_environment = new_environment
+            end
 
-        if headnode.status == RemoteStatus'.CONNECTED
             IG.Spacing()
-            draw_webproxy_connection(state)
+            disable_connect = (headnode.status == RemoteStatus'.CONNECTED
+                               || headnode.status == RemoteStatus'.CONNECTING
+                               || !state.connect_to_cluster
+                               || length(headnode.address) == 0)
+            @Disabled disable_connect begin
+                if IG.Button("Connect")
+                    @guiasync Client.initialize_engine(state)
+                end
+            end
+            IG.SameLine()
+            @Disabled headnode.status != RemoteStatus'.CONNECTED begin
+                if IG.Button("Disconnect & shutdown")
+                    Client.shutdown_server(state)
+                end
+            end
+
+            IG.Dummy(0, 10)
+            if headnode.status == RemoteStatus'.CONNECTING
+                Spinner("Connecting to cluster...")
+                BoxedText("##headnode_cmd_output", String(take!(copy(state.headnode_cmd_output))))
+            elseif headnode.status == RemoteStatus'.ERROR
+                IG.Text("Error connecting to node:")
+                BoxedText("##headnode_last_error", headnode.last_error)
+            elseif headnode.status == RemoteStatus'.CONNECTED
+                IG.Text("Connected with client ID: $(headnode.client_id)")
+
+                IG.Dummy(0, 2)
+                IG.Separator()
+                IG.Dummy(0, 2)
+
+                IG.Text("Use context file:")
+                IG.SameLine()
+                edited, new_context_path = SafeInputText("##context-file";
+                                                         current_text=default(state.context_path))
+                if edited
+                    state.context_path = expanduser(new_context_path)
+                    state.context_path_valid = isfile(state.context_path)
+                end
+
+                if !state.context_path_valid
+                    IG.TextColored(ImVec4(1, 0.2, 0.5, 1), "Path does not point to a valid file!")
+                end
+
+                # Get the webproxy address
+                IG.Text("Use webproxy:")
+                IG.SameLine()
+                edited, new_webproxy_addr = EditableComboBox("##webproxy-address",
+                                                             state.webproxy, WEBPROXY_COMPLETIONS)
+                if edited
+                    state.webproxy = new_webproxy_addr
+                end
+
+                # Update the list of devices
+                if IG.Button("Update device list")
+                    Client.get_devices(state)
+                end
+                IG.SameLine()
+                @cases state.webproxy_status begin
+                    IDLE => IG.Text("Found $(length(state.karabo_devices)) Karabo devices")
+                    WAITING_FOR_DEVICES => Spinner("")
+                    ERROR => IG.Text("Error! Check backend logs.")
+                end
+
+                IG.Dummy(0, 10)
+
+                # Show a list of trainmatchers
+                IG.Text("Found $(length(state.trainmatchers)) matchers:")
+                if IG.BeginListBox("")
+                    for matcher in sort(collect(keys(state.trainmatchers)))
+                        IG.Selectable(matcher)
+                    end
+                    IG.EndListBox()
+                end
+            end
         end
+
+        @Disabled headnode.status != RemoteStatus'.CONNECTED || isempty(state.context_state) begin
+            if IG.BeginTabItem("Analysis pipeline")
+                draw_dag(state)
+                IG.EndTabItem()
+            end
+        end
+
+        IG.EndTabBar()
 
         End()
     end
@@ -262,8 +370,9 @@ function draw_gui(state)
 end
 
 """Start the XFA GUI."""
-function start_gui()
+function main()
     app = Renderer.ImGuiApp(; title="XFA", fonts=[
+        (joinpath(@__DIR__, "fonts", "Inter-Regular.otf"), 17),
         (joinpath(@__DIR__, "fonts", "JuliaMono-Regular.ttf"), 15),
         (joinpath(@__DIR__, "fonts", "JuliaMono-Regular.ttf"), 16)
     ])
@@ -283,8 +392,20 @@ function start_gui()
     empty!(wip_state)
     state.headnode_cmd_output = IOBuffer()
     state.current_trainmatcher = Cint(0)
+    state.context_path = ""
+    state.context_path_valid = false
+    state.engine_environment = "@xfa-default"
+    state.context_state = Dict{String, Any}()
+    state.trainmatchers = Dict{String, Any}()
 
-    Renderer.render(app) do
+    function on_exit()
+        ws = state.headnode.websocket
+        if ws != nothing && !WebSockets.isclosed(ws)
+            close(ws)
+        end
+    end
+
+    Renderer.render(app; on_exit) do
         if state.disable_rendering
             # Occasionally an exception will occur in the middle of a disabled
             # section, which helpfully also disables the continue button
@@ -295,7 +416,7 @@ function start_gui()
             end
 
             IG.Text("Render loop crashed, continue when ready:")
-            draw_revise()
+            draw_revise(state)
             IG.SameLine()
             state.disable_rendering = !IG.Button("Continue")
             return
