@@ -14,6 +14,7 @@ import CImGui as IG
 import CImGui: ImVec2, ImVec4, Begin, End
 import CImGui.CSyntax: @c
 import HTTP: WebSockets
+import LibSSH as ssh
 
 import XfaEngine.Context: KaraboDependency, Parameter
 import XfaEngine.Protocol: Message, send
@@ -21,8 +22,7 @@ import XfaEngine.Protocol: Message, send
 import .ImNodes
 import .Renderer
 using .ImGuiHelpers
-import .States: HeadNode, RemoteStatus, WebproxyStatus
-import .Client
+import .States: GuiState, ClientState, RemoteStatus
 import ..Util
 
 const WEBPROXY_COMPLETIONS::Vector{String} = [
@@ -35,49 +35,6 @@ const WEBPROXY_COMPLETIONS::Vector{String} = [
     "sqs-rr-sys-con-gui1:8484",
     "sxp-rr-sys-con-gui1:8484"
 ]
-
-## Store the state of the GUI between a struct and dict for easy modification
-## without having to restart Julia.
-
-@kwdef mutable struct GuiState
-    app::Renderer.ImGuiApp
-    disable_rendering::Bool = false
-
-    # Showing external tool windows
-    show_imgui_demo::Bool = false
-    show_imgui_metrics::Bool = false
-    show_implot_metrics::Bool = false
-    show_implot_demo::Bool = false
-    show_stacktool::Bool = false
-    show_debug_log::Bool = false
-
-    # Connections to remote things
-    headnode::HeadNode = HeadNode()
-    connect_to_cluster::Bool = true
-    webproxy::String = WEBPROXY_COMPLETIONS[1]
-    webproxy_status::WebproxyStatus = WebproxyStatus'.IDLE
-
-    # Karabo status
-    karabo_devices::Dict{String, Any} = Dict()
-end
-
-wip_state::Dict{Symbol, Any} = Dict()
-
-function Base.getproperty(state::GuiState, sym::Symbol)
-    if sym in fieldnames(GuiState)
-        return getfield(state, sym)
-    else
-        return wip_state[sym]
-    end
-end
-
-function Base.setproperty!(state::GuiState, sym::Symbol, value)
-    if sym in fieldnames(GuiState)
-        setfield!(state, sym, value)
-    else
-        wip_state[sym] = value
-    end
-end
 
 ## Helper functions for the GUI
 
@@ -101,8 +58,8 @@ function draw_revise(state)
         if IG.Button(can_revise ? "Revise*" : "Revise")
             Revise.retry()
 
-            headnode = state.headnode
-            if headnode.status == RemoteStatus'.CONNECTED
+            client = state.client
+            if client.status == RemoteStatus'.CONNECTED
                 Client.revise_engine(state)
             end
         end
@@ -113,7 +70,7 @@ function draw_main_menubar(state)
     if IG.BeginMenuBar()
         draw_revise(state)
 
-        @Disabled state.headnode.status != RemoteStatus'.CONNECTED || !state.context_path_valid begin
+        @Disabled state.client.status != RemoteStatus'.CONNECTED || !state.context_path_valid begin
             if IG.Button("Apply context")
                 Client.load_context(state)
             end
@@ -216,6 +173,101 @@ function draw_dag(state)
     ImNodes.EndNodeEditor()
 end
 
+function draw_ssh_auth(state)
+    client = state.client
+
+    for (hop_idx, ssh_state) in enumerate(client.ssh_hops)
+        if ssh_state.auth_state == ssh.AuthStatus_Success
+            IG.BulletText("Successfully authenticated to $(ssh_state.address)")
+            continue
+        elseif isnothing(ssh_state.session)
+            if ssh_state.auth_state == :connecting
+                IG.BulletText("Connecting to $(ssh_state.address) ")
+                IG.SameLine()
+                Spinner()
+            else
+                IG.BulletText("Next hop: $(ssh_state.address)")
+            end
+            continue
+        end
+
+        host = if isnothing(ssh_state.session) || !isopen(ssh_state.session)
+            ssh_state.address
+        else
+            "$(ssh_state.session.user)@$(ssh_state.address)"
+        end
+
+        IG.BulletText("Connecting to $host:")
+
+        # Only continue if we're connected
+        if isnothing(ssh_state.session)
+            continue
+        end
+
+        IG.Indent()
+
+        auth_state = ssh_state.auth_state
+        auth_method = ssh_state.auth_method
+
+        can_authenticate = false
+
+        if auth_method == ssh.AuthMethod_Password
+            IG.Text("Password: ")
+            IG.SameLine()
+            edited, new_password = SafeInputText("##password"; password=true, max_len=127,
+                                                 current_text=ssh_state.password)
+            if edited
+                ssh_state.password = new_password
+            end
+
+            can_authenticate = !isempty(ssh_state.password)
+        elseif auth_method == ssh.AuthMethod_Interactive
+            all_answers_filled = true
+
+            for prompt in ssh_state.kbdint_prompts
+                IG.Text(prompt.msg)
+                IG.SameLine()
+                edited, new_answer = SafeInputText("##$prompt"; password=!prompt.display, max_len=127,
+                                                   current_text=prompt.answer)
+                if edited
+                    prompt.answer = new_answer
+                end
+
+                if isempty(prompt.answer)
+                    all_answers_filled = false
+                end
+            end
+
+            can_authenticate = all_answers_filled
+        else
+            can_authenticate = true
+        end
+        can_authenticate &= auth_state != :authenticating
+
+        IG.Spacing()
+
+        @Disabled !can_authenticate begin
+            if IG.Button(auth_state == :authenticating ? "Authenticating" : "Authenticate")
+                @guiasync Client.ssh_authenticate_hop(state, hop_idx)
+            end
+        end
+
+        if auth_state == :authenticating
+            IG.SameLine()
+            Spinner()
+        elseif auth_state isa ssh.AuthStatus && auth_state != ssh.AuthStatus_Success
+            status_str = split(string(auth_state), "_")[2]
+
+            IG.SameLine()
+            IG.PushStyleColor(IG.ImGuiCol_Text, IG.IM_COL32(245, 80, 81, 255))
+            IG.Text("Error, please try again: '$(status_str)'")
+            IG.PopStyleColor()
+        end
+
+        IG.Unindent()
+    end
+end
+
 ## Main GUI function
 
 default(value, default="") = isnothing(value) ? default : value
@@ -231,7 +283,8 @@ function draw_gui(state)
     main_window_flags |= IG.ImGuiWindowFlags_MenuBar
     main_window_flags |= IG.ImGuiWindowFlags_HorizontalScrollbar
 
-    headnode = state.headnode
+    client = state.client
+    fully_authenticated = Client.ssh_fully_authenticated(client)
 
     # Draw the main window
     if Begin("Main window", C_NULL, main_window_flags)
@@ -242,15 +295,15 @@ function draw_gui(state)
         if IG.BeginTabItem("Setup")
             IG.EndTabItem()
 
-            can_connect = (headnode.status != RemoteStatus'.CONNECTING &&
-                headnode.status != RemoteStatus'.CONNECTED)
+            can_connect = (client.status != RemoteStatus'.CONNECTING
+                           && !fully_authenticated)
             @Disabled !can_connect begin
-                @c IG.Checkbox("Connect to cluster node:", &state.connect_to_cluster)
-            end
-            IG.SameLine()
-            @Disabled !state.connect_to_cluster || !can_connect begin
-                edited, new_address = SafeInputText("##headnode"; hint="exflonc24.desy.de",
-                                                    current_text=default(headnode.address))
+                IG.Text("Connect to node:")
+
+                IG.SameLine()
+
+                edited, new_address = SafeInputText("##client"; hint="exflonc24.desy.de",
+                                                    current_text=default(state.address))
 
                 IG.Text("Use environment:")
                 IG.SameLine()
@@ -259,38 +312,55 @@ function draw_gui(state)
             end
 
             if edited
-                headnode.address = new_address
+                state.address = new_address
             end
             if env_edited
                 state.engine_environment = new_environment
             end
 
             IG.Spacing()
-            disable_connect = (headnode.status == RemoteStatus'.CONNECTED
-                               || headnode.status == RemoteStatus'.CONNECTING
-                               || !state.connect_to_cluster
-                               || length(headnode.address) == 0)
+
+            disable_connect = !can_connect || length(state.address) == 0
             @Disabled disable_connect begin
                 if IG.Button("Connect")
-                    @guiasync Client.initialize_engine(state)
+                    client.cmd_output = ""
+                    client.last_error = ""
+                    @guiasync Client.ssh_initialize(state)
                 end
             end
             IG.SameLine()
-            @Disabled headnode.status != RemoteStatus'.CONNECTED begin
+
+            @Disabled can_connect begin
+                if IG.Button("Disconnect")
+                    @guiasync Client.disconnect(state, false)
+                end
+
+                IG.SameLine()
+
                 if IG.Button("Disconnect & shutdown")
-                    Client.shutdown_server(state)
+                    @guiasync Client.disconnect(state, true)
                 end
             end
 
-            IG.Dummy(0, 10)
-            if headnode.status == RemoteStatus'.CONNECTING
-                Spinner("Connecting to cluster...")
-                BoxedText("##headnode_cmd_output", String(take!(copy(state.headnode_cmd_output))))
-            elseif headnode.status == RemoteStatus'.ERROR
-                IG.Text("Error connecting to node:")
-                BoxedText("##headnode_last_error", headnode.last_error)
-            elseif headnode.status == RemoteStatus'.CONNECTED
-                IG.Text("Connected with client ID: $(headnode.client_id)")
+            IG.Dummy(0, 20)
+            if client.status == RemoteStatus'.CONNECTING && !fully_authenticated
+                draw_ssh_auth(state)
+            elseif client.status == RemoteStatus'.CONNECTING && fully_authenticated
+                Spinner("Starting engine...")
+                BoxedText("##client_cmd_output", state.client.cmd_output)
+            elseif client.status == RemoteStatus'.ERROR
+                @Disabled !fully_authenticated begin
+                    if IG.Button("Restart engine")
+                        @guiasync Client.initialize_engine(state)
+                    end
+                end
+
+                IG.Spacing()
+
+                IG.Text(fully_authenticated ? "Error starting engine:" : "Error connecting to node:")
+                BoxedText("##client_last_error", client.last_error)
+            elseif client.status == RemoteStatus'.CONNECTED
+                IG.Text("Connected with client ID: $(client.client_id)")
 
                 IG.Dummy(0, 2)
                 IG.Separator()
@@ -342,7 +412,7 @@ function draw_gui(state)
             end
         end
 
-        @Disabled headnode.status != RemoteStatus'.CONNECTED || isempty(state.context_state) begin
+        @Disabled client.status != RemoteStatus'.CONNECTED || isempty(state.context_state) begin
             if IG.BeginTabItem("Analysis pipeline")
                 draw_dag(state)
                 IG.EndTabItem()
@@ -369,9 +439,18 @@ function draw_gui(state)
     end
 end
 
+function on_exit(state::GuiState)
+    close(state)
+    # ws = state.client.websocket
+    # if ws != nothing && !WebSockets.isclosed(ws)
+    #     close(ws)
+    # end
+end
+
 """Start the XFA GUI."""
 function main()
-    app = Renderer.ImGuiApp(; title="XFA", fonts=[
+    state::GuiState = GuiState(; disable_rendering=false, webproxy=WEBPROXY_COMPLETIONS[1])
+    app = Renderer.ImGuiApp(state; title="XFA", fonts=[
         (joinpath(@__DIR__, "fonts", "Inter-Regular.otf"), 17),
         (joinpath(@__DIR__, "fonts", "JuliaMono-Regular.ttf"), 15),
         (joinpath(@__DIR__, "fonts", "JuliaMono-Regular.ttf"), 16)
@@ -386,26 +465,7 @@ function main()
     # io.WantSaveIniSettings = false
     # io.IniFilename = C_NULL
 
-    state::GuiState = GuiState(; app)
-    state.disable_rendering = false
-
-    empty!(wip_state)
-    state.headnode_cmd_output = IOBuffer()
-    state.current_trainmatcher = Cint(0)
-    state.context_path = ""
-    state.context_path_valid = false
-    state.engine_environment = "@xfa-default"
-    state.context_state = Dict{String, Any}()
-    state.trainmatchers = Dict{String, Any}()
-
-    function on_exit()
-        ws = state.headnode.websocket
-        if ws != nothing && !WebSockets.isclosed(ws)
-            close(ws)
-        end
-    end
-
-    Renderer.render(app; on_exit) do
+    t = Renderer.render(app; on_exit) do state
         if state.disable_rendering
             # Occasionally an exception will occur in the middle of a disabled
             # section, which helpfully also disables the continue button
@@ -423,12 +483,16 @@ function main()
         end
 
         try
-            @invokelatest draw_gui(state)
+            @lock state begin
+                @invokelatest draw_gui(state)
+            end
         catch ex
             @error "Error while rendering:" exception=(ex, catch_backtrace())
             state.disable_rendering = true
         end
     end
+
+    return t, state
 end
 
 end

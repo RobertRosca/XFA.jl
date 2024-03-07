@@ -56,10 +56,14 @@ function EditableComboBox(label, text, completions;
     return edited, unsafe_string(pointer(input))
 end
 
-function SafeInputText(label; max_len=63, hint="", current_text="",
-                       flags=IG.ImGuiInputTextFlags_EnterReturnsTrue)
+function SafeInputText(label; max_len=63, hint="", current_text="", password=false)
     input = zeros(UInt8, max_len + 1) # Add 1 for the null pointer
     Util.strcpy!(input, current_text)
+
+    flags = IG.ImGuiInputTextFlags_EnterReturnsTrue
+    if password
+        flags |= IG.ImGuiInputTextFlags_Password
+    end
 
     if IG.InputTextWithHint(label, hint, pointer(input), length(input), flags)
         return true, unsafe_string(pointer(input))
@@ -77,7 +81,7 @@ function BoxedText(label, text)
 end
 
 # Diabolically stolen from: https://github.com/ocornut/imgui/issues/1901#issuecomment-400563921
-function Spinner(text)
+function Spinner(text="")
     characters = "|/-\\"
     idx = 1 + (trunc(Int, time() / 0.07) & (length(characters) - 1))
 
@@ -87,7 +91,7 @@ function Spinner(text)
 end
 
 macro guiasync(expr)
-    return :(errormonitor(Threads.@spawn :interactive $(esc(expr))))
+    return :(errormonitor(Threads.@spawn $(esc(expr))))
 end
 
 macro Disabled(cond, expr)

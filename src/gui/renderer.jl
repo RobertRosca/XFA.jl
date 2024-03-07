@@ -22,9 +22,10 @@ struct ImGuiApp
     imnodes_ctx::Ptr{ImNodes.ImNodesContext}
     glfw_ctx::ImGuiGLFWBackend.Context
     opengl_ctx::GLBackend.Context
+    state::Any
 
     """Initialize the renderer and app state."""
-    function ImGuiApp(; width=1280, height=720, title::AbstractString="Demo", fonts::FontList=FontList())
+    function ImGuiApp(state; width=1280, height=720, title::AbstractString="Demo", fonts::FontList=FontList())
         # Setup GLFW error callback
         GLFW.glfwSetErrorCallback(Ref(error_callback))
 
@@ -90,11 +91,11 @@ struct ImGuiApp
         # disable it again by default.
         io.ConfigFlags = unsafe_load(io.ConfigFlags) & ~CImGui.ImGuiConfigFlags_ViewportsEnable
 
-        return new(window, imgui_ctx, implot_ctx, imnodes_ctx, glfw_ctx, opengl_ctx)
+        return new(window, imgui_ctx, implot_ctx, imnodes_ctx, glfw_ctx, opengl_ctx, state)
     end
 end
 
-function renderloop(app::ImGuiApp, ui=()->nothing; hotloading=false, on_exit=()->nothing)
+function renderloop(app::ImGuiApp, ui=Returns(nothing); hotloading=false, on_exit=Returns(nothing))
     io = CImGui.GetIO()
 
     try
@@ -107,7 +108,11 @@ function renderloop(app::ImGuiApp, ui=()->nothing; hotloading=false, on_exit=()-
             CImGui.NewFrame()
 
             # Build the interface
-            hotloading ? Base.invokelatest(ui) : ui()
+            if hotloading
+                @invokelatest ui(app.state)
+            else
+                ui(app.state)
+            end
 
             # Render it
             CImGui.Render()
@@ -140,7 +145,7 @@ function renderloop(app::ImGuiApp, ui=()->nothing; hotloading=false, on_exit=()-
         Base.show_backtrace(stderr, catch_backtrace())
     finally
         try
-            on_exit()
+            on_exit(app.state)
         catch exit_ex
             @error "Error in on_exit() function!" exception=exit_ex
         end
