@@ -4,6 +4,7 @@ authors = ["JamesWrigley <james.wrigley@xfel.eu>"]
 version = "0.1.0"
 
 [deps]
+Dagger = "d58978e5-989f-55fb-8d15-ea34adc7bf54"
 Distributed = "8ba89e20-285c-5b6f-9357-94700520ee1b"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
@@ -15,6 +16,5 @@ OrderedCollections = "bac558e1-5e72-5ebc-8fee-abe8a469f55d"
 Revise = "295af30f-e4ad-537b-8983-00126c2a3abe"
 Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
-SumTypes = "8e1ec7a9-0e02-4297-b0fe-6433085c89f2"
 TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 ZMQ = "c2297ded-f4af-51ae-bb23-16f91089e4e1"

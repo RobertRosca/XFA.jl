@@ -13,9 +13,8 @@ using Serialization
 import HTTP
 import HTTP: WebSockets
 import Revise
-import SumTypes: @cases
 
-import .Protocol: Message, send
+using .Protocol
 import .WebProxy
 import .Context: XfaContext
 
@@ -95,41 +94,31 @@ function handle_message(msg::Message, state::EngineState, id)
     client_state = state.clients[id]
     ws = client_state.websocket
 
-    @cases msg begin
-        PING => begin
-            client_state.last_heartbeat = time()
-            send(ws, Message'.PONG)
+    if msg isa Ping
+        client_state.last_heartbeat = time()
+        Protocol.send(ws, Pong())
+    elseif msg isa Shutdown
+        @info "Received shutdown request from client $(id)"
+        shutdown(state)
+        notify(state.halt_and_catch_fire)
+    elseif msg isa GetDevices
+        try
+            devices = WebProxy.get_devices(msg.webproxy_endpoint)
+            Protocol.send(ws, Devices(devices))
+            @info "Responded to 'GetDevices' from $(id)"
+        catch ex
+            @error "Error in 'GetDevices', requested by $(id)" exception=(ex, catch_backtrace())
+            Protocol.send(ws, Devices(ex))
         end
-
-        HCF => begin
-            @info "Received shutdown request from client $(id)"
-            shutdown(state)
-            notify(state.halt_and_catch_fire)
-        end
-
-        GET_DEVICES(address) => begin
-            try
-                devices = WebProxy.get_devices(address)
-                send(ws, Message'.DEVICES(devices))
-                @info "Responded to GET_DEVICES from $(id)"
-            catch ex
-                @error "Error in GET_DEVICES, requested by $(id)" exception=(ex, catch_backtrace())
-                send(ws, Message'.DEVICES(ex))
-            end
-        end
-
-        LOAD_CONTEXT(context_path) => begin
-            state.ctx = Context.load_from_file(context_path)
-            send(ws, Message'.CONTEXT_INFO(Context.to_dict(state.ctx)))
-            @info "Loaded context file $(context_path): $(state.ctx)"
-        end
-
-        REVISE => begin
-            @everywhere Revise.retry()
-            @info "Revised source code"
-        end
-
-        [PONG, DEVICES, CONTEXT_INFO] => @error "Received unsupported message"
+    elseif msg isa LoadContext
+        state.ctx = Context.load_from_file(msg.path)
+        Protocol.send(ws, ContextInfo(Context.to_dict(state.ctx)))
+        @info "Loaded context file $(context_path): $(state.ctx)"
+    elseif msg isa ReviseCode
+        @everywhere Revise.retry()
+        @info "Revised source code"
+    else
+        @error "Received unsupported message: $(typeof(msg))"
     end
 end
 

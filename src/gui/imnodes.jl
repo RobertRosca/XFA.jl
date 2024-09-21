@@ -1,43 +1,43 @@
 module ImNodes
 
-import LibCImGui as L
+import CImGui as ig
 
-ImNodesContext = L.ImNodesContext
-ImNodesPinShape = L.ImNodesPinShape
+ImNodesContext = ig.ImNodesContext
+ImNodesPinShape = ig.ImNodesPinShape
 
-ImNodesPinShape_Circle = L.ImNodesPinShape_Circle
-ImNodesPinShape_CircleFilled = L.ImNodesPinShape_CircleFilled
-ImNodesPinShape_Triangle = L.ImNodesPinShape_Triangle
-ImNodesPinShape_TriangleFilled = L.ImNodesPinShape_TriangleFilled
-ImNodesPinShape_Quad = L.ImNodesPinShape_Quad
-ImNodesPinShape_QuadFilled = L.ImNodesPinShape_QuadFilled
+ImNodesPinShape_Circle = ig.ImNodesPinShape_Circle
+ImNodesPinShape_CircleFilled = ig.ImNodesPinShape_CircleFilled
+ImNodesPinShape_Triangle = ig.ImNodesPinShape_Triangle
+ImNodesPinShape_TriangleFilled = ig.ImNodesPinShape_TriangleFilled
+ImNodesPinShape_Quad = ig.ImNodesPinShape_Quad
+ImNodesPinShape_QuadFilled = ig.ImNodesPinShape_QuadFilled
 
-ImNodesMiniMapLocation_BottomLeft = L.ImNodesMiniMapLocation_BottomLeft
-ImNodesMiniMapLocation_BottomRight = L.ImNodesMiniMapLocation_BottomRight
-ImNodesMiniMapLocation_TopLeft = L.ImNodesMiniMapLocation_TopLeft
-ImNodesMiniMapLocation_TopRight = L.ImNodesMiniMapLocation_TopRight
+ImNodesMiniMapLocation_BottomLeft = ig.ImNodesMiniMapLocation_BottomLeft
+ImNodesMiniMapLocation_BottomRight = ig.ImNodesMiniMapLocation_BottomRight
+ImNodesMiniMapLocation_TopLeft = ig.ImNodesMiniMapLocation_TopLeft
+ImNodesMiniMapLocation_TopRight = ig.ImNodesMiniMapLocation_TopRight
 
-CreateContext = L.imnodes_CreateContext
-DestroyContext = L.imnodes_DestroyContext
+CreateContext = ig.imnodes_CreateContext
+DestroyContext = ig.imnodes_DestroyContext
 
-BeginNodeEditor = L.imnodes_BeginNodeEditor
-EndNodeEditor = L.imnodes_EndNodeEditor
+BeginNodeEditor = ig.imnodes_BeginNodeEditor
+EndNodeEditor = ig.imnodes_EndNodeEditor
 
-BeginNode = L.imnodes_BeginNode
-EndNode = L.imnodes_EndNode
+BeginNode = ig.imnodes_BeginNode
+EndNode = ig.imnodes_EndNode
 
-Link = L.imnodes_Link
+Link = ig.imnodes_Link
 
-BeginInputAttribute = L.imnodes_BeginInputAttribute
-EndInputAttribute = L.imnodes_EndInputAttribute
-BeginOutputAttribute = L.imnodes_BeginOutputAttribute
-EndOutputAttribute = L.imnodes_EndOutputAttribute
+BeginInputAttribute = ig.imnodes_BeginInputAttribute
+EndInputAttribute = ig.imnodes_EndInputAttribute
+BeginOutputAttribute = ig.imnodes_BeginOutputAttribute
+EndOutputAttribute = ig.imnodes_EndOutputAttribute
 
-BeginNodeTitleBar = L.imnodes_BeginNodeTitleBar
-EndNodeTitleBar = L.imnodes_EndNodeTitleBar
+BeginNodeTitleBar = ig.imnodes_BeginNodeTitleBar
+EndNodeTitleBar = ig.imnodes_EndNodeTitleBar
 
 function MiniMap()
-    L.imnodes_MiniMap(0.2, ImNodesMiniMapLocation_BottomRight, C_NULL, C_NULL)
+    ig.imnodes_MiniMap(0.2, ImNodesMiniMapLocation_BottomRight, C_NULL, C_NULL)
 end
 
 end

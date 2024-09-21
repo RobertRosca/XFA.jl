@@ -1,23 +1,38 @@
 module Protocol
 
-using Serialization
+export Message, Ping, Shutdown, GetDevices, LoadContext, ReviseCode, Pong, Devices, ContextInfo
+
+import Serialization: serialize
 
 import HTTP: WebSockets
-import SumTypes: @sum_type
 
 
-@sum_type Message :hidden begin
-    # Messages that a client can send
-    PING
-    HCF
-    GET_DEVICES(::String) # Holds webproxy endpoint
-    LOAD_CONTEXT(::String) # Holds the path to the context file
-    REVISE
+abstract type Message end
 
-    # Messages that the server can send
-    PONG
-    DEVICES(::Union{Dict{String, Any}, Exception}) # Holds list of device names
-    CONTEXT_INFO(::Union{Dict{String}, Exception})
+# Messages that a client can send
+struct Ping <: Message end
+struct Shutdown <: Message end
+
+struct GetDevices <: Message
+    webproxy_endpoint::String
+end
+
+struct LoadContext
+    path::String
+end
+
+struct ReviseCode <: Message end
+
+
+# Messages that the server can send
+struct Pong <: Message end
+
+struct Devices <: Message
+    device_names::Union{Dict{String, Any}, Exception}
+end
+
+struct ContextInfo <: Message
+    info::Union{Dict{String, Any}, Exception}
 end
 
 function send(ws::WebSockets.WebSocket, msg::Message)

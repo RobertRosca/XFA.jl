@@ -1,26 +1,33 @@
 module States
 
 import LibSSH as ssh
-import SumTypes: @sum_type
 import HTTP.WebSockets as ws
 
 import XfaEngine.Protocol: Message, send
-import ..Renderer
 import ...Maybe
 
+export GuiState
 
-@sum_type RemoteStatus :hidden begin
-    UNCONNECTED
-    CONNECTING
-    CONNECTED
-    ERROR
+macro exportinstances(enum)
+    eval = GlobalRef(Core, :eval)
+    return :($eval($__module__, Expr(:export, map(Symbol, instances($enum))...)))
 end
 
-@sum_type WebproxyStatus :hidden begin
-    IDLE
-    WAITING_FOR_DEVICES
-    ERROR
+
+@enum RemoteStatus begin
+    RemoteStatus_Unconnected
+    RemoteStatus_Connecting
+    RemoteStatus_Connected
+    RemoteStatus_Error
 end
+@exportinstances RemoteStatus
+
+@enum WebproxyStatus begin
+    WebproxyStatus_Idle
+    WebproxyStatus_WaitingForDevices
+    WebproxyStatus_Error
+end
+@exportinstances WebproxyStatus
 
 @enum SshStatus begin
     SshStatus_Unconnected
@@ -28,6 +35,7 @@ end
     SshStatus_NeedsAuth
     SshStatus_Error
 end
+@exportinstances SshStatus
 
 """
 A type to help with implementing thread-safe revise-able states.
@@ -140,7 +148,7 @@ end
     client_id::String = ""
     worker_info::Dict = Dict()
 
-    status::RemoteStatus = RemoteStatus'.UNCONNECTED
+    status::RemoteStatus = RemoteStatus_Unconnected
     websocket::Maybe{ws.WebSocket} = nothing
     ssh_hops::Vector{SshState} = SshState[]
     ws_forwarder::Maybe{ssh.Forwarder} = nothing
@@ -186,9 +194,10 @@ end
     show_debug_log::Bool = false
 
     # Connections to remote things
+    address::String = "wrigleyj@exflonc26.desy.de"
     client::ClientState = ClientState()
     webproxy::String = ""
-    webproxy_status::WebproxyStatus = WebproxyStatus'.IDLE
+    webproxy_status::WebproxyStatus = WebproxyStatus_Idle
 
     # Context file
     context_state::Dict{String, Any} = Dict()

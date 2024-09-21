@@ -7,12 +7,13 @@ using Serialization
 import LibSSH as ssh
 import HTTP
 import HTTP: WebSockets
-import SumTypes: @cases
 
 import XfaEngine: getavailableport
 import XfaEngine.Context: Dependency, Parameter
-import XfaEngine.Protocol: Message, send
-import ..States: GuiState, SshState, ClientState, RemoteStatus, WebproxyStatus, KbdintPromptState
+using XfaEngine.Protocol
+import XfaEngine.Protocol: send
+import ..States: GuiState, SshState, ClientState, KbdintPromptState
+using ..States
 import ..ImGuiHelpers: @guiasync
 import ...Util
 
@@ -26,7 +27,7 @@ end
 
 function ssh_initialize(state::GuiState)
     client = state.client
-    client.status = RemoteStatus'.CONNECTING
+    client.status = RemoteStatus_Connecting
 
     address = state.address
     user = nothing
@@ -79,13 +80,13 @@ function ssh_authenticate_hop(state::GuiState, hop_idx)
     ssh_state.auth_state = :authenticating
 
     new_auth_state = if auth_method == ssh.AuthMethod_Password
-        ssh.authenticate(session; password=ssh_state.password, throw_on_error=false)
+        ssh.authenticate(session; password=ssh_state.password, throw=false)
     elseif auth_method == ssh.AuthMethod_Interactive
         kbdint_answers = [prompt.answer for prompt in ssh_state.kbdint_prompts]
 
-        ssh.authenticate(session; kbdint_answers, throw_on_error=false)
+        ssh.authenticate(session; kbdint_answers, throw=false)
     else
-        ssh.authenticate(session; throw_on_error=false)
+        ssh.authenticate(session; throw=false)
     end
 
     # If we're doing interactive auth and the server asks more questions then we
@@ -143,7 +144,7 @@ end
 
 function initialize_engine(state)
     client = state.client
-    client.status = RemoteStatus'.CONNECTING
+    client.status = RemoteStatus_Connecting
     address = state.address
     ssh_state = client.ssh_hops[end]
     session = ssh_state.session
@@ -180,7 +181,7 @@ function initialize_engine(state)
                     dependencies = ["Revise", "LoggingFormats", "LoggingExtras"]
 
                     if $(is_local)
-                        Pkg.develop(path=joinpath(homedir(), "git/XFA/XfaEngine"))
+                        Pkg.develop(path=joinpath(homedir(), "git/XFA.jl/XfaEngine"))
                         for pkg in dependencies
                             Pkg.add(pkg)
                         end
@@ -283,7 +284,7 @@ function initialize_engine(state)
         full_error = output_str * "Exception:\n" * backtrace
 
         client.last_error = full_error
-        client.status = RemoteStatus'.ERROR
+        client.status = RemoteStatus_Error
     end
 end
 
@@ -291,7 +292,7 @@ function disconnect(state, shutdown_engine)
     client = state.client
     if shutdown_engine && !isnothing(client.websocket)
         if !WebSockets.isclosed(client.websocket)
-            send(client.websocket, Message'.HCF)
+            send(client.websocket, Shutdown())
         end
 
         # Wait for the websocket to be closed before killing the connection
@@ -379,26 +380,22 @@ function build_context_state(state, ctx_info)
 end
 
 function handle_msg(state, msg)
-    @cases msg begin
-        PONG => nothing
-
-        DEVICES(data) => begin
-            if data isa Exception
-                @error "Error from server with DEVICES" exception=data
-                state.webproxy_status = WebproxyStatus'.ERROR
-            else
-                state.karabo_devices = data
-                state.webproxy_status = WebproxyStatus'.IDLE
-                state.trainmatchers = filter(x -> occursin("Matcher", x.second["classId"]),
-                                             state.karabo_devices)
-            end
+    if msg isa Pong
+        nothing
+    elseif msg isa Devices
+        if msg.device_names isa Exception
+            @error "Error from server with DEVICES" exception=data
+            state.webproxy_status = WebproxyStatus_Error
+        else
+            state.karabo_devices = msg.device_names
+            state.webproxy_status = WebproxyStatus_Idle
+            state.trainmatchers = filter(x -> occursin("Matcher", x.second["classId"]),
+                                         state.karabo_devices)
         end
-
-        CONTEXT_INFO(info) => begin
-            state.context_state = build_context_state(state, info)
-        end
-
-        [PING, HCF, GET_DEVICES, LOAD_CONTEXT, REVISE] => nothing
+    elseif msg isa ContextInfo
+        state.context_state = build_context_state(state, msg.info)
+    else
+        @warn "Received unsupported message of type '$(typeof(msg))'"
     end
 end
 
@@ -423,7 +420,7 @@ function handle_server(state)
                 id = WebSockets.receive(ws)
                 client.client_id = id
 
-                client.status = RemoteStatus'.CONNECTED
+                client.status = RemoteStatus_Connected
 
                 for msg_bytes in ws
                     buffer = IOBuffer(msg_bytes)
@@ -451,21 +448,21 @@ function handle_server(state)
                 sleep(2)
             else
                 client.last_error = Util.exception2str(ex, catch_backtrace())
-                client.status = RemoteStatus'.ERROR
+                client.status = RemoteStatus_Error
             end
         end
     end
 
     # If we've reached the maximum possible number of attempts, error out
-    if client.status != RemoteStatus'.CONNECTED && attempts == max_attempts
+    if client.status != RemoteStatus_Connected && attempts == max_attempts
         client.last_error = "Connection to server failed after $(attempts) attempts."
-        client.status = RemoteStatus'.ERROR
+        client.status = RemoteStatus_Error
 
         # Call the shutdown function to ensure that the tunnel is killed too
         disconnect(state, false)
     else
         # Otherwise we've disconnected normally
-        client.status = RemoteStatus'.UNCONNECTED
+        client.status = RemoteStatus_Unconnected
     end
 end
 
@@ -497,19 +494,19 @@ function test_connect(port=1331)
 end
 
 function get_devices(state)
-    send(state.client.websocket, Message'.GET_DEVICES(state.webproxy))
-    state.webproxy_status = WebproxyStatus'.WAITING_FOR_DEVICES
+    send(state.client.websocket, GetDevices(state.webproxy))
+    state.webproxy_status = WebproxyStatus_Waiting_FOR_DEVICES
     empty!(state.karabo_devices)
     empty!(state.trainmatchers)
 end
 
 function load_context(state)
-    send(state.client.websocket, Message'.LOAD_CONTEXT(state.context_path))
+    send(state.client.websocket, LoadContext(state.context_path))
 end
 
 function revise_engine(state)
-    if state.client.status == RemoteStatus'.CONNECTED && !isnothing(state.client.websocket)
-        send(state.client.websocket, Message'.REVISE)
+    if state.client.status == RemoteStatus_Connected && !isnothing(state.client.websocket)
+        send(state.client.websocket, ReviseCode())
     end
 end
 
