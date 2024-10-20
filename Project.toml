@@ -22,9 +22,12 @@ ZMQ = "c2297ded-f4af-51ae-bb23-16f91089e4e1"
 CImGui = "3"
 GLFW = "3"
 HTTP = "1"
-LibSSH = "0.5"
+LibSSH = "0.6"
 ModernGL = "1"
 Revise = "3"
 TOML = "1"
 ZMQ = "1"
-julia = "1.9"
+julia = "1.11"
+
+[sources]
+XfaEngine = {path = "./XfaEngine"}

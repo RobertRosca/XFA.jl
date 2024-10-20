@@ -155,12 +155,6 @@ function initialize_engine(state)
         is_local = state.address == "localhost"
         working_dir = is_local ? pwd() : "/scratch/xfa"
 
-        environment = state.engine_environment
-        is_shared_environment = startswith(environment, "@")
-        if is_shared_environment
-            environment = environment[2:end]
-        end
-
         # Find the Julia binary to use
         which_proc = run(ignorestatus(`bash -c 'which julia'`), session; print_out=false)
         if !success(which_proc)
@@ -168,80 +162,20 @@ function initialize_engine(state)
         end
         julia_binary = strip(String(which_proc.out))
 
-        # Warning: do not put single quotes in this string! It'll break the
-        # escaping into the SSH command.
-        bootstrap = """
-                    import Pkg
-                    import TOML
-                    using Printf
+        bootstrap_jl = joinpath(working_dir, "bootstrap.jl")
+        ssh.SftpSession(session) do sftp
+            code = read(joinpath(@__DIR__, "bootstrap.jl"))
+            open(bootstrap_jl, sftp; write=true) do f
+                write(f, code)
+            end
+        end
 
-                    # Install the package
-                    Pkg.activate("$(environment)"; shared=$(is_shared_environment))
-                    proxy = "exflproxy01:3128"
-                    dependencies = ["Revise", "LoggingFormats", "LoggingExtras"]
-
-                    if $(is_local)
-                        Pkg.develop(path=joinpath(homedir(), "git/XFA.jl/XfaEngine"))
-                        for pkg in dependencies
-                            Pkg.add(pkg)
-                        end
-                        Pkg.instantiate()
-                    else
-                        withenv("http_proxy" => proxy, "https_proxy" => proxy) do
-                            Pkg.develop(path=joinpath(homedir(), "git/XFA/XfaEngine"))
-                            for pkg in dependencies
-                                Pkg.add(pkg)
-                            end
-                            Pkg.instantiate()
-                        end
-                    end
-
-                    # Check if a worker file already exists
-                    working_dir = "$(working_dir)"
-                    toml_path = joinpath(working_dir, "worker-info.toml")
-                    if isfile(toml_path)
-                       worker_info = TOML.parsefile(toml_path)
-                       headnode_pid = worker_info["1"]["pid"]
-
-                       # If it does but its old and the process does not exist anymore, delete it
-                       pid_alive = @ccall kill(headnode_pid::Cint, 0::Cint)::Cint
-                       if pid_alive != 0
-                           rm(toml_path)
-                       end
-                    end
-
-                    # Launch the engine if necessary
-                    if !isfile(toml_path)
-                        import XfaEngine
-                        launcher_script = joinpath(dirname(pathof(XfaEngine)), "launcher.jl")
-                        mkpath(working_dir)
-                        cd(working_dir) do
-                            cmd = `$(julia_binary) --project="$(state.engine_environment)" --color=no --startup-file=no \$(launcher_script)`
-                            println("Launching: " * string(cmd))
-                            run(detach(cmd); wait=false)
-                        end
-                    end
-
-                    # Wait for up to 30s for it to start
-                    start = time()
-                    while !isfile(toml_path) || filesize(toml_path) == 0
-                        elapsed = time() - start
-                        if elapsed > 30
-                            error("Timeout while waiting for engine to start in \$(working_dir)")
-                        else
-                            elapsed_str = @sprintf "%.2fs" elapsed
-                            println("Waiting for engine to start... \$(elapsed_str)")
-                            sleep(1)
-                        end
-                    end
-
-                    # Print the config
-                    println(">>>")
-                    print(read(toml_path, String))
-                    println("<<<")
-                    """
-
-        bootstrap_cmd = `$(julia_binary) --color=no -E "$(bootstrap)"`
+        bootstrap_env = Dict("XFA_ENVIRONMENT" => state.engine_environment,
+                             "XFA_ENGINE_DIR" => "git/XFA.jl/XfaEngine",
+                             "XFA_WORKING_DIR" => working_dir,
+                             "XFA_JULIA_BINARY" => julia_binary)
+        bootstrap_env_str = join(["$(key)=$(value)" for (key, value) in bootstrap_env], " ")
+        bootstrap_cmd = "$(bootstrap_env_str) bash -c '$(julia_binary) --color=no $(bootstrap_jl)'"
         bootstrap_process = run(bootstrap_cmd, session; wait=false)
 
         while !process_exited(bootstrap_process)
@@ -384,7 +318,7 @@ function handle_msg(state, msg)
         nothing
     elseif msg isa Devices
         if msg.device_names isa Exception
-            @error "Error from server with DEVICES" exception=data
+            @error "Error from server with DEVICES" exception=msg
             state.webproxy_status = WebproxyStatus_Error
         else
             state.karabo_devices = msg.device_names
@@ -495,7 +429,7 @@ end
 
 function get_devices(state)
     send(state.client.websocket, GetDevices(state.webproxy))
-    state.webproxy_status = WebproxyStatus_Waiting_FOR_DEVICES
+    state.webproxy_status = WebproxyStatus_WaitingForDevices
     empty!(state.karabo_devices)
     empty!(state.trainmatchers)
 end
