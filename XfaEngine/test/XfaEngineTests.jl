@@ -399,18 +399,35 @@ end
     """)
     @test Context.execute_variables(ctx, Dict("foo.bar" => 1)) == Dict("foo" => 1, "bar" => (2, 1))
 
-    # Test executing a complete context file
-    ctx = Context.load_from_string(raw"""
-    @Input function fakecamera(output::Channel)
+    # Test executing inputs
+    input_str = """
+    @Input function fakecamera(output)
         tid = 0
-        data = Dict("camera" => rand(100, 100))
+        data = Dict("camera.data" => rand(100, 100))
         while true
             put!(output, (tid, data))
             tid += 1
         end
     end
+    """
+
+    ctx = Context.load_from_string(input_str)
+    Context.run(ctx) do
+        @test length(ctx.input_channels) == 1
+        @test timedwait(() -> isready(ctx.input_channels["fakecamera"]), 10) == :ok
+    end
+    @test istaskdone(ctx.input_dtasks["fakecamera"])
+
+    ctx = Context.load_from_string("""
+    @Input function fakecamera(output)
+        put!(output, (0, Dict("camera.data" => 42)))
+    end
+
+    @Variable foo -> karabo"camera.data"
     """)
-    # @show Context.execute_stream(ctx)
+    Context.run(ctx) do
+        @test only(keys(ctx.variable_dtasks)) == "foo"
+    end
 end
 
 @testset "Serialization" begin

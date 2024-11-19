@@ -2,6 +2,10 @@ module Context
 
 export @karabo_str, @Variable, @Parameter, @Input, @Group
 
+import Distributed: RemoteChannel
+
+import Dagger
+import Dagger: DTask
 import MacroTools
 import MacroTools: @capture, postwalk, prettify
 import OrderedCollections: OrderedDict
@@ -261,7 +265,7 @@ function _input(ctx_module, expr, side_effects)
             if !@capture(dependencies[1], (_, Context.GroupDependency(_)))
                 throw(XfaContextException("The first argument of a two-argument @Input must be a @Group"))
             end
-        elseif length(dependencies) != 1
+        elseif length(new_args) != 1
             throw(XfaContextException("@Input functions must accept 1-2 arguments, '$(name)' has $(length(args)) arguments"))
         end
 
@@ -343,7 +347,7 @@ macro Group(expr)
 end
 
 
-@kwdef mutable struct XfaContext10
+@kwdef mutable struct XfaContext
     functions::Dict{String, Any}
     group_types::Dict{String, Group}
     groups::Dict{String, Any}
@@ -353,13 +357,13 @@ end
     exprs::Vector{Expr}
 
     inputs::Dict{String, Any}
-    ext_inputs_channel::Union{Channel, Nothing} = nothing
-    inputs_tasks::Dict{String, Task} = Dict()
-    exec_task::Union{Task, Nothing} = nothing
+    input_channels::Dict{String, RemoteChannel} = Dict()
+    input_dtasks::Dict{String, DTask} = Dict()
+    input_variables_dtasks::Dict{String, DTask} = Dict()
+
+    variable_dtasks::Dict{String, DTask} = Dict()
     variable_outputs_channel::Union{Channel, Nothing} = nothing
 end
-
-XfaContext = XfaContext10
 
 function Base.show(io::IO, ctx::XfaContext)
     n_variables = length(ctx.functions)
@@ -371,11 +375,11 @@ end
 Finds all external dependencies (i.e. from Karabo) required by the context.
 """
 function external_dependencies(ctx::XfaContext)
-    ext_deps = Set{KaraboDependency}()
-    for (_, deps) in ctx.dag
-        for dep in values(deps)
+    ext_deps = Dict{String, KaraboDependency}()
+    for (name, deps) in ctx.dag
+        for (_, dep) in deps
             if dep isa KaraboDependency
-                push!(ext_deps, dep)
+                ext_deps[name] = dep
             end
         end
     end
@@ -478,78 +482,158 @@ function execute_variables(ctx::XfaContext, inputs::Dict)
     return results
 end
 
-function _execute_input(ctx::XfaContext, input_name)
-    deps = ctx.inputs[input_name]
-    args = []
-    if length(deps) == 2
-        push!(args, ctx.groups[deps[1].struct_name])
-    end
-    push!(args, ctx.ext_inputs_channel)
-
+function input_wrapper(f::Function, name::String, output::AbstractChannel)
     try
-        ctx.functions[input_name](args...)
+        f(output)
     catch ex
-        @error "Error executing input $(input_name)!" exception=ex
+        if !(ex isa InvalidStateException)
+            @error "Caught exception while executing input '$(name)'" exception=(ex, catch_backtrace())
+        end
+
+        rethrow()
     end
 end
 
-function _execute_pipeline(ctx::XfaContext)
-    train_inputs = OrderedDict{Int, Any}()
-    wake_condition = Threads.Condition()
-
-    reader_task = Threads.@spawn begin
-        for (train_id, data) in ctx.ext_inputs_channel
-            train_inputs[train_id] = merge(get(train_inputs, train_id, Dict()), data)
-            @lock wake_condition notify(wake_condition)
+function _execute_input(ctx::XfaContext, name)
+    try
+        return take!(ctx.input_channels[name])
+    catch ex
+        if !(ex isa InvalidStateException)
+            @error "Couldn't get input data from '$(name)'" exception=(ex, catch_backtrace())
         end
 
-        empty!(train_inputs)
-        @lock wake_condition notify(wake_condition)
+        return Dagger.finish_stream()
+    end
+end
+
+function _execute_external_dependency(name, input)
+    tid, sources = input
+    return haskey(sources, name) ? sources[name] : nothing
+end
+
+function _execute_variable(ctx, name, args...)
+    if any(isnothing.(args))
+        return nothing
     end
 
-    while !istaskdone(reader_task)
-        @lock wake_condition wait(wake_condition)
-
-        # If there are no inputs, that's the sign that a stop has been requested
-        if isempty(train_inputs)
-            break
-        end
-
-        execute_variables(ctx, popfirst!(train_inputs))
-    end
+    return ctx.functions[name](args...)
 end
 
 function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50)
-    required_inputs = external_dependencies(ctx)
-
-    # Clear any state from previous executions
-    if !isnothing(ctx.ext_inputs_channel) && isopen(ctx.ext_inputs_channel)
-        throw(XfaExecutionException("Context is still being executed, cannot start it twice"))
-    end
-    ctx.ext_inputs_channel = Channel(input_buffer_size)
-
-    empty!(ctx.inputs_tasks)
+    # Start the input functions to feed the DAG
     for name in keys(ctx.inputs)
-        ctx.inputs_tasks[name] = Threads.@spawn _execute_input(ctx, name)
+        ctx.input_channels[name] = RemoteChannel()
+        ctx.input_dtasks[name] = Dagger.@spawn ctx.functions[name](ctx.input_channels[name])
     end
 
-    ctx.exec_task = Threads.@spawn _execute_pipeline(ctx)
+    Dagger.spawn_streaming() do
+        # Start the input variables
+        for name in keys(ctx.inputs)
+            ctx.input_variables_dtasks[name] = Dagger.@spawn _execute_input(ctx, name)
+        end
+
+        # Start the external dependency variables
+        input_variable = only(values(ctx.input_variables_dtasks))
+        for name in keys(external_dependencies(ctx))
+            ctx.variable_dtasks[name] = Dagger.spawn(_execute_external_dependency, name, input_variable)
+        end
+
+        return
+
+        # Start the variables themselves
+        execution_order = topological_sort(ctx)
+        for name in execution_order
+            # Build up the argument list
+            args = []
+            for dep in values(ctx.dag[name])
+                dep_key = string(dep)
+
+                if dep isa KaraboDependency || dep isa Dependency
+                    push!(args, ctx.variable_dtasks[dep_key])
+                elseif dep isa Parameter
+                    push!(args, ctx.parameters[dep_key].value)
+                elseif dep isa GroupDependency
+                    push!(args, ctx.groups[dep.struct_name])
+                else
+                    throw(XfaContextException("Unrecognized dependency type: $(typeof(dep))"))
+                end
+            end
+
+            ctx.variable_dtasks[name] = Dagger.spawn(_execute_variable, ctx, name, args...)
+        end
+    end
 end
 
 function stop_pipeline(ctx::XfaContext; timeout=5)
-    close(ctx.ext_inputs_channel)
+    for ch in values(ctx.input_channels)
+        close(ch)
+    end
+
+    # Close the input dtasks
+    timer = Timer(timeout) do _
+        @warn "Cancelling input dtasks"
+        foreach(Dagger.cancel!, values(ctx.input_dtasks))
+    end
+    for dtask in values(ctx.input_dtasks)
+        wait(dtask)
+    end
+    close(timer)
+
+    # Close the streaming input dtasks
+    timer = Timer(timeout) do _
+        @warn "Cancelling streaming input dtasks"
+        foreach(Dagger.cancel!, values(ctx.input_variables_dtasks))
+    end
+    for dtask in values(ctx.input_variables_dtasks)
+        wait(dtask)
+    end
+    close(timer)
+
+    # Close the variables dtasks
+    timer = Timer(timeout) do _
+        @warn "Cancelling variables dtasks"
+        foreach(Dagger.cancel!, values(ctx.variable_dtasks))
+    end
+    for dtask in values(ctx.variable_dtasks)
+        wait(dtask)
+    end
+    close(timer)
+end
+
+function run(f::Function, ctx::XfaContext; timeout=10, kwargs...)
+    start_pipeline(ctx; kwargs...)
+
+    task = nothing
+    timer = Timer(timeout) do _
+        @warn "Function timed out, killing it"
+        Threads.@spawn Base.throwto(task, InterruptException())
+    end
+
+    try
+        task = Threads.@spawn f()
+        wait(task)
+    finally
+        close(timer)
+        stop_pipeline(ctx)
+    end
 end
 
 function load_from_string(ctx_str::AbstractString)
     ctx_module = Module()
-    ctx_module._xfa_generated_module = true
-    ctx_module._xfa_variables = Dict{String, Vector{Any}}()
-    ctx_module._xfa_subvariables = Dict{String, Vector{String}}()
-    ctx_module._xfa_parameters = Parameter[]
-    ctx_module._xfa_inputs = Dict{String, Any}()
-    ctx_module._xfa_groups = Dict{String, Any}()
+    init_expr = quote
+        using XfaEngine.Context
+        import XfaEngine.Context: Parameter
 
-    exprs = Expr[:(using XfaEngine.Context)]
+        _xfa_generated_module = true
+        _xfa_variables = Dict{String, Vector{Any}}()
+        _xfa_subvariables = Dict{String, Vector{String}}()
+        _xfa_parameters = Parameter[]
+        _xfa_inputs = Dict{String, Any}()
+        _xfa_groups = Dict{String, Any}()
+    end
+    @eval ctx_module $init_expr
+
+    exprs = Expr[]# :(using XfaEngine.Context)]
 
     # Parse everything
     expr, pos = Meta.parse(ctx_str, 1)
@@ -679,6 +763,8 @@ function load_from_string(ctx_str::AbstractString)
                     inputs[group_input_name] = new_deps
                 end
             end
+
+            # functions[input_name] = getproperty(ctx_module, Symbol(input_name))
         end
     end
 
@@ -686,8 +772,9 @@ function load_from_string(ctx_str::AbstractString)
     # add them to the context if they're not part of a group. All the grouped
     # inputs should already have been added.
     for (name, deps) in ctx_module._xfa_inputs
-        if length(deps) == 1
+        if isempty(deps) || length(deps) == 1
             inputs[name] = Dict(deps)
+            functions[name] = getproperty(ctx_module, Symbol(name))
         end
     end
 
