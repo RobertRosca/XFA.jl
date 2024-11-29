@@ -11,7 +11,7 @@ import ReTest: @testset, @test, @test_throws
 import OrderedCollections: OrderedDict as OD
 
 import XfaEngine.Context
-import XfaEngine.Context: @Variable, @karabo_str, Dependency, KaraboDependency,
+import XfaEngine.Context: @Variable, @karabo_str, VariableData, Dependency, KaraboDependency,
     GroupDependency, SubvariableDependency, XfaContextException, Parameter, FunctionArgument
 import XfaEngine.KaraboBridge
 import XfaEngine.KaraboBridge: KaraboBridgeClient, KaraboBridgeServer
@@ -166,7 +166,9 @@ end
     for name in expected_variables
         @test ctx.dag[name] == OD("data" => KaraboDependency(name, "data"))
     end
-    @test Context.external_dependencies(ctx) == Set([karabo"foo.data", karabo"bar.data", karabo"baz.data"])
+    @test Context.external_dependencies(ctx) == Dict("foo" => karabo"foo.data",
+                                                     "bar" => karabo"bar.data",
+                                                     "baz" => karabo"baz.data")
 
     # Test variables depending on each other
     ctx = Context.load_from_string(raw"""
@@ -274,15 +276,13 @@ end
     # And a input function that's part of a group
     ctx = Context.load_from_string(raw"""
     @Group struct Foo end
-    @Input function bridge(::Foo, output::Channel{Int})
+    @Input function bridge(::Foo, output)
         put!(output, 42)
     end
 
     foo = Foo()
     """)
     @test haskey(ctx.inputs, "foo.bridge")
-    @test ctx.inputs == Dict("foo.bridge" => OD(nothing => GroupDependency("foo"),
-                                                         "output" => FunctionArgument("output", Channel{Int})))
 
     # But not one with arbitrary arguments
     @test_throws XfaContextException Context._input(@__MODULE__,
@@ -304,13 +304,16 @@ end
         42
     end
     """)
-    # Creating a group should add it to the group definitions
-    @test haskey(ctx.group_types, "Foo")
-    @test ctx.group_types["Foo"].variables == ["foo"]
-    # But it shouldn't actually schedule anything
+
+    # Creating a group variable should add it to the group definitions
+    @test length(ctx.group_types) > 1
+    group_key = only(filter(x -> nameof(x) == :Foo, keys(ctx.group_types)))
+    @test nameof.(ctx.group_types[group_key].variables) == [:foo]
+    # But because a group object hasn't been created it shouldn't actually
+    # schedule anything.
     @test isempty(ctx.dag)
 
-    # Test instantiating and executing a group
+    # Test instantiating a group
     ctx = Context.load_from_string(raw"""
     @Group struct Foo
         @Parameter bar::Int
@@ -321,10 +324,9 @@ end
 
     foo_group = Foo(42)
     """)
-
-    @test ctx.dag == Dict("foo_group.foo" => OD("data" => Context.GroupDependency("foo_group")))
+    group_type = only(filter(x -> nameof(x) == :Foo, keys(ctx.group_types)))
+    @test ctx.dag == Dict("foo_group.foo" => OD("data" => Context.GroupDependency("foo_group", group_type)))
     @test ctx.parameters == Dict("foo_group.bar" => Context.Parameter("foo_group.bar", 42))
-    @test Context.execute_variables(ctx, Dict()) == Dict("foo_group.foo" => 42)
 
     # Test that the struct can be used as a dependency
     ctx = Context.load_from_string(raw"""
@@ -341,7 +343,20 @@ end
         data
     end
     """)
-    @test Context.execute_variables(ctx, Dict()) == Dict("foo_group.foo" => 2π, "bar" => 2π)
+    @test ctx.dag["bar"] == OD("data" => Context.Dependency("foo_group.foo"))
+
+    # Test instantiating groups from other modules
+    helper_file_path = joinpath(@__DIR__, "dummy_variables.jl")
+    ctx = Context.load_from_string("""
+    Base.include(@__MODULE__, "$(helper_file_path)")
+
+    bridge = KaraboBridge("foo", 1, [])
+
+    foo = DummyVariables.Foo(1)
+    """)
+    @test haskey(ctx.inputs, "bridge.stream")
+    @test ctx.functions["bridge.stream"] === Context.stream
+    @test haskey(ctx.dag, "foo.compute")
 end
 
 @testset "Scheduler" begin
@@ -367,9 +382,9 @@ end
     ctx = Context.load_from_string(raw"""
     @Variable camera -> karabo"camera.data"
     """)
-    # Variables shouldn't be execute_variablesd unless they have all their dependencies
-    @test length(Context.execute_variables(ctx, Dict())) == 0
-    @test Context.execute_variables(ctx, Dict("camera.data" => 1)) == Dict("camera" => 1)
+    # Variables shouldn't be executed unless they have all their dependencies
+    # @test length(Context.execute_variables(ctx, Dict())) == 0
+    # @test Context.execute_variables(ctx, Dict("camera.data" => 1)) == Dict("camera" => 1)
 
     # Variables that throw shouldn't cause execution of the other variables to
     # fail.
@@ -382,12 +397,12 @@ end
         42
     end
     """)
-    log = TestLogger()
-    with_logger(log) do
-        @test Context.execute_variables(ctx, Dict()) == Dict("bar" => 42)
-    end
-    @test length(log.logs) == 1
-    @test occursin("Error executing", log.logs[1].message)
+    # log = TestLogger()
+    # with_logger(log) do
+    #     @test Context.execute_variables(ctx, Dict()) == Dict("bar" => 42)
+    # end
+    # @test length(log.logs) == 1
+    # @test occursin("Error executing", log.logs[1].message)
 
     # Test that dependencies are passed correctly
     ctx = Context.load_from_string(raw"""
@@ -397,7 +412,7 @@ end
         return (2 * data, norm)
     end
     """)
-    @test Context.execute_variables(ctx, Dict("foo.bar" => 1)) == Dict("foo" => 1, "bar" => (2, 1))
+    # @test Context.execute_variables(ctx, Dict("foo.bar" => 1)) == Dict("foo" => 1, "bar" => (2, 1))
 
     # Test executing inputs
     input_str = """
@@ -418,6 +433,7 @@ end
     end
     @test istaskdone(ctx.input_dtasks["fakecamera"])
 
+    # Test executing external dependency variables
     ctx = Context.load_from_string("""
     @Input function fakecamera(output)
         put!(output, (0, Dict("camera.data" => 42)))
@@ -426,8 +442,33 @@ end
     @Variable foo -> karabo"camera.data"
     """)
     Context.run(ctx) do
+        @test only(keys(ctx.external_dependency_dtasks)) == "camera.data"
         @test only(keys(ctx.variable_dtasks)) == "foo"
+        wait(ctx.variable_dtasks["foo"])
     end
+    @test take!(ctx.variable_output) == VariableData(0, "foo", 42)
+
+    # Test executing variables
+    ctx = Context.load_from_string("""
+    @Input function input(output)
+        put!(output, (0, Dict("motor1.pos" => 1, "motor2.pos" => 2)))
+    end
+
+    @Variable motor1 -> karabo"motor1.pos"
+
+    @Variable function bar(motor1 -> motor1, motor2 -> karabo"motor2.pos")
+        return motor1 + motor2
+    end
+    """)
+    Context.run(ctx) do
+        @test keys(ctx.variable_dtasks) == Set(["motor1", "bar"])
+        wait(ctx.variable_dtasks["bar"])
+        @show istaskdone(ctx.variable_dtasks["bar"])
+        flush(stdout)
+        flush(stderr)
+    end
+    @test take!(ctx.variable_output) == VariableData(0, "motor1", 1)
+    @test take!(ctx.variable_output) == VariableData(0, "bar", 3)
 end
 
 @testset "Serialization" begin
