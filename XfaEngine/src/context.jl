@@ -2,7 +2,7 @@ module Context
 
 export @karabo_str, @Variable, @Parameter, @Input, @Group
 
-import Distributed: RemoteChannel
+import DistributedNext: RemoteChannel
 
 import Dagger
 import Dagger: DTask
