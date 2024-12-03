@@ -1,5 +1,5 @@
 import Pkg
-using Distributed
+using DistributedNext
 
 include("launcher_utils.jl")
 

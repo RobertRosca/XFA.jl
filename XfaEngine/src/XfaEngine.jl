@@ -7,7 +7,7 @@ include("context.jl")
 
 import TOML
 import Sockets: listen, close, @ip_str
-import Distributed: @everywhere, @fetchfrom, workers, procs
+import DistributedNext: @everywhere, @fetchfrom, workers, procs
 using Serialization
 
 import HTTP
