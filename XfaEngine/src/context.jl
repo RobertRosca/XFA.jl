@@ -2,10 +2,10 @@ module Context
 
 export @karabo_str, @Variable, @Parameter, @Input, @Group
 
+import Base.ScopedValues: @with
+
 import DistributedNext: RemoteChannel
 
-import Dagger
-import Dagger: DTask
 import MacroTools
 import MacroTools: @capture, postwalk, prettify
 import OrderedCollections: OrderedDict
@@ -15,6 +15,31 @@ const registered_variables = Dict{Function, Vector{Any}}()
 const registered_subvariables = Dict{Function, Vector{String}}()
 const registered_inputs = Dict{Function, Any}()
 const registered_groups = Dict{DataType, Any}()
+
+struct Neighbour
+    name::String
+    channel::RemoteChannel
+end
+
+const dag_functions = Dict{String, Function}()
+current_ctx_module::Module = Module()
+const scratch_spaces = Dict{String, Dict{String, Any}}()
+
+# Container module for train/variable-specific information. This conflicts with
+# Base.Meta but we accept that for the convenience of the name. In this module
+# and the context file, usage of Base.Meta should always explicitly refer to
+# `Base.Meta` to avoid confusion.
+module Meta
+
+import Base.ScopedValues: ScopedValue
+
+const tid = ScopedValue{Int}()
+const run_number = ScopedValue{Int}()
+const proposal = ScopedValue{Int}()
+
+const scratch = ScopedValue{Dict{String, Any}}()
+
+end
 
 include("context_types.jl")
 include("context_builtins.jl")
@@ -30,13 +55,19 @@ include("context_builtins.jl")
 
     inputs::Dict{String, Any}
     input_channels::Dict{String, RemoteChannel} = Dict()
-    input_dtasks::Dict{String, DTask} = Dict()
-    input_variables_dtasks::Dict{String, DTask} = Dict()
+    input_tasks::Dict{String, Task} = Dict()
 
-    external_dependency_dtasks::Dict{String, DTask} = Dict()
+    input_variable_channels::Dict{String, Dict{String, RemoteChannel}} = Dict()
+    input_variables_tasks::Dict{String, Task} = Dict()
 
-    variable_dtasks::Dict{String, DTask} = Dict()
-    variable_output::RemoteChannel = RemoteChannel(() -> Channel(100))
+    external_dependency_channels::Dict{String, Dict{String, RemoteChannel}} = Dict()
+    external_dependency_tasks::Dict{String, Task} = Dict()
+
+    variable_tasks::Dict{String, Task} = Dict()
+    variable_channels::Dict{String, Dict{String, RemoteChannel}} = Dict()
+
+    stream_output::RemoteChannel = RemoteChannel(() -> Channel(100))
+    watcher_task::Task = Task(Returns(nothing))
 end
 
 function Base.show(io::IO, ctx::XfaContext)
@@ -59,6 +90,20 @@ function external_dependencies(ctx::XfaContext)
     end
 
     return ext_deps
+end
+
+
+function find_downstream_neighbours(ctx::XfaContext, dep_name, T::DataType)
+    neighbours = Set{String}()
+    for (var_name, deps) in ctx.dag
+        for (_, dep) in deps
+            if dep isa T && string(dep) == dep_name
+                push!(neighbours, var_name)
+            end
+        end
+    end
+
+    return neighbours
 end
 
 function to_dict(ctx::XfaContext)
@@ -165,15 +210,14 @@ TrainData(tid, data) = TrainData(UInt64(tid), data)
 
 struct VariableData{T}
     tid::UInt64
-    name::String
+    name::Union{String, Nothing}
     data::T
 end
 
 VariableData(tid, name, data) = VariableData(UInt64(tid), name, data)
 
-function input_wrapper(ctx::XfaContext, name)
-    f = ctx.functions[name]
-    channel = ctx.input_channels[name]
+function input_wrapper(name, channel)
+    f = dag_functions[name]
 
     try
         f(channel)
@@ -181,62 +225,182 @@ function input_wrapper(ctx::XfaContext, name)
         if !(ex isa InvalidStateException)
             @error "Caught exception while executing input '$(name)'" exception=(ex, catch_backtrace())
         end
-
-        rethrow()
     finally
         close(channel)
     end
 end
 
-function _maybe_send_output(ctx::XfaContext, data::TrainData)
+function maybe_send_output(channel, data::VariableData)
     # Semi-arbitrarily set a threshold of 30MB, which is just under twice the
     # size of a Float32 2k camera.
     threshold = 30_000_000
 
     if Base.summarysize(data) < threshold
-        put!(ctx.variable_output, data)
+        put!(channel, data)
     else
-        put!(ctx.variable_output, TrainData(data.tid, :threshold_exceeded))
+        put!(channel, VariableData(data.tid, nothing, :threshold_exceeded))
     end
 end
 
-function _execute_input(ctx::XfaContext, name)
+function putall!(channels, value)
+    for channel in channels
+        put!(channel, value)
+    end
+end
+
+function stream_input(name, channel, downstream_neighbours)
     try
-        tid, sources = take!(ctx.input_channels[name])
-        return TrainData(tid, sources)
+        while isopen(channel) || isready(channel)
+            tid, sources = take!(channel)
+            putall!(values(downstream_neighbours), TrainData(tid, sources))
+            @debug "Pushed input data from '$(name)' to: $(keys(downstream_neighbours))"
+        end
     catch ex
         if !(ex isa InvalidStateException)
+            # If it's not an error about the channel being closed, show the exception
             @error "Couldn't get input data from '$(name)'" exception=(ex, catch_backtrace())
         end
-
-        return Dagger.finish_stream()
+    finally
+        @debug "Finishing input '$(name)'"
+        for neighbour_channel in values(downstream_neighbours)
+            close(neighbour_channel)
+        end
     end
 end
 
-function _execute_external_dependency(ctx::XfaContext, name, input)
-    if haskey(input.data, name)
-        td = TrainData(input.tid, input.data[name])
-        return td
-    else
-        return nothing
-    end
-end
-
-function _execute_variable(ctx::XfaContext, name, args...)
-    if any(isnothing.(args))
-        return nothing
-    end
-
-    unwrapped_args = [arg.data for arg in args]
-    tid = first(args).tid
+function stream_external_dependency(name, input_neighbour, downstream_neighbours)
+    channel = input_neighbour.channel
 
     try
-        out = ctx.functions[name](unwrapped_args...)
-        out = VariableData(tid, name, out)
-        put!(ctx.variable_output, out)
-        return out
+        while isopen(channel) || isready(channel)
+            input = take!(channel)
+            result = VariableData(input.tid, name, haskey(input.data, name) ? input.data[name] : nothing)
+            putall!(values(downstream_neighbours), result)
+            @debug "Pushed '$(name)' to: $(keys(downstream_neighbours))"
+        end
     catch ex
-        @error "Execution of variable '$(name)' failed" exception=(ex, catch_backtrace())
+        if !(ex isa InvalidStateException)
+            @error "Executing external dependency '$(name)' failed" exception=(ex, catch_backtrace())
+        end
+    finally
+        @debug "Finishing external dependency '$(name)'"
+        close(channel)
+        for channel in values(downstream_neighbours)
+            close(channel)
+        end
+    end
+end
+    
+function stream_variable(name, stream_output, upstream, downstream, param_names)
+    # Resolve all parameter names to their parent objects
+    params = Dict{String, Any}()
+    for param_name in param_names
+        elements = split(param_name, '.')
+        parent_obj = current_ctx_module
+        for property in elements[1:end - 1]
+            parent_obj = getproperty(parent_obj, Symbol(property))
+        end
+
+        params[param_name] = (; parent_obj, property=Symbol(last(elements)))
+    end
+
+    param_values = Dict{String, Any}()
+
+    # Initialize the scratch space
+    scratch_spaces[name] = Dict{String, Any}()
+
+    try
+        while true
+            args = []
+            for arg in values(upstream)
+                if arg isa RemoteChannel
+                    push!(args, take!(arg))
+                else
+                    push!(args, arg)
+                end
+            end
+
+            variable_args = filter(x -> x isa VariableData, args)
+            tid = first(variable_args).tid
+            if any([arg.tid != tid for arg in variable_args])
+                @warn "Skipping '$(name)', received inputs from different trains"
+                continue
+            end
+
+            # Don't execute the variable if any inputs are `nothing`
+            empty_result = VariableData(tid, name, nothing)
+            unwrapped_args = [arg isa VariableData ? arg.data : arg for arg in args]
+            if any(isnothing.(unwrapped_args))
+                putall!(values(downstream), empty_result)
+                continue
+            end
+
+            # Store the current parameter values
+            for (param_name, param_info) in params
+                param_values[param_name] = getproperty(param_info.parent_obj, param_info.property)
+            end
+
+            # Execute the variable
+            f = dag_functions[name]
+            @debug "Executing variable '$(name)'..."
+            try
+                out = @with Meta.tid => tid Meta.scratch => scratch_spaces[name] f(unwrapped_args...)
+            catch ex
+                @error "Execution of variable '$(name)' failed" exception=(ex, catch_backtrace())
+                putall!(values(downstream), empty_result)
+                continue
+            end
+
+            # Check for changed parameters
+            for (param_name, param_info) in params
+                current_value = getproperty(param_info.parent_obj, param_info.property)
+
+                if current_value != param_values[param_name]
+                    # TODO: notify the master that the parameter changed
+                end
+
+                param_values[param_name] = current_value
+            end
+
+            # Send output
+            out = VariableData(tid, name, out)
+            maybe_send_output(stream_output, out)
+            putall!(values(downstream), out)
+            @debug "Pushed output from '$(name)' to: $(keys(downstream))"
+        end
+    catch ex
+        if !(ex isa InvalidStateException)
+            @error "Streaming '$(name)' failed" exception=(ex, catch_backtrace())
+        end
+    finally
+        @debug "Finishing variable '$(name)'"
+
+        # Clear the scratch space so anything stored can be GC'd
+        delete!(scratch_spaces, name)
+
+        # Close upstream and downstream channels
+        for arg in values(upstream)
+            if arg isa RemoteChannel
+                close(arg)
+            end
+        end
+
+        for channel in values(downstream)
+            close(channel)
+        end
+    end
+end
+
+# Simple function that will asynchronously watch the DAG and close the
+# `stream_output` if all variables are finished.
+function watch_context(ctx::XfaContext)
+    while true
+        if all(istaskdone.(values(ctx.variable_tasks)))
+            close(ctx.stream_output)
+            return
+        end
+
+        sleep(0.1)
     end
 end
 
@@ -244,46 +408,78 @@ function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50)
     # Start the input functions to feed the DAG
     for name in keys(ctx.inputs)
         ctx.input_channels[name] = RemoteChannel()
-        ctx.input_dtasks[name] = Dagger.@spawn input_wrapper(ctx, name)
+        ctx.input_tasks[name] = Threads.@spawn input_wrapper(name, ctx.input_channels[name])
+        errormonitor(ctx.input_tasks[name])
     end
 
-    Dagger.spawn_streaming() do
-        # Start the input variables
-        for name in keys(ctx.inputs)
-            ctx.input_variables_dtasks[name] = Dagger.@spawn _execute_input(ctx, name)
+    # Start the input variables
+    for name in keys(ctx.inputs)
+        downstream_neighbours = Dict{String, RemoteChannel}()
+        for dep in values(external_dependencies(ctx))
+            downstream_neighbours[string(dep)] = RemoteChannel()
         end
+        ctx.input_variable_channels[name] = downstream_neighbours
 
-        # Start the external dependency variables
-        input_variable = only(values(ctx.input_variables_dtasks))
-        for (_, dep) in external_dependencies(ctx)
-            name = string(dep)
-            ctx.external_dependency_dtasks[name] = Dagger.spawn(_execute_external_dependency, ctx, name, input_variable)
+        ctx.input_variables_tasks[name] = Threads.@spawn stream_input(name, ctx.input_channels[name], downstream_neighbours)
+        errormonitor(ctx.input_variables_tasks[name])
+    end
+
+    # Start the external dependency variables
+    unique_external_deps = unique(values(external_dependencies(ctx)))
+    for dep in unique_external_deps
+        dep_name = string(dep)
+        input_name = only(keys(ctx.inputs))
+        input_channel = ctx.input_variable_channels[input_name][dep_name]
+        input_neighbour = Neighbour(input_name, input_channel)
+
+        downstream_neighbours = Dict{String, RemoteChannel}()
+        for neighbour in find_downstream_neighbours(ctx, dep_name, KaraboDependency)
+            downstream_neighbours[neighbour] = RemoteChannel()
         end
+        ctx.external_dependency_channels[dep_name] = downstream_neighbours
 
-        # Start the variables themselves
-        execution_order = topological_sort(ctx)
-        for name in execution_order
-            # Build up the argument list
-            args = []
-            for dep in values(ctx.dag[name])
-                dep_key = string(dep)
+        ctx.external_dependency_tasks[dep_name] = Threads.@spawn stream_external_dependency(dep_name, input_neighbour, downstream_neighbours)
+        errormonitor(ctx.external_dependency_tasks[dep_name])
+    end
 
-                if dep isa KaraboDependency
-                    push!(args, ctx.external_dependency_dtasks[dep_key])
-                elseif dep isa Dependency
-                    push!(args, ctx.variable_dtasks[dep_key])
-                elseif dep isa Parameter
-                    push!(args, ctx.parameters[dep_key].value)
-                elseif dep isa GroupDependency
-                    push!(args, ctx.groups[dep.struct_name])
-                else
-                    throw(XfaContextException("Unrecognized dependency type: $(typeof(dep))"))
-                end
+    # Start the variables themselves
+    execution_order = topological_sort(ctx)
+    for name in execution_order
+        # Build up the argument list
+        args = OrderedDict{String, Any}()
+        for dep in values(ctx.dag[name])
+            dep_name = string(dep)
+
+            if dep isa KaraboDependency
+                args[dep_name] = ctx.external_dependency_channels[dep_name][name]
+            elseif dep isa Dependency
+                args[dep_name] = ctx.variable_channels[dep_name][name]
+            elseif dep isa Parameter
+                args[dep_name] = ctx.parameters[dep_name]
+            elseif dep isa GroupDependency
+                args[dep_name] = ctx.groups[dep.name]
+            else
+                throw(XfaContextException("Unrecognized dependency type: $(typeof(dep))"))
             end
-
-            ctx.variable_dtasks[name] = Dagger.spawn(_execute_variable, ctx, name, args...)
         end
+
+        # Find downstream variables
+        downstream = Dict{String, RemoteChannel}()
+        for neighbour in find_downstream_neighbours(ctx, name, Dependency)
+            downstream[neighbour] = RemoteChannel()
+        end
+        ctx.variable_channels[name] = downstream
+
+        param_names = keys(ctx.parameters)
+        ctx.variable_tasks[name] = Threads.@spawn stream_variable(name, ctx.stream_output, args, downstream, param_names)
+        errormonitor(ctx.variable_tasks[name])
     end
+
+    # Start the watcher task
+    ctx.watcher_task = Threads.@spawn watch_context(ctx)
+    errormonitor(ctx.watcher_task)
+
+    return nothing
 end
 
 function stop_pipeline(ctx::XfaContext; timeout=5)
@@ -291,37 +487,44 @@ function stop_pipeline(ctx::XfaContext; timeout=5)
         close(ch)
     end
 
-    # Close the input dtasks
-    timer = Timer(timeout) do _
-        @warn "Cancelling input dtasks"
-        foreach(Dagger.cancel!, values(ctx.input_dtasks))
+    # Close the input tasks
+    for task in values(ctx.input_tasks)
+        wait(task)
     end
-    for dtask in values(ctx.input_dtasks)
-        wait(dtask)
-    end
-    close(timer)
 
-    # Close the streaming input dtasks
-    timer = Timer(timeout) do _
-        @warn "Cancelling streaming input dtasks"
-        foreach(Dagger.cancel!, values(ctx.input_variables_dtasks))
+    # Close the streaming input tasks
+    for outputs in values(ctx.input_variable_channels)
+        for channel in values(outputs)
+            close(channel)
+        end
     end
-    for dtask in values(ctx.input_variables_dtasks)
-        wait(dtask)
+    for task in values(ctx.input_variables_tasks)
+        wait(task)
     end
-    close(timer)
 
-    # Close the variables dtasks
-    timer = Timer(timeout) do _
-        @warn "Cancelling variables dtasks"
-        foreach(Dagger.cancel!, values(ctx.variable_dtasks))
+    # Close the external dependency tasks
+    for outputs in values(ctx.external_dependency_channels)
+        for channel in values(outputs)
+            close(channel)
+        end
     end
-    for dtask in values(ctx.variable_dtasks)
-        wait(dtask)
+    for task in values(ctx.external_dependency_tasks)
+        wait(task)
     end
-    close(timer)
 
-    close(ctx.variable_output)
+    # Close the variables tasks
+    for outputs in values(ctx.variable_channels)
+        for channel in values(outputs)
+            close(channel)
+        end
+    end
+    for task in values(ctx.variable_tasks)
+        wait(task)
+    end
+
+    wait(ctx.watcher_task)
+
+    return nothing
 end
 
 function run(f::Function, ctx::XfaContext; timeout=10, kwargs...)
@@ -364,7 +567,7 @@ function load_from_string(ctx_str::AbstractString)
     ctx_module = Module(Symbol(:XfaContext, gensym()))
     init_expr = quote
         using XfaEngine.Context
-        import XfaEngine.Context: Parameter, KaraboBridge
+        import XfaEngine.Context: Parameter, KaraboBridge, Meta
 
         _xfa_parameters = Parameter[]
     end
@@ -373,10 +576,10 @@ function load_from_string(ctx_str::AbstractString)
     exprs = Expr[]
 
     # Parse everything
-    expr, pos = Meta.parse(ctx_str, 1)
+    expr, pos = Base.Meta.parse(ctx_str, 1)
     while expr != nothing
         push!(exprs, expr)
-        expr, pos = Meta.parse(ctx_str, pos)
+        expr, pos = Base.Meta.parse(ctx_str, pos)
     end
 
     # Evaluate all exprs
@@ -551,6 +754,10 @@ function load_from_string(ctx_str::AbstractString)
 
         ctx_subvariables[string(nameof(func))] = subvars
     end
+
+    empty!(dag_functions)
+    copy!(dag_functions, functions)
+    global current_ctx_module = ctx_module
 
     return XfaContext(; functions, group_types, groups, dag,
                       subvariables=ctx_subvariables, parameters, exprs,

@@ -360,115 +360,228 @@ end
 end
 
 @testset "Scheduler" begin
-    # Test sorting a DAG with a cycle
-    dag = Dict("foo" => ["bar"], "bar" => ["foo"])
-    @test_throws XfaContextException Context.topological_sort(dag)
+    @testset "Topological sort" begin
+        # Test sorting a DAG with a cycle
+        dag = Dict("foo" => ["bar"], "bar" => ["foo"])
+        @test_throws XfaContextException Context.topological_sort(dag)
 
-    # Sort an empty DAG
-    @test Context.topological_sort(Dict("foo" => [])) == ["foo"]
+        # Sort an empty DAG
+        @test Context.topological_sort(Dict("foo" => [])) == ["foo"]
 
-    # Test that external dependencies aren't considered during sorting
-    dag = Dict("camera" => [karabo"foo.bar", karabo"baz.quux"])
-    @test Context.topological_sort(dag) == ["camera"]
+        # Test that external dependencies aren't considered during sorting
+        dag = Dict("camera" => [karabo"foo.bar", karabo"baz.quux"])
+        @test Context.topological_sort(dag) == ["camera"]
 
-    # Subvariables should be ignored too
-    dag = Dict("camera" => [], "foo" => [SubvariableDependency("camera", "bar")])
-    @test Context.topological_sort(dag) == ["camera", "foo"]
+        # Subvariables should be ignored too
+        dag = Dict("camera" => [], "foo" => [SubvariableDependency("camera", "bar")])
+        @test Context.topological_sort(dag) == ["camera", "foo"]
 
-    # Test that sorting actually works
-    dag = Dict("camera" => [karabo"foo.bar"], "foo" => ["camera"], "bar" => ["foo"])
-    @test Context.topological_sort(dag) == ["camera", "foo", "bar"]
-
-    ctx = Context.load_from_string(raw"""
-    @Variable camera -> karabo"camera.data"
-    """)
-    # Variables shouldn't be executed unless they have all their dependencies
-    # @test length(Context.execute_variables(ctx, Dict())) == 0
-    # @test Context.execute_variables(ctx, Dict("camera.data" => 1)) == Dict("camera" => 1)
-
-    # Variables that throw shouldn't cause execution of the other variables to
-    # fail.
-    ctx = Context.load_from_string(raw"""
-    @Variable function foo()
-        error("foo")
+        # Test that sorting actually works
+        dag = Dict("camera" => [karabo"foo.bar"], "foo" => ["camera"], "bar" => ["foo"])
+        @test Context.topological_sort(dag) == ["camera", "foo", "bar"]
     end
 
-    @Variable function bar()
-        42
-    end
-    """)
-    # log = TestLogger()
-    # with_logger(log) do
-    #     @test Context.execute_variables(ctx, Dict()) == Dict("bar" => 42)
-    # end
-    # @test length(log.logs) == 1
-    # @test occursin("Error executing", log.logs[1].message)
+    @testset "Execution" begin
+        ctx = Context.load_from_string(raw"""
+        @Variable camera -> karabo"camera.data"
+        """)
+        # Variables shouldn't be executed unless they have all their dependencies
+        # @test length(Context.execute_variables(ctx, Dict())) == 0
+        # @test Context.execute_variables(ctx, Dict("camera.data" => 1)) == Dict("camera" => 1)
 
-    # Test that dependencies are passed correctly
-    ctx = Context.load_from_string(raw"""
-    @Parameter norm::Int -> 1
-    @Variable foo -> karabo"foo.bar"
-    @Variable function bar(data -> foo, norm -> norm)
-        return (2 * data, norm)
-    end
-    """)
-    # @test Context.execute_variables(ctx, Dict("foo.bar" => 1)) == Dict("foo" => 1, "bar" => (2, 1))
-
-    # Test executing inputs
-    input_str = """
-    @Input function fakecamera(output)
-        tid = 0
-        data = Dict("camera.data" => rand(100, 100))
-        while true
-            put!(output, (tid, data))
-            tid += 1
+        # Test that dependencies are passed correctly
+        ctx = Context.load_from_string(raw"""
+        @Parameter norm::Int -> 1
+        @Variable foo -> karabo"foo.bar"
+        @Variable function bar(data -> foo, norm -> norm)
+            return (2 * data, norm)
         end
-    end
-    """
+        """)
+        # @test Context.execute_variables(ctx, Dict("foo.bar" => 1)) == Dict("foo" => 1, "bar" => (2, 1))
 
-    ctx = Context.load_from_string(input_str)
-    Context.run(ctx) do
-        @test length(ctx.input_channels) == 1
-        @test timedwait(() -> isready(ctx.input_channels["fakecamera"]), 10) == :ok
-    end
-    @test istaskdone(ctx.input_dtasks["fakecamera"])
+        # Test executing inputs
+        ctx = Context.load_from_string("""
+        @Input function fakecamera(output)
+            tid = 0
+            data = Dict("camera.data" => rand(100, 100))
+            while true
+                put!(output, (tid, data))
+                tid += 1
+            end
+        end
+        """)
+        Context.run(ctx) do
+            @test length(ctx.input_channels) == 1
+            @test timedwait(() -> isready(ctx.input_channels["fakecamera"]), 10) == :ok
 
-    # Test executing external dependency variables
-    ctx = Context.load_from_string("""
-    @Input function fakecamera(output)
-        put!(output, (0, Dict("camera.data" => 42)))
-    end
+            @test isempty(ctx.input_variable_channels["fakecamera"])
+        end
+        @test istaskdone(ctx.input_tasks["fakecamera"])
+        @test istaskdone(ctx.input_variables_tasks["fakecamera"])
 
-    @Variable foo -> karabo"camera.data"
-    """)
-    Context.run(ctx) do
-        @test only(keys(ctx.external_dependency_dtasks)) == "camera.data"
-        @test only(keys(ctx.variable_dtasks)) == "foo"
-        wait(ctx.variable_dtasks["foo"])
-    end
-    @test take!(ctx.variable_output) == VariableData(0, "foo", 42)
+        # Stopping execution should close all tasks/channels
+        @test !isopen(ctx.stream_output)
 
-    # Test executing variables
-    ctx = Context.load_from_string("""
-    @Input function input(output)
-        put!(output, (0, Dict("motor1.pos" => 1, "motor2.pos" => 2)))
-    end
+        # Test executing external dependency variables
+        ctx = Context.load_from_string("""
+        @Input function fakecamera(output)
+            put!(output, (0, Dict("camera.data" => 42)))
+        end
 
-    @Variable motor1 -> karabo"motor1.pos"
+        @Variable foo -> karabo"camera.data"
+        """)
+        Context.run(ctx) do
+            @test only(keys(ctx.external_dependency_tasks)) == "camera.data"
+            @test only(keys(ctx.external_dependency_channels["camera.data"])) == "foo"
+            @test only(keys(ctx.variable_tasks)) == "foo"
 
-    @Variable function bar(motor1 -> motor1, motor2 -> karabo"motor2.pos")
-        return motor1 + motor2
+            @test timedwait(() -> isready(ctx.stream_output), 5) == :ok
+        end
+        @test istaskdone(ctx.external_dependency_tasks["camera.data"])
+        @test take!(ctx.stream_output) == VariableData(0, "foo", 42)
+
+        # Test executing variables
+        ctx = Context.load_from_string("""
+        @Input function input(output)
+            put!(output, (0, Dict("motor1.pos" => 1, "motor2.pos" => 2)))
+        end
+
+        @Variable motor1 -> karabo"motor1.pos"
+
+        @Variable function bar(motor1 -> motor1, motor2 -> karabo"motor2.pos")
+            return motor1 + motor2
+        end
+        """)
+        Context.run(ctx) do
+            @test keys(ctx.variable_tasks) == Set(["motor1", "bar"])
+            @test timedwait(() -> istaskdone(ctx.variable_tasks["bar"]), 5) == :ok
+        end
+        @test take!(ctx.stream_output) == VariableData(0, "motor1", 1)
+        @test take!(ctx.stream_output) == VariableData(0, "bar", 3)
+
+        # Variables that throw shouldn't cause execution of the other variables to
+        # fail.
+        ctx = Context.load_from_string(raw"""
+        @Input function input(output)
+            put!(output, (0, Dict("motor1.pos" => 1)))
+        end
+
+        @Variable function foo(data -> karabo"motor1.pos")
+            error("foo")
+        end
+
+        @Variable function bar(data -> karabo"motor1.pos")
+            return data
+        end
+        """)
+        log = TestLogger()
+        with_logger(log) do
+            Context.run(ctx) do
+                @test timedwait(() -> isready(ctx.stream_output), 5) == :ok
+            end
+        end
+        @test length(log.logs) == 1
+        @test occursin("Execution of variable 'foo' failed", log.logs[1].message)
+        @test take!(ctx.stream_output) == VariableData(0, "bar", 1)
+
+        # Variables that fail should block downstream dependencies from running
+        ctx = Context.load_from_string(raw"""
+        @Input function input(output)
+            put!(output, (0, Dict("motor1.pos" => 1)))
+        end
+
+        @Variable function foo(data -> karabo"motor1.pos")
+            error("foo")
+        end
+
+        @Variable function bar(data -> foo)
+            return data
+        end
+        """)
+        log = TestLogger()
+        with_logger(log) do
+            Context.run(ctx) do
+                @test timedwait(() -> istaskdone(ctx.variable_tasks["bar"]), 5) == :ok
+            end
+        end
+        @test length(log.logs) == 1
+        @test !isready(ctx.stream_output)
+
+        # Slightly more complicated DAG to test that everything is wired up correctly
+        ctx = Context.load_from_string(raw"""
+        @Input function input(output)
+            put!(output, (0, Dict("motor1.pos" => 1, "motor2.pos" => 1)))
+        end
+
+        @Variable function x(data -> karabo"motor1.pos")
+            return data
+        end
+
+        @Variable function y(data -> karabo"motor2.pos")
+            return data
+        end
+
+        @Variable function z(x -> x, y -> y)
+            return x + y
+        end
+        """)
+        Context.run(ctx) do
+            @test timedwait(() -> !isopen(ctx.stream_output), 5) == :ok
+        end
+
+        # Take all the outputs
+        results = VariableData[]
+        while isready(ctx.stream_output)
+            push!(results, take!(ctx.stream_output))
+        end
+
+        # Check that we have results from each variable
+        @test length(results) == 3
+        @test Set(results) == Set([VariableData(0, "x", 1),
+                                   VariableData(0, "y", 1),
+                                   VariableData(0, "z", 2)])
+
+        # Test scheduling with groups and parameters
+        ctx = Context.load_from_string(raw"""
+        @Input function input(output)
+            put!(output, (0, Dict("motor1.pos" => 1)))
+        end
+
+        @Group struct Foo
+            @Parameter x::Int
+        end
+
+        @Variable function bar(group::Foo, data -> karabo"motor1.pos")
+            return group.x + data
+        end
+
+        foo = Foo(1)
+        """)
+        @test only(keys(ctx.parameters)) == "foo.x"
+        Context.run(ctx) do
+            @test timedwait(() -> !isopen(ctx.stream_output), 5) == :ok
+        end
+        @test isready(ctx.stream_output)
+        @test take!(ctx.stream_output) == VariableData(0, "foo.bar", 2)
+
+        # Test the Meta module
+        ctx = Context.load_from_string(raw"""
+        @Input function input(output)
+            put!(output, (42, Dict("motor1.pos" => 1)))
+        end
+
+        @Variable function foo(data -> karabo"motor1.pos")
+            scratch = Meta.scratch[]
+
+            return (; tid=Meta.tid[], scratch_dict=scratch isa Dict)
+        end
+        """)
+        Context.run(ctx) do
+            @test timedwait(() -> !isopen(ctx.stream_output), 5) == :ok
+        end
+        result = take!(ctx.stream_output)
+        @test result == VariableData(42, "foo", (; tid=42, scratch_dict=true))
     end
-    """)
-    Context.run(ctx) do
-        @test keys(ctx.variable_dtasks) == Set(["motor1", "bar"])
-        wait(ctx.variable_dtasks["bar"])
-        @show istaskdone(ctx.variable_dtasks["bar"])
-        flush(stdout)
-        flush(stderr)
-    end
-    @test take!(ctx.variable_output) == VariableData(0, "motor1", 1)
-    @test take!(ctx.variable_output) == VariableData(0, "bar", 3)
 end
 
 @testset "Serialization" begin

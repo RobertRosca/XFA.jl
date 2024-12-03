@@ -71,7 +71,7 @@ Example usage:
     karabo"SA2_XTD1_XGM/XGM/DOOCS:output[data.intensityTD]"
 """
 macro karabo_str(str)
-    Expr(:call, :KaraboDependency, esc(Meta.parse("\"$(escape_string(str))\"")))
+    Expr(:call, :KaraboDependency, esc(Base.Meta.parse("\"$(escape_string(str))\"")))
 end
 
 
