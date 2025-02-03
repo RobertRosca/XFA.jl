@@ -3,8 +3,9 @@ module States
 import LibSSH as ssh
 import HTTP.WebSockets as ws
 
-import XfaEngine.Protocol: Message, send
+import XfaEngine.Protocol: send
 import ...Maybe
+import ..ImGuiHelpers
 
 export GuiState
 
@@ -142,6 +143,9 @@ function Base.close(state::SshState)
     if !isnothing(state.session)
         close(state.session)
     end
+
+    state.password = ""
+    empty!(state.kbdint_prompts)
 end
 
 @kwdef mutable struct ClientState <: ExtendableState
@@ -180,6 +184,9 @@ function Base.close(client::ClientState)
     for ssh_state in Iterators.reverse(client.ssh_hops)
         close(ssh_state)
     end
+
+    # Delete any cached values
+    empty!(ImGuiHelpers.safe_input_text_cache)
 end
 
 @kwdef mutable struct GuiState <: ExtendableState
@@ -209,6 +216,9 @@ end
     trainmatchers::Dict{String, Any} = Dict()
     karabo_devices::Dict{String, Any} = Dict()
 
+    # Variables
+    variable_data::Dict{String, Any} = Dict()
+
     extras::Dict{Any, Any} = Dict()
     lock::ReentrantLock = ReentrantLock()
 end
@@ -217,7 +227,10 @@ function Base.show(io::IO, state::GuiState)
     print(io, GuiState, "(context_path=\"$(state.context_path)\", engine_environment=\"$(state.engine_environment)\")")
 end
 
-Base.close(state::GuiState) = close(state.client)
+function Base.close(state::GuiState)
+    close(state.client)
+    empty!(state.variable_data)
+end
 
 function Base.lock(state::GuiState)
     lock(state.lock)

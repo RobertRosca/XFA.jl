@@ -2,6 +2,7 @@ module Client
 
 import TOML
 import Sockets
+import CRC32c: crc32c
 using Serialization
 
 import LibSSH as ssh
@@ -9,7 +10,7 @@ import HTTP
 import HTTP: WebSockets
 
 import XfaEngine: getavailableport
-import XfaEngine.Context: Dependency, Parameter
+import XfaEngine.Context: KaraboDependency, Dependency, Parameter
 using XfaEngine.Protocol
 import XfaEngine.Protocol: send
 import ..States: GuiState, SshState, ClientState, KbdintPromptState
@@ -28,7 +29,6 @@ end
 function ssh_initialize(state::GuiState)
     client = state.client
     client.status = RemoteStatus_Connecting
-
     address = state.address
     user = nothing
     if occursin("@", address)
@@ -102,6 +102,8 @@ function ssh_authenticate_hop(state::GuiState, hop_idx)
         ssh_state.auth_state = nothing
     elseif new_auth_state isa ssh.AuthStatus
         ssh_state.auth_state = new_auth_state
+    elseif new_auth_state isa ssh.KnownHosts
+        ssh_state.auth_state = new_auth_state
     else
         @error "Unsupported result from ssh.authenticate(): $(new_auth_state)"
     end
@@ -165,6 +167,8 @@ function initialize_engine(state)
         bootstrap_jl = joinpath(working_dir, "bootstrap.jl")
         ssh.SftpSession(session) do sftp
             code = read(joinpath(@__DIR__, "bootstrap.jl"))
+
+            mkpath(dirname(bootstrap_jl), sftp)
             open(bootstrap_jl, sftp; write=true) do f
                 write(f, code)
             end
@@ -237,61 +241,48 @@ function disconnect(state, shutdown_engine)
     state.client = ClientState()
 end
 
-function build_context_state(state, ctx_info)
-    ctx_state = state.context_state
-    new_ctx_state = Dict{String, Any}()
+# Create a Int32 hash to use for ImNodes
+node_hash(x) = reinterpret(Cint, crc32c(x))
 
-    used_ids = Set()
-    for (name, value) in ctx_state
-        push!(used_ids, value["id"])
-        for (dep_id, _) in value["dependencies"]
-            push!(used_ids, dep_id)
-        end
-        for (output_id, _) in value["outputs"]
-            push!(used_ids, output_id)
-        end
-        for (link_id, _, _) in value["links"]
-            push!(used_ids, link_id)
+function build_context_state(state, ctx_info)
+    ctx_state = Dict{String, Any}()
+
+    for (name, deps) in ctx_info["dag"]
+        ctx_state[name] = Dict{String, Any}("id" => node_hash(name))
+
+        ctx_state[name]["dependencies"] = []
+        ctx_state[name]["outputs"] = []
+        ctx_state[name]["type"] = :variable
+
+        for (value_name, current_values) in [("dependencies", deps),
+                                             ("outputs", ["", ctx_info["subvariables"][name]...])]
+            for value in current_values
+                attr_id = node_hash("$(name).$(value_name).$(value)")
+                push!(ctx_state[name][value_name], (attr_id, value))
+            end
         end
     end
 
-    id_pool = setdiff(Set(1:999), used_ids)
+    for name in ctx_info["groups"]
+        group_filter = startswith("$(name).")
 
-    for (name, deps) in ctx_info["dag"]
-        var_exists = haskey(ctx_state, name)
-        if var_exists
-            new_ctx_state[name] = ctx_state[name]
-        else
-            new_ctx_state[name] = Dict{String, Any}("id" => pop!(id_pool))
+        ctx_state[name] = Dict{String, Any}("id" => node_hash(name))
+        ctx_state[name]["dependencies"] = []
+        ctx_state[name]["outputs"] = []
+        ctx_state[name]["type"] = :group
+        ctx_state[name]["links"] = []
+        ctx_state[name]["parameters"] = Dict{String, Any}()
+
+        inputs = filter(group_filter, keys(ctx_info["inputs"]))
+        for input_name in inputs
+            stripped_name = chopprefix(input_name, "$(name).")
+            push!(ctx_state[name]["outputs"], (node_hash(input_name), stripped_name))
         end
 
-        new_ctx_state[name]["dependencies"] = []
-        new_ctx_state[name]["outputs"] = []
-
-        old_params = var_exists ? ctx_state[name]["parameters"] : Dict()
-        params = Dict([dep.name => dep for dep in values(deps) if dep isa Parameter])
-        for param in values(params)
-            if haskey(old_params, param.name) && typeof(param.value) == typeof(old_params[param.name].value)
-                params[param.name] = old_params[param.name]
-            end
-        end
-
-        new_ctx_state[name]["parameters"] = params
-        non_param_deps = [dep for dep in deps if !(dep isa Parameter)]
-
-        for (value_name, current_values) in [("dependencies", non_param_deps),
-                                             ("outputs", ["output", ctx_info["subvariables"][name]...])]
-            old_values = var_exists ? map(x -> x[2], ctx_state[name][value_name]) : []
-
-            for value in current_values
-                old_idx = findfirst(==(value), old_values)
-
-                if old_idx != nothing
-                    push!(new_ctx_state[name][value_name],
-                          ctx_state[name][value_name][old_idx])
-                else
-                    push!(new_ctx_state[name][value_name], (pop!(id_pool), value))
-                end
+        for (param_name, param) in ctx_info["parameters"]
+            if group_filter(param_name)
+                stripped_name = chopprefix(param_name, "$(name).")
+                ctx_state[name]["parameters"][stripped_name] = param
             end
         end
     end
@@ -300,17 +291,24 @@ function build_context_state(state, ctx_info)
     for (name, deps) in ctx_info["dag"]
         for (i, dep_pair) in enumerate(deps)
             dep = dep_pair.second
+            link_end_id = ctx_state[name]["dependencies"][i][1]
+
             if dep isa Dependency
-                link_start_id = new_ctx_state[dep.name]["outputs"][1][1]
-                link_end_id = new_ctx_state[name]["dependencies"][i][1]
-                push!(new_links, (pop!(id_pool), link_start_id, link_end_id))
+                link_start_id = ctx_state[dep.name]["outputs"][1][1]
+                link_id = node_hash("$(link_start_id)->$(link_end_id)")
+                push!(new_links, (link_id, link_start_id, link_end_id))
+            elseif dep isa KaraboDependency
+                input_name = only(keys(ctx_info["inputs"]))
+                link_start_id = node_hash(input_name)
+                link_id = node_hash("$(link_start_id)->$(link_end_id)")
+                push!(new_links, (link_id, link_start_id, link_end_id))
             end
         end
 
-        new_ctx_state[name]["links"] = new_links
+        ctx_state[name]["links"] = new_links
     end
 
-    return new_ctx_state
+    return ctx_state
 end
 
 function handle_msg(state, msg)
@@ -328,6 +326,16 @@ function handle_msg(state, msg)
         end
     elseif msg isa ContextInfo
         state.context_state = build_context_state(state, msg.info)
+    elseif msg isa TrainData
+        for variable in msg.variables
+            @show variable
+
+            if !haskey(state.variable_data, variable.name)
+                state.variable_data[variable.name] = Float64[]
+            end
+
+            # push!(state.variable_data[variable.name], variable.data)
+        end
     else
         @warn "Received unsupported message of type '$(typeof(msg))'"
     end
@@ -358,7 +366,7 @@ function handle_server(state)
 
                 for msg_bytes in ws
                     buffer = IOBuffer(msg_bytes)
-                    msg::Message = deserialize(buffer)
+                    msg::AbstractMessage = deserialize(buffer)
 
                     try
                         @invokelatest handle_msg(state, msg)
@@ -417,7 +425,7 @@ function test_connect(port=1331)
 
         for msg_bytes in ws
             buffer = IOBuffer(msg_bytes)
-            msg::Message = deserialize(buffer)
+            msg::AbstractMessage = deserialize(buffer)
             @show msg
         end
 
@@ -442,6 +450,18 @@ function revise_engine(state)
     if state.client.status == RemoteStatus_Connected && !isnothing(state.client.websocket)
         send(state.client.websocket, ReviseCode())
     end
+end
+
+function change_parameter(state, param::Parameter)
+    send(state.client.websocket, ChangeParameter(param))
+end
+
+function start(state)
+    send(state.client.websocket, Start())
+end
+
+function stop(state)
+    send(state.client.websocket, Stop())
 end
 
 end

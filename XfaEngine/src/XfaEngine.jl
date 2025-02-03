@@ -1,9 +1,9 @@
 module XfaEngine
 
 include("karabo_bridge.jl")
+include("context.jl")
 include("protocol.jl")
 include("webproxy.jl")
-include("context.jl")
 
 import TOML
 import Sockets: listen, close, @ip_str
@@ -56,6 +56,7 @@ end
     karabo_bridge_port::Int = -1
     websocket_listener_task::Union{Task, Nothing} = nothing
     clients::Dict{String, ClientState} = Dict()
+
     ctx::Union{XfaContext, Nothing} = nothing
 
     halt_and_catch_fire::Base.Event = Base.Event()
@@ -79,6 +80,14 @@ function Base.setproperty!(state::EngineState, sym::Symbol, value)
     end
 end
 
+function forward_output(state::EngineState, stream_output)
+    for data in stream_output
+        for client in values(state.clients)
+            Protocol.send(client.websocket, TrainData([data]))
+        end
+    end
+end
+
 """Close connections to all clients and optionally the websocket listener."""
 function shutdown(state::EngineState, ws_server=nothing)
     if ws_server != nothing
@@ -90,7 +99,7 @@ function shutdown(state::EngineState, ws_server=nothing)
     end
 end
 
-function handle_message(msg::Message, state::EngineState, id)
+function handle_message(msg::AbstractMessage, state::EngineState, id)
     client_state = state.clients[id]
     ws = client_state.websocket
 
@@ -111,12 +120,22 @@ function handle_message(msg::Message, state::EngineState, id)
             Protocol.send(ws, Devices(ex))
         end
     elseif msg isa LoadContext
-        state.ctx = Context.load_from_file(msg.path)
+        path = abspath(expanduser(msg.path))
+        state.ctx = Context.load_from_file(path)
         Protocol.send(ws, ContextInfo(Context.to_dict(state.ctx)))
-        @info "Loaded context file $(context_path): $(state.ctx)"
+        @info "Loaded context file $(path): $(state.ctx)"
     elseif msg isa ReviseCode
         @everywhere Revise.retry()
         @info "Revised source code"
+    elseif msg isa ChangeParameter
+        param = msg.parameter
+        @info "ChangeParameter of $(param.name) to $(param.value)"
+    elseif msg isa Start
+        @info "Starting pipeline"
+        Context.start_pipeline(state.ctx; forwarder=Base.Fix1(forward_output, state))
+    elseif msg isa Stop
+        @info "Stopping pipeline"
+        Context.stop_pipeline(state.ctx)
     else
         @error "Received unsupported message: $(typeof(msg))"
     end
@@ -151,14 +170,14 @@ const ID_PREFIXES = ["bothersome", "droopy", "deleterious", "morbid", "snobbish"
 const ID_SUFFIXES = ["elf", "balrog", "wizard", "hobbit", "dwarf", "ent", "troll", "goblin", "tom", "dragon"]
 create_id() = "$(rand(ID_PREFIXES))-$(rand(ID_SUFFIXES))"
 
-function main(halt_and_catch_fire=Base.Event())
+function main(halt_and_catch_fire=Base.Event(); info_path=nothing)
     websocket_port = getavailableport(1331)
     state = EngineState(; websocket_port, halt_and_catch_fire)
 
     ws_server = WebSockets.listen!("0.0.0.0", state.websocket_port) do ws
+        id = create_id()
         try
             # Select their identifier
-            id = create_id()
             while id in keys(state.clients)
                 id = create_id()
             end
@@ -188,7 +207,12 @@ function main(halt_and_catch_fire=Base.Event())
     worker_info["1"]["websocket-port"] = websocket_port
     worker_info["1"]["karabo-bridge-port"] = state.karabo_bridge_port
 
-    info_path = abspath("worker-info.toml")
+    if isnothing(info_path)
+        info_path = abspath("worker-info.toml")
+    else
+        info_path = abspath(expanduser(info_path))
+    end
+
     open(info_path, "w") do io
         TOML.print(io, worker_info)
     end

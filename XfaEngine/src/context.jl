@@ -1,10 +1,10 @@
 module Context
 
-export @karabo_str, @Variable, @Parameter, @Input, @Group
+export @karabo_str, @Variable, @Input, @Group, Parameter, tryset
 
 import Base.ScopedValues: @with
 
-import DistributedNext: RemoteChannel
+import DistributedNext: RemoteChannel, remote_do
 
 import MacroTools
 import MacroTools: @capture, postwalk, prettify
@@ -23,7 +23,6 @@ end
 
 const dag_functions = Dict{String, Function}()
 current_ctx_module::Module = Module()
-const scratch_spaces = Dict{String, Dict{String, Any}}()
 
 # Container module for train/variable-specific information. This conflicts with
 # Base.Meta but we accept that for the convenience of the name. In this module
@@ -36,12 +35,15 @@ import Base.ScopedValues: ScopedValue
 const tid = ScopedValue{Int}()
 const run_number = ScopedValue{Int}()
 const proposal = ScopedValue{Int}()
+const name = ScopedValue{String}()
 
 const scratch = ScopedValue{Dict{String, Any}}()
 
 end
 
 include("context_types.jl")
+
+import ..KaraboBridge: KaraboBridgeClient
 include("context_builtins.jl")
 
 @kwdef mutable struct XfaContext
@@ -54,7 +56,7 @@ include("context_builtins.jl")
     exprs::Vector{Expr}
 
     inputs::Dict{String, Any}
-    input_channels::Dict{String, RemoteChannel} = Dict()
+    input_channels::Dict{String, Channel} = Dict()
     input_tasks::Dict{String, Task} = Dict()
 
     input_variable_channels::Dict{String, Dict{String, RemoteChannel}} = Dict()
@@ -66,7 +68,10 @@ include("context_builtins.jl")
     variable_tasks::Dict{String, Task} = Dict()
     variable_channels::Dict{String, Dict{String, RemoteChannel}} = Dict()
 
-    stream_output::RemoteChannel = RemoteChannel(() -> Channel(100))
+    stream_output::Union{RemoteChannel, Nothing} = nothing
+    output_forwarder_task::Union{Task, Nothing} = nothing
+
+    events_channel::Union{RemoteChannel, Nothing} = nothing
     watcher_task::Task = Task(Returns(nothing))
 end
 
@@ -107,9 +112,18 @@ function find_downstream_neighbours(ctx::XfaContext, dep_name, T::DataType)
 end
 
 function to_dict(ctx::XfaContext)
+    inputs = Dict{String, Vector{String}}()
+    for (name, deps) in ctx.inputs
+        inputs[name] = collect(keys(deps))
+    end
+
+    groups = sort(collect(keys(ctx.groups)))
+
     return Dict("dag" => ctx.dag,
                 "subvariables" => ctx.subvariables,
-                "parameters" => ctx.parameters)
+                "parameters" => ctx.parameters,
+                "inputs" => inputs,
+                "groups" => groups)
 end
 
 """
@@ -216,11 +230,15 @@ end
 
 VariableData(tid, name, data) = VariableData(UInt64(tid), name, data)
 
-function input_wrapper(name, channel)
+function input_wrapper(name, group, channel)
     f = dag_functions[name]
 
     try
-        f(channel)
+        if isnothing(group)
+            @with Meta.name => name f(channel)
+        else
+            @with Meta.name => name f(group, channel)
+        end
     catch ex
         if !(ex isa InvalidStateException)
             @error "Caught exception while executing input '$(name)'" exception=(ex, catch_backtrace())
@@ -252,6 +270,7 @@ function stream_input(name, channel, downstream_neighbours)
     try
         while isopen(channel) || isready(channel)
             tid, sources = take!(channel)
+
             putall!(values(downstream_neighbours), TrainData(tid, sources))
             @debug "Pushed input data from '$(name)' to: $(keys(downstream_neighbours))"
         end
@@ -271,12 +290,19 @@ end
 function stream_external_dependency(name, input_neighbour, downstream_neighbours)
     channel = input_neighbour.channel
 
+    dep = KaraboDependency(name)
+
     try
         while isopen(channel) || isready(channel)
             input = take!(channel)
-            result = VariableData(input.tid, name, haskey(input.data, name) ? input.data[name] : nothing)
+            data = nothing
+            if haskey(input.data, dep.source) && haskey(input.data[dep.source], dep.property)
+                data = input.data[dep.source][dep.property]
+            end
+
+            result = VariableData(input.tid, name, data)
             putall!(values(downstream_neighbours), result)
-            @debug "Pushed '$(name)' to: $(keys(downstream_neighbours))"
+            @debug "Pushed data for '$(name)' to: $(keys(downstream_neighbours))"
         end
     catch ex
         if !(ex isa InvalidStateException)
@@ -290,24 +316,10 @@ function stream_external_dependency(name, input_neighbour, downstream_neighbours
         end
     end
 end
-    
-function stream_variable(name, stream_output, upstream, downstream, param_names)
-    # Resolve all parameter names to their parent objects
-    params = Dict{String, Any}()
-    for param_name in param_names
-        elements = split(param_name, '.')
-        parent_obj = current_ctx_module
-        for property in elements[1:end - 1]
-            parent_obj = getproperty(parent_obj, Symbol(property))
-        end
 
-        params[param_name] = (; parent_obj, property=Symbol(last(elements)))
-    end
-
-    param_values = Dict{String, Any}()
-
+function stream_variable(name, stream_output, upstream, downstream)
     # Initialize the scratch space
-    scratch_spaces[name] = Dict{String, Any}()
+    scratch = Dict{String, Any}()
 
     try
         while true
@@ -335,31 +347,15 @@ function stream_variable(name, stream_output, upstream, downstream, param_names)
                 continue
             end
 
-            # Store the current parameter values
-            for (param_name, param_info) in params
-                param_values[param_name] = getproperty(param_info.parent_obj, param_info.property)
-            end
-
             # Execute the variable
             f = dag_functions[name]
             @debug "Executing variable '$(name)'..."
             try
-                out = @with Meta.tid => tid Meta.scratch => scratch_spaces[name] f(unwrapped_args...)
+                out = @with Meta.tid => tid Meta.name => name Meta.scratch => scratch f(unwrapped_args...)
             catch ex
                 @error "Execution of variable '$(name)' failed" exception=(ex, catch_backtrace())
                 putall!(values(downstream), empty_result)
                 continue
-            end
-
-            # Check for changed parameters
-            for (param_name, param_info) in params
-                current_value = getproperty(param_info.parent_obj, param_info.property)
-
-                if current_value != param_values[param_name]
-                    # TODO: notify the master that the parameter changed
-                end
-
-                param_values[param_name] = current_value
             end
 
             # Send output
@@ -374,9 +370,6 @@ function stream_variable(name, stream_output, upstream, downstream, param_names)
         end
     finally
         @debug "Finishing variable '$(name)'"
-
-        # Clear the scratch space so anything stored can be GC'd
-        delete!(scratch_spaces, name)
 
         # Close upstream and downstream channels
         for arg in values(upstream)
@@ -404,11 +397,26 @@ function watch_context(ctx::XfaContext)
     end
 end
 
-function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50)
+function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50, forwarder=Returns(nothing))
+    ctx.stream_output = RemoteChannel(() -> Channel(100))
+    ctx.events_channel = RemoteChannel(() -> Channel(100))
+    ctx.output_forwarder_task = Threads.@spawn forwarder(ctx.stream_output)
+    errormonitor(ctx.output_forwarder_task)
+
     # Start the input functions to feed the DAG
-    for name in keys(ctx.inputs)
-        ctx.input_channels[name] = RemoteChannel()
-        ctx.input_tasks[name] = Threads.@spawn input_wrapper(name, ctx.input_channels[name])
+    for (name, deps) in ctx.inputs
+        group = nothing
+        if !isempty(deps)
+            first_arg = first(keys(deps))
+            if deps[first_arg] isa GroupDependency
+                group = ctx.groups[deps[first_arg].name]
+            else
+                error("Couldn't schedule input '$(name)', it has a non-group dependency: $(deps[1])")
+            end
+        end
+
+        ctx.input_channels[name] = Channel(1)
+        ctx.input_tasks[name] = Threads.@spawn input_wrapper(name, group, ctx.input_channels[name])
         errormonitor(ctx.input_tasks[name])
     end
 
@@ -454,8 +462,6 @@ function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50)
                 args[dep_name] = ctx.external_dependency_channels[dep_name][name]
             elseif dep isa Dependency
                 args[dep_name] = ctx.variable_channels[dep_name][name]
-            elseif dep isa Parameter
-                args[dep_name] = ctx.parameters[dep_name]
             elseif dep isa GroupDependency
                 args[dep_name] = ctx.groups[dep.name]
             else
@@ -470,8 +476,7 @@ function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50)
         end
         ctx.variable_channels[name] = downstream
 
-        param_names = keys(ctx.parameters)
-        ctx.variable_tasks[name] = Threads.@spawn stream_variable(name, ctx.stream_output, args, downstream, param_names)
+        ctx.variable_tasks[name] = Threads.@spawn stream_variable(name, ctx.stream_output, args, downstream)
         errormonitor(ctx.variable_tasks[name])
     end
 
@@ -523,6 +528,11 @@ function stop_pipeline(ctx::XfaContext; timeout=5)
     end
 
     wait(ctx.watcher_task)
+    if !isnothing(ctx.output_forwarder_task)
+        wait(ctx.output_forwarder_task)
+    end
+
+    @debug "Pipeline fully stopped"
 
     return nothing
 end
@@ -569,7 +579,7 @@ function load_from_string(ctx_str::AbstractString)
         using XfaEngine.Context
         import XfaEngine.Context: Parameter, KaraboBridge, Meta
 
-        _xfa_parameters = Parameter[]
+        # _xfa_parameters = Parameter[]
     end
     @eval ctx_module $init_expr
 
@@ -587,16 +597,21 @@ function load_from_string(ctx_str::AbstractString)
         @eval ctx_module $expr
     end
 
-    # Check if we have any duplicate parameters
-    if !allunique([param.name for param in ctx_module._xfa_parameters])
-        throw(XfaContextException("Duplicate @Parameter's exist"))
+    parameters = Dict{String, Parameter}() # [param.name => param for param in ctx_module._xfa_parameters])
+
+    # Find top-level parameters
+    for name in names(ctx_module; all=true)
+        object = getproperty(ctx_module, name)
+        if object isa Parameter
+            object.name = string(name)
+            parameters[string(name)] = object
+        end
     end
 
     # Load the group types
     group_types = Dict{DataType, Group}()
     for (group_struct, param_fields) in registered_groups
-        parameters = Dict([field => fieldtype(group_struct, field) for field in param_fields])
-        group_types[group_struct] = Group(group_struct, parameters, Function[])
+        group_types[group_struct] = Group(group_struct, Function[])
 
         for (func, deps) in registered_variables
             if isempty(deps)
@@ -609,8 +624,6 @@ function load_from_string(ctx_str::AbstractString)
             end
         end
     end
-
-    parameters = Dict([param.name => param for param in ctx_module._xfa_parameters])
 
     # Check if there are any parameters with the same name as a variable
     ctx_variables = filter(pair -> parentmodule(pair.first) === ctx_module, registered_variables)
@@ -663,12 +676,6 @@ function load_from_string(ctx_str::AbstractString)
 
     # Look at all the top-level names and check if they're groups
     for (group_name, group_type, object) in _get_group_objects(ctx_module, group_types)
-        # value = getproperty(ctx_module, group_name)
-        # group_type_name = findfirst(g -> value isa g.type, group_types)
-        # if group_type_name == nothing
-        #     continue
-        # end
-
         groups[group_name] = object
 
         # If so, then add all their variables to the DAG
@@ -707,9 +714,16 @@ function load_from_string(ctx_str::AbstractString)
         end
 
         # And add all the parameters too
-        for (param_sym, param_type) in group_types[group_type].parameters
-            param_name = "$group_name.$param_sym"
-            parameters[param_name] = Parameter(param_name, getproperty(object, param_sym))
+        # for (param_sym, param_type) in group_types[group_type].parameters
+        #     param_name = "$group_name.$param_sym"
+        #     parameters[param_name] = Parameter(param_name, getproperty(object, param_sym))
+        # end
+        for field in fieldnames(group_type)
+            if fieldtype(group_type, field) <: Parameter
+                param = getproperty(object, field)
+                param.name = "$(group_name).$(field)"
+                parameters[param.name] = param
+            end
         end
 
         # And all the inputs
@@ -736,7 +750,7 @@ function load_from_string(ctx_str::AbstractString)
     # add them to the context if they're not part of a group. All the grouped
     # inputs should already have been added.
     for (func, deps) in ctx_inputs
-        if isempty(deps) || length(deps) == 1
+        if isempty(deps) || !(deps[1][2] isa GroupDependency)
             name = string(nameof(func))
             inputs[name] = Dict(deps)
             functions[name] = func

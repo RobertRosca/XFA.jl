@@ -208,39 +208,37 @@ macro Variable(expr)
     _variable(__module__, expr, true)
 end
 
-
 mutable struct Parameter{T}
-    const name::String
+    name::String
     value::T
+    set_by_user::Bool
 end
 
-Base.:(==)(one::Parameter{T}, two::Parameter{T}) where T = one.name == two.name && one.value == two.value
-Base.string(param::Parameter{T}) where T = param.name
+function Base.:(==)(one::Parameter{T}, two::Parameter{T}) where T
+    one.name == two.name && one.value == two.value && one.set_by_user == two.set_by_user
+end
 
-function _parameter(ctx_module, expr, side_effects)
-    if !(expr isa Expr)
-        throw(ArgumentError("Must pass an Expr to @Parameter"))
+Parameter(value) = Parameter("", value, false)
+Parameter(name, value) = Parameter(name, value, false)
+
+function tryset(param::Parameter, value; force=false)
+    if param.set_by_user && force
+        param.set_by_user = false
     end
 
-    if @capture(expr, name_::T_ -> value_)
-        body = quote
-            if $side_effects
-                push!(_xfa_parameters, Context.Parameter($("$name"), $value::$T))
-            end
-        end
-        return esc(body)
+    if !param.set_by_user
+        remote_do(set_parameter, 1, param.name, value, Meta.name[])
+        return true
+    else
+        return false
     end
-
-    throw(ArgumentError("Could not construct parameter from expression: $(prettify(expr))"))
 end
 
-"""
-Mark things as parameters.
-"""
-macro Parameter(expr)
-    _parameter(__module__, expr, true)
-end
+Base.getindex(param::Parameter) = param.value
 
+function set_parameter(name::String, value, requestor::String)
+    @info "Setting parameter '$(name)' to $(value) as requested by '$(requestor)'"
+end
 
 function _input(ctx_module, expr, side_effects)
     if !(expr isa Expr)
@@ -284,7 +282,6 @@ end
 
 struct Group
     type::DataType
-    parameters::Dict{Symbol, DataType}
     variables::Vector{Function}
 end
 
@@ -298,23 +295,33 @@ function _group(ctx_module, expr, side_effects)
     end
 
     if @capture(expr, struct name_ fields__ end)
-        # Look through the fields for parameters
-        param_fields = []
-        new_fields = [if @capture(field, @Parameter field_name_::T_)
-                          push!(param_fields, field_name)
-                          :($field_name::$T)
-                      else
-                          field
-                      end
-                      for field in fields]
+        # # Look through the fields for parameters
+        # param_fields = []
+        # new_fields = [if @capture(field, field_name_::Parameter{T_})
+        #                   push!(param_fields, field_name)
+        #                   :($field_name::$T)
+        #               else
+        #                   field
+        #               end
+        #               for field in fields]
+
+        # new_expr = quote
+        #     struct $name
+        #         $(new_fields...)
+        #     end
+
+        #     if $side_effects
+        #         Context.registered_groups[$name] = $param_fields
+        #     end
+
+        #     $name
+        # end
 
         new_expr = quote
-            struct $name
-                $(new_fields...)
-            end
+            $(expr)
 
             if $side_effects
-                Context.registered_groups[$name] = $param_fields
+                Context.registered_groups[$name] = []
             end
 
             $name

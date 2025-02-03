@@ -70,7 +70,7 @@ function draw_main_menubar(state)
         draw_revise(state)
 
         @Disabled state.client.status != RemoteStatus_Connected || !state.context_path_valid begin
-            if ig.Button("Apply context")
+            if ig.Button("Load context")
                 Client.load_context(state)
             end
         end
@@ -92,20 +92,45 @@ function draw_main_menubar(state)
     end
 end
 
-function draw_parameter(param::Parameter{Float64})
-    @c ig.InputDouble(param.name, &param.value)
+function draw_parameter(name, param::Parameter{Float64})
+    @c ig.InputDouble(name, &param.value)
+
+    return false, nothing
 end
 
-function draw_parameter(param::Parameter{Int})
+function draw_parameter(name, param::Parameter{Int})
     int32_value = Int32(param.value)
-    @c ig.InputInt(param.name, &int32_value)
+    @c ig.InputInt(name, &int32_value)
     param.value = Int(int32_value)
+
+    return false, nothing
+end
+
+function draw_parameter(name, param::Parameter{String})
+    SafeInputText(name; current_text=param.value)
+end
+
+function draw_parameter(name, param::Parameter{Vector{String}})
+    ig.Text("Vector{String}")
+
+    return false, nothing
 end
 
 function draw_dag(state)
+    ctx_state = state.context_state
+
+    ig.Dummy(0, 10)
+    if ig.Button(" Start ")
+        Client.start(state)
+    end
+    ig.SameLine()
+    if ig.Button(" Stop ")
+        Client.stop(state)
+    end
+    ig.Dummy(0, 10)
+
     ImNodes.BeginNodeEditor()
 
-    ctx_state = state.context_state
     for (name, var_data) in ctx_state
         min_node_width = 150
         node_id = var_data["id"]
@@ -117,14 +142,18 @@ function draw_dag(state)
         ImNodes.EndNodeTitleBar()
 
         # Draw parameters
-        if !isempty(var_data["parameters"])
+        if haskey(var_data, "parameters")
             ig.Text("Parameters:")
-        end
-        for param in values(var_data["parameters"])
-            draw_parameter(param)
+            for (param_name, param) in var_data["parameters"]
+                ig.SetNextItemWidth(round(Int, min_node_width * 1.5))
+                modified, new_value = draw_parameter(param_name, param)
+                if modified
+                    Client.change_parameter(state, Parameter(param.name, new_value))
+                end
+            end
         end
 
-        ig.Dummy(min_node_width, 10)
+        ig.Dummy(min_node_width, 20)
 
         # Draw dependencies
         deps = var_data["dependencies"]
@@ -236,6 +265,21 @@ function draw_ssh_auth(state)
             end
 
             can_authenticate = all_answers_filled
+        elseif ssh_state.auth_state == ssh.KnownHosts_Unknown
+            ig.Text("The host is unrecognized, would you like to add it to the known hosts file?")
+            ig.SameLine()
+            if ig.Button("Yes")
+                ssh.update_known_hosts(ssh_state.session)
+                @guiasync Client.ssh_authenticate_hop(state, hop_idx)
+                can_authenticate = true
+            end
+            ig.SameLine()
+            ig.Text("/")
+            ig.SameLine()
+            if ig.Button("No")
+                # If they refuse to recognize the host then we can't do anything
+                @guiasync Client.disconnect(state, false)
+            end
         else
             can_authenticate = true
         end
@@ -368,8 +412,8 @@ function draw_gui(state)
                 edited, new_context_path = SafeInputText("##context-file";
                                                          current_text=default(state.context_path))
                 if edited
-                    state.context_path = expanduser(new_context_path)
-                    state.context_path_valid = isfile(state.context_path)
+                    state.context_path = new_context_path
+                    state.context_path_valid = true
                 end
 
                 if !state.context_path_valid

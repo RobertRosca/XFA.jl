@@ -49,4 +49,10 @@ end
 get_topology(address; per_stage_timeout=5) = get_json(address, "/topology.json"; per_stage_timeout)
 get_devices(address; per_stage_timeout=5) = get_json(address, "/devices.json"; per_stage_timeout)["devices"]
 
+function get_trainmatcher_address(address, device::String; index=1)
+    config = get_json(address, "/devices/$(device)/config.json")
+
+    config["zmqOutputs"]["value"][index]["address"]["value"]
+end
+
 end
