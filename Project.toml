@@ -18,8 +18,11 @@ TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 XfaEngine = "df4d7780-7f2f-4694-8ef1-2cbac230b49a"
 ZMQ = "c2297ded-f4af-51ae-bb23-16f91089e4e1"
 
+[sources.XfaEngine]
+path = "./XfaEngine"
+
 [compat]
-CImGui = "3"
+CImGui = "3, 5"
 GLFW = "3"
 HTTP = "1"
 LibSSH = "0.6"
@@ -28,6 +31,3 @@ Revise = "3"
 TOML = "1"
 ZMQ = "1"
 julia = "1.11"
-
-[sources]
-XfaEngine = {path = "./XfaEngine"}
