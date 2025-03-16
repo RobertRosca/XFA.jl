@@ -13,6 +13,7 @@ using Serialization
 import HTTP
 import HTTP: WebSockets
 import Revise
+using DimensionalData: DimArray
 
 using .Protocol
 import .WebProxy
@@ -59,7 +60,8 @@ end
 
     ctx::Union{XfaContext, Nothing} = nothing
 
-    halt_and_catch_fire::Base.Event = Base.Event()
+    stop_event::Base.Event = Base.Event()
+    stop_task::Union{Task, Nothing} = nothing
 end
 
 wip_state::Dict{Symbol, Any} = Dict()
@@ -109,7 +111,7 @@ function handle_message(msg::AbstractMessage, state::EngineState, id)
     elseif msg isa Shutdown
         @info "Received shutdown request from client $(id)"
         shutdown(state)
-        notify(state.halt_and_catch_fire)
+        notify(state.stop_event)
     elseif msg isa GetDevices
         try
             devices = WebProxy.get_devices(msg.webproxy_endpoint)
@@ -121,21 +123,31 @@ function handle_message(msg::AbstractMessage, state::EngineState, id)
         end
     elseif msg isa LoadContext
         path = abspath(expanduser(msg.path))
-        state.ctx = Context.load_from_file(path)
-        Protocol.send(ws, ContextInfo(Context.to_dict(state.ctx)))
-        @info "Loaded context file $(path): $(state.ctx)"
+        try
+            state.ctx = Context.load_from_file(path)
+            Protocol.send(ws, ContextInfo(Context.to_dict(state.ctx)))
+            @info "Loaded context file $(path): $(state.ctx)"
+        catch ex
+            Protocol.send(ws, ContextInfo(ex))
+            @error "Loading context file at $(path) failed" exception=(ex, catch_backtrace())
+        end
     elseif msg isa ReviseCode
         @everywhere Revise.retry()
         @info "Revised source code"
     elseif msg isa ChangeParameter
         param = msg.parameter
+        Context.change_parameter(param)
         @info "ChangeParameter of $(param.name) to $(param.value)"
     elseif msg isa Start
-        @info "Starting pipeline"
+        @info "Starting pipeline..."
         Context.start_pipeline(state.ctx; forwarder=Base.Fix1(forward_output, state))
+        Protocol.send(ws, Started())
+        @info "Started"
     elseif msg isa Stop
-        @info "Stopping pipeline"
+        @info "Stopping pipeline..."
         Context.stop_pipeline(state.ctx)
+        Protocol.send(ws, Stopped())
+        @info "Stopped"
     else
         @error "Received unsupported message: $(typeof(msg))"
     end
@@ -170,9 +182,9 @@ const ID_PREFIXES = ["bothersome", "droopy", "deleterious", "morbid", "snobbish"
 const ID_SUFFIXES = ["elf", "balrog", "wizard", "hobbit", "dwarf", "ent", "troll", "goblin", "tom", "dragon"]
 create_id() = "$(rand(ID_PREFIXES))-$(rand(ID_SUFFIXES))"
 
-function main(halt_and_catch_fire=Base.Event(); info_path=nothing)
+function main(stop_event=Base.Event(); info_path=nothing, wait=true)
     websocket_port = getavailableport(1331)
-    state = EngineState(; websocket_port, halt_and_catch_fire)
+    state = EngineState(; websocket_port, stop_event)
 
     ws_server = WebSockets.listen!("0.0.0.0", state.websocket_port) do ws
         id = create_id()
@@ -219,8 +231,8 @@ function main(halt_and_catch_fire=Base.Event(); info_path=nothing)
 
     @info "Wrote worker information to $(info_path)"
 
-    try
-        wait(state.halt_and_catch_fire)
+    state.stop_task = Threads.@spawn try
+        Base.wait(state.stop_event)
     catch ex
         if ex isa InterruptException
             @info "Shutdown requested, shutting down..."
@@ -233,6 +245,12 @@ function main(halt_and_catch_fire=Base.Event(); info_path=nothing)
             HTTP.forceclose(ws_server)
         end
     end
+
+    if wait
+        Base.wait(state.stop_task)
+    end
+
+    return state
 end
 
 end # module XfelAnalyserEngine

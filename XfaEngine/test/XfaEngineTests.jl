@@ -7,9 +7,11 @@ import Sockets
 import Sockets: @ip_str, send, recv
 import Statistics: mean
 import Test: with_logger, TestLogger
-import ReTest: @testset, @test, @test_throws
+import ReTest: @testset, @test, @test_throws, @test_logs
 
 import ZMQ
+import HTTP
+import HTTP: WebSockets
 import OrderedCollections: OrderedDict as OD
 
 import XfaEngine
@@ -18,7 +20,80 @@ import XfaEngine.Context: @Variable, @karabo_str, VariableData, Dependency, Kara
     GroupDependency, SubvariableDependency, XfaContextException, Parameter, FunctionArgument
 import XfaEngine.KaraboBridge
 import XfaEngine.KaraboBridge: KaraboBridgeClient, KaraboBridgeServer, ThreadsafeSocket
+import XfaEngine: Protocol
 
+
+function test_connect(port=1331)
+    client = Client()
+
+    t = Threads.@spawn WebSockets.open(address) do ws
+        client.websocket = ws
+
+        id = WebSockets.receive(ws)
+        client.client_id = id
+
+        for msg_bytes in ws
+            buffer = IOBuffer(msg_bytes)
+            msg::AbstractMessage = deserialize(buffer)
+            @show msg
+        end
+
+        @info "Connection to $(address) closed"
+    end
+
+    return client, errormonitor(t)
+end
+
+function server_exists(port)
+    try
+        sock = Sockets.connect(port)
+        close(sock)
+        return true
+    catch
+        return false
+    end
+end
+
+function mock_webproxy(f::Function, port)
+    server = HTTP.serve!(Sockets.localhost, port) do request
+        if request.target == "/devices.json"
+            return HTTP.Response(read(joinpath(@__DIR__, "mid-devices.json"), String))
+        else
+            return HTTP.Response(404, "Path not supported")
+        end
+    end
+
+    try
+        f()
+    finally
+        close(server)
+    end
+end
+
+function temp_engine(f::Function; log=Logging.global_logger())
+    mktemp() do info_path, io
+        port = Ref{Int}()
+        stop_event = Base.Event()
+        t = Threads.@spawn with_logger(log) do
+            XfaEngine.main(stop_event; info_path, port)
+        end
+
+        if (timedwait(() -> isassigned(port), 10) == :timed_out
+            || timedwait(() -> server_exists(port[]), 10) == :timed_out)
+            notify(stop_event)
+            wait(t)
+            error("Server didn't start within the timeout")
+        end
+
+        address = "ws://localhost:$(port[])"
+        try
+            f(address, stop_event, info_path)
+        finally
+            notify(stop_event)
+            wait(t)
+        end
+    end
+end
 
 @testset "Engine" begin
     # Smoke test
@@ -37,6 +112,57 @@ import XfaEngine.KaraboBridge: KaraboBridgeClient, KaraboBridgeServer, Threadsaf
 
         @test occursin("[1]", read(info_path, String))
     end
+
+    log = TestLogger()
+    temp_engine(; log) do address, stop_event, info_path
+        WebSockets.open(address) do ws
+            # Test that we get a valid ID
+            id = WebSockets.receive(ws)
+            @test id isa String
+            @test length(id) > 5
+
+            # Test Ping
+            Protocol.send(ws, Protocol.Ping())
+            @test Protocol.receive(ws) isa Protocol.Pong
+
+            # Test GetDevices
+            webproxy_port = XfaEngine.getavailableport(8484)
+            mock_webproxy(webproxy_port) do
+                Protocol.send(ws, Protocol.GetDevices("localhost:$(webproxy_port)"))
+                @test Protocol.receive(ws) isa Protocol.Devices
+            end
+
+            # Test LoadContext
+            mktemp() do path, io
+                # Test loading an invalid context
+                write(path, "@Variable x -> foo")
+                Protocol.send(ws, Protocol.LoadContext(path))
+                msg = Protocol.receive(ws)
+                @test msg isa Protocol.ContextInfo
+                @test msg.info isa Exception
+
+                # Test loading a valid context
+                write(path, """
+                            p = Parameter(0)
+                            @Variable x -> karabo"foo.bar" 
+                            """)
+                Protocol.send(ws, Protocol.LoadContext(path))
+                msg = Protocol.receive(ws)
+                @test msg isa Protocol.ContextInfo
+                @test msg.info isa Dict
+                @test haskey(msg.info["dag"], "x")
+            end
+
+            # Test ChangeParameter
+            Protocol.send(ws, Protocol.ChangeParameter(Parameter("p", 1)))
+
+            # Test ReviseCode
+            Protocol.send(ws, Protocol.ReviseCode())
+        end
+    end
+
+    change_param_logs = [x.message for x in log.logs if occursin("ChangeParameter of p", x.message)]
+    @test length(change_param_logs) == 1
 
     # launcher_script = joinpath(dirname(dirname(@__FILE__)), "src/launcher.jl")
     # executable = Base.julia_cmd()
@@ -665,6 +791,29 @@ end
         end
         result = take!(ctx.stream_output)
         @test result == VariableData(42, "foo", (; tid=42, scratch_dict=true))
+
+        # Test changing parameters
+        ctx = Context.load_from_string(raw"""
+        next_input = Base.Event()
+
+        @Input function input(output)
+            put!(output, (42, Dict("motor1" => Dict("pos" => 1))))
+            wait(next_input)
+            put!(output, (42, Dict("motor1" => Dict("pos" => 1))))
+        end
+
+        x = Parameter(0)
+
+        @Variable function foo(data -> karabo"motor1.pos")
+            return x[]
+        end
+        """)
+        Context.run(ctx) do
+            @test take!(ctx.stream_output).data == 0
+            Context.change_parameter(Parameter("x", 1))
+            notify(Context.worker_state.current_ctx_module.next_input)
+            @test take!(ctx.stream_output).data == 1
+        end
     end
 end
 

@@ -3,9 +3,10 @@ module Protocol
 export AbstractMessage, Ping, Shutdown,
     GetDevices, LoadContext, ReviseCode,
     ChangeParameter, Start, Stop,
-    Pong, Devices, ContextInfo, ParameterChanged, TrainData
+    Pong, Started, Stopped, Devices, ContextInfo,
+    ParameterChanged, TrainData
 
-import Serialization: serialize
+import Serialization: serialize, deserialize
 
 import HTTP: WebSockets
 
@@ -38,6 +39,9 @@ struct Stop <: AbstractMessage end
 # Messages that the server can send
 struct Pong <: AbstractMessage end
 
+struct Started <: AbstractMessage end
+struct Stopped <: AbstractMessage end
+
 struct Devices <: AbstractMessage
     device_names::Union{Dict{String, Any}, Exception}
 end
@@ -58,6 +62,11 @@ function send(ws::WebSockets.WebSocket, msg::AbstractMessage)
     buffer = IOBuffer()
     serialize(buffer, msg)
     WebSockets.send(ws, take!(buffer))
+end
+
+function receive(ws::WebSockets.WebSocket)::AbstractMessage
+    buffer = IOBuffer(WebSockets.receive(ws))
+    return deserialize(buffer)
 end
 
 end

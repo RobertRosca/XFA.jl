@@ -1,27 +1,44 @@
 module GUI
 
+import Base.ScopedValues: ScopedValue, @with
+
 include("imnodes.jl")
 include("imgui_helpers.jl")
+
+import GLMakie
+import Observables: Observable
+import DimensionalData as DD
+using DimensionalData: DimArray
+include("plotting.jl")
+
+import ..Maybe
+import LibSSH as ssh
+import HTTP: WebSockets
+import XfaEngine: EngineState
 include("states.jl")
+
+import TOML
+import Sockets
+import CRC32c: crc32c
+using Serialization
+import HTTP
+import XfaEngine
+import XfaEngine: getavailableport
+import XfaEngine.Context: KaraboDependency, Dependency, Parameter
+using XfaEngine.Protocol
+import XfaEngine.Protocol: send
+using .ImGuiHelpers
 include("client.jl")
 
 import CImGui as ig
-import CImGui: ImVec2, ImVec4, Begin, End
+import CImGui: ImVec2, ImVec4
 import CImGui.CSyntax: @c
 import GLFW
 import ModernGL
 
 import Revise
-import HTTP: WebSockets
-import LibSSH as ssh
-
-import XfaEngine.Context: KaraboDependency, Parameter
-using XfaEngine.Protocol
-import XfaEngine.Protocol: send
 
 import .ImNodes
-using .ImGuiHelpers
-using .States
 import ..Util
 
 const WEBPROXY_COMPLETIONS::Vector{String} = [
@@ -35,10 +52,12 @@ const WEBPROXY_COMPLETIONS::Vector{String} = [
     "sxp-rr-sys-con-gui1:8484"
 ]
 
+const state = ScopedValue{GuiState}()
+
 ## Helper functions for the GUI
 
 # function update_device_list(state)
-#     client = state.webproxy_client
+#     client = state.client.webproxy_client
 #     client.status = WebProxyClientStatus_Connecting
 
 #     try
@@ -51,39 +70,40 @@ const WEBPROXY_COMPLETIONS::Vector{String} = [
 #     end
 # end
 
-function draw_revise(state)
+function draw_revise()
     can_revise = length(Revise.revision_queue) > 0
     @Disabled !can_revise begin
         if ig.Button(can_revise ? "Revise*" : "Revise")
             Revise.retry()
 
-            client = state.client
+            client = state[].client
             if client.status == RemoteStatus_Connected
-                Client.revise_engine(state)
+                revise_engine(state[])
             end
         end
     end
 end
 
-function draw_main_menubar(state)
+function draw_main_menubar()
     if ig.BeginMenuBar()
-        draw_revise(state)
+        draw_revise()
 
-        @Disabled state.client.status != RemoteStatus_Connected || !state.context_path_valid begin
+        client = state[].client
+        @Disabled client.status != RemoteStatus_Connected || !client.context_path_valid begin
             if ig.Button("Load context")
-                Client.load_context(state)
+                load_context(state[])
             end
         end
 
         if ig.BeginMenu("Tools")
             if ig.BeginMenu("Demos")
-                @c MenuItem("ImGui demo", &state.show_imgui_demo)
+                @c MenuItem("ImGui demo", &state[].show_imgui_demo)
                 ig.EndMenu()
             end
 
-            @c MenuItem("ImGui metrics", &state.show_imgui_metrics)
-            @c MenuItem("Stack tool", &state.show_stacktool)
-            @c MenuItem("Debug log", &state.show_debug_log)
+            @c MenuItem("ImGui metrics", &state[].show_imgui_metrics)
+            @c MenuItem("Stack tool", &state[].show_stacktool)
+            @c MenuItem("Debug log", &state[].show_debug_log)
 
             ig.EndMenu()
         end
@@ -93,9 +113,9 @@ function draw_main_menubar(state)
 end
 
 function draw_parameter(name, param::Parameter{Float64})
-    @c ig.InputDouble(name, &param.value)
+    ret = @c ig.InputDouble(name, &param.value, 0.0, 0.0, "%.3f0", ig.ImGuiInputTextFlags_EnterReturnsTrue)
 
-    return false, nothing
+    return ret, param.value
 end
 
 function draw_parameter(name, param::Parameter{Int})
@@ -116,17 +136,41 @@ function draw_parameter(name, param::Parameter{Vector{String}})
     return false, nothing
 end
 
-function draw_dag(state)
-    ctx_state = state.context_state
+function get_variable_typeinfo(name)
+    variable_data = state[].client.variable_data
+    if haskey(variable_data, name)
+        data = variable_data[name].data[]
+        T = eltype(data)
+        return "$T$(size(data))"
+    else
+        return ""
+    end
+end
+
+function draw_dag()
+    ctx_state = state[].client.context_state
+    client = state[].client
 
     ig.Dummy(0, 10)
-    if ig.Button(" Start ")
-        Client.start(state)
+    @Disabled client.pipeline_status != PipelineStatus_Stopped begin
+        if ig.Button(" Start ")
+            start(state[])
+        end
     end
+
     ig.SameLine()
-    if ig.Button(" Stop ")
-        Client.stop(state)
+
+    @Disabled client.pipeline_status != PipelineStatus_Started begin
+        if ig.Button(" Stop ")
+            stop(state[])
+        end
     end
+
+    if client.pipeline_status in (PipelineStatus_Starting, PipelineStatus_Stopping)
+        ig.SameLine()
+        Spinner()
+    end
+
     ig.Dummy(0, 10)
 
     ImNodes.BeginNodeEditor()
@@ -148,7 +192,7 @@ function draw_dag(state)
                 ig.SetNextItemWidth(round(Int, min_node_width * 1.5))
                 modified, new_value = draw_parameter(param_name, param)
                 if modified
-                    Client.change_parameter(state, Parameter(param.name, new_value))
+                    change_parameter(Parameter(param.name, new_value))
                 end
             end
         end
@@ -177,12 +221,28 @@ function draw_dag(state)
 
         ig.Dummy(min_node_width, 10)
 
+        ig.TextDisabled("Outputs")
+        draw_list = ig.GetWindowDrawList()
+        start_pos = ig.GetCursorScreenPos()
+        gray = ig.IM_COL32(100, 100, 100, 255)
+        ig.AddLine(draw_list, start_pos, (start_pos.x + min_node_width / 2f0, start_pos.y), gray, 2)
+        ig.Dummy(min_node_width, 2)
+
         # Draw outputs
         for (output_id, output) in var_data["outputs"]
             label = string(output)
+            output_name = isempty(label) ? name : "$(name).$(label)"
             ImNodes.BeginOutputAttribute(output_id, ImNodes.ImNodesPinShape_CircleFilled)
-            ig.Indent(min_node_width - ig.CalcTextSize(label).x)
-            ig.Text(label)
+
+            # ig.Indent(min_node_width - ig.CalcTextSize(label).x)
+            typestr = get_variable_typeinfo(output_name)
+            if !isempty(typestr)
+                label = isempty(label) ? typestr : "$(label) - $(typestr)"
+            end
+            if !isempty(label) && ig.Button(label)
+                push!(client.plots, Plot(name, client.variable_data[output_name].data))
+            end
+
             ImNodes.EndOutputAttribute()
         end
 
@@ -199,8 +259,8 @@ function draw_dag(state)
     ImNodes.EndNodeEditor()
 end
 
-function draw_ssh_auth(state)
-    client = state.client
+function draw_ssh_auth()
+    client = state[].client
 
     for (hop_idx, ssh_state) in enumerate(client.ssh_hops)
         if ssh_state.auth_state == ssh.AuthStatus_Success
@@ -270,7 +330,7 @@ function draw_ssh_auth(state)
             ig.SameLine()
             if ig.Button("Yes")
                 ssh.update_known_hosts(ssh_state.session)
-                @guiasync Client.ssh_authenticate_hop(state, hop_idx)
+                @guiasync ssh_authenticate_hop(state[], hop_idx)
                 can_authenticate = true
             end
             ig.SameLine()
@@ -278,7 +338,7 @@ function draw_ssh_auth(state)
             ig.SameLine()
             if ig.Button("No")
                 # If they refuse to recognize the host then we can't do anything
-                @guiasync Client.disconnect(state, false)
+                @guiasync disconnect_engine(state[], false)
             end
         else
             can_authenticate = true
@@ -289,7 +349,7 @@ function draw_ssh_auth(state)
 
         @Disabled !can_authenticate begin
             if ig.Button(auth_state == :authenticating ? "Authenticating" : "Authenticate")
-                @guiasync Client.ssh_authenticate_hop(state, hop_idx)
+                @guiasync ssh_authenticate_hop(state[], hop_idx)
             end
         end
 
@@ -309,11 +369,38 @@ function draw_ssh_auth(state)
     end
 end
 
+function draw_plots()
+    client = state[].client
+
+    # Update all the observables
+    for (name, store) in client.variable_data
+        array = store.data[]
+        while isready(store.updates)
+            tid, x = take!(store.updates)
+            array = push!(array, x, (; trainId=tid))
+        end
+        store.data[] = array
+    end
+
+    # Draw plot windows
+    for plot in client.plots
+        draw_plot(plot)
+    end
+
+    # Remove closed plots
+    for i in reverse(eachindex(client.plots))
+        if !client.plots[i].open[]
+            close(client.plots[i])
+            deleteat!(client.plots, i)
+        end
+    end
+end
+
 ## Main GUI function
 
 default(value, default="") = isnothing(value) ? default : value
 
-function draw_gui(state)
+function draw_gui()
     # Dock the main window by default
     viewport = ig.igGetMainViewport()
     central_dock_id = ig.DockSpaceOverViewport(ig.GetWindowDockID(), viewport, ig.ImGuiDockNodeFlags_PassthruCentralNode)
@@ -324,75 +411,87 @@ function draw_gui(state)
     main_window_flags |= ig.ImGuiWindowFlags_MenuBar
     main_window_flags |= ig.ImGuiWindowFlags_HorizontalScrollbar
 
-    client = state.client
-    fully_authenticated = Client.ssh_fully_authenticated(client)
+    client = state[].client
+    fully_authenticated = ssh_fully_authenticated(client)
 
     # Draw the main window
-    if Begin("Main window", C_NULL, main_window_flags)
+    if ig.Begin("Main window", C_NULL, main_window_flags)
         # Draw the menubar
-        draw_main_menubar(state)
+        draw_main_menubar()
 
         ig.BeginTabBar("main-tab-bar")
         if ig.BeginTabItem("Setup")
             ig.EndTabItem()
 
-            can_connect = (client.status != RemoteStatus_Connecting
-                           && !fully_authenticated)
+            can_connect = if client.is_local
+                client.status != RemoteStatus_Connecting && client.status != RemoteStatus_Connected
+            else
+                client.status != RemoteStatus_Connecting && !fully_authenticated
+            end
+
             @Disabled !can_connect begin
-                ig.Text("Connect to node:")
+                ig.Combo("##client-type", state[].client_type_current_item,
+                         ["Connect to remote", "Create local engine"])
+                client.is_local = state[].client_type_current_item[] == 1
 
-                ig.SameLine()
+                ig.Spacing()
 
-                edited, new_address = SafeInputText("##client"; hint="exflonc24.desy.de",
-                                                    current_text=default(state.address))
+                if !state[].client.is_local
+                    ig.Text("Connect to node:")
 
-                ig.Text("Use environment:")
-                ig.SameLine()
-                env_edited, new_environment = SafeInputText("##engine-environment";
-                                                            current_text=default(state.engine_environment))
-            end
+                    ig.SameLine()
 
-            if edited
-                state.address = new_address
-            end
-            if env_edited
-                state.engine_environment = new_environment
+                    edited, new_address = SafeInputText("##client"; hint="exflonc24.desy.de",
+                                                        current_text=default(state[].address))
+
+                    ig.Text("Use environment:")
+                    ig.SameLine()
+                    env_edited, new_environment = SafeInputText("##engine-environment";
+                                                                current_text=default(state[].engine_environment))
+
+                    if edited
+                        state[].address = new_address
+                    end
+                    if env_edited
+                        state[].engine_environment = new_environment
+                    end
+                end
             end
 
             ig.Spacing()
 
-            disable_connect = !can_connect || length(state.address) == 0
+            disable_connect = !can_connect || length(state[].address) == 0
             @Disabled disable_connect begin
                 if ig.Button("Connect")
                     client.cmd_output = ""
                     client.last_error = ""
-                    @guiasync Client.ssh_initialize(state)
+                    @guiasync connect_engine()
                 end
             end
             ig.SameLine()
 
             @Disabled can_connect begin
                 if ig.Button("Disconnect")
-                    @guiasync Client.disconnect(state, false)
+                    @guiasync disconnect_engine(state[], false)
                 end
 
                 ig.SameLine()
 
                 if ig.Button("Disconnect & shutdown")
-                    @guiasync Client.disconnect(state, true)
+                    @guiasync disconnect_engine(state[], true)
                 end
             end
 
             ig.Dummy(0, 20)
             if client.status == RemoteStatus_Connecting && !fully_authenticated
-                draw_ssh_auth(state)
+                draw_ssh_auth()
             elseif client.status == RemoteStatus_Connecting && fully_authenticated
                 Spinner("Starting engine...")
-                BoxedText("##client_cmd_output", state.client.cmd_output)
+                BoxedText("##client_cmd_output", state[].client.cmd_output)
             elseif client.status == RemoteStatus_Error
                 @Disabled !fully_authenticated begin
                     if ig.Button("Restart engine")
-                        @guiasync Client.initialize_engine(state)
+                        @guiasync initialize_engine(state[])
                     end
                 end
 
@@ -410,13 +509,13 @@ function draw_gui(state)
                 ig.Text("Use context file:")
                 ig.SameLine()
                 edited, new_context_path = SafeInputText("##context-file";
-                                                         current_text=default(state.context_path))
+                                                         current_text=default(client.context_path))
                 if edited
-                    state.context_path = new_context_path
-                    state.context_path_valid = true
+                    client.context_path = new_context_path
+                    client.context_path_valid = true
                 end
 
-                if !state.context_path_valid
+                if !client.context_path_valid
                     ig.TextColored(ImVec4(1, 0.2, 0.5, 1), "Path does not point to a valid file!")
                 end
 
@@ -424,30 +523,30 @@ function draw_gui(state)
                 ig.Text("Use webproxy:")
                 ig.SameLine()
                 edited, new_webproxy_addr = EditableComboBox("##webproxy-address",
-                                                             state.webproxy, WEBPROXY_COMPLETIONS)
+                                                             client.webproxy, WEBPROXY_COMPLETIONS)
                 if edited
-                    state.webproxy = new_webproxy_addr
+                    client.webproxy = new_webproxy_addr
                 end
 
                 # Update the list of devices
                 if ig.Button("Update device list")
-                    Client.get_devices(state)
+                    get_devices(state[])
                 end
                 ig.SameLine()
-                if state.webproxy_status == WebproxyStatus_Idle
-                    ig.Text("Found $(length(state.karabo_devices)) Karabo devices")
-                elseif state.webproxy_status == WebproxyStatus_WaitingForDevices
+                if client.webproxy_status == WebproxyStatus_Idle
+                    ig.Text("Found $(length(client.karabo_devices)) Karabo devices")
+                elseif client.webproxy_status == WebproxyStatus_WaitingForDevices
                     Spinner("")
-                elseif state.webproxy_status == WebproxyStatus_Error
+                elseif client.webproxy_status == WebproxyStatus_Error
                     ig.Text("Error! Check backend logs.")
                 end
 
                 ig.Dummy(0, 10)
 
                 # Show a list of trainmatchers
-                ig.Text("Found $(length(state.trainmatchers)) matchers:")
+                ig.Text("Found $(length(client.trainmatchers)) matchers:")
                 if ig.BeginListBox("")
-                    for matcher in sort(collect(keys(state.trainmatchers)))
+                    for matcher in sort(collect(keys(client.trainmatchers)))
                         ig.Selectable(matcher)
                     end
                     ig.EndListBox()
@@ -455,16 +554,18 @@ function draw_gui(state)
             end
         end
 
-        @Disabled client.status != RemoteStatus_Connected || isempty(state.context_state) begin
+        @Disabled client.status != RemoteStatus_Connected || isempty(client.context_state) begin
             if ig.BeginTabItem("Analysis pipeline")
-                draw_dag(state)
+                draw_dag()
                 ig.EndTabItem()
             end
         end
 
         ig.EndTabBar()
 
-        End()
+        draw_plots()
+
+        ig.End()
     end
 
     # Display tooling windows
@@ -472,17 +573,18 @@ function draw_gui(state)
                                       (:show_imgui_metrics,  ig.ShowMetricsWindow),
                                       (:show_stacktool,      ig.ShowIDStackToolWindow),
                                       (:show_debug_log,      ig.ShowDebugLogWindow)]
-        do_show = getproperty(state, window_sym)
+        do_show = getproperty(state[], window_sym)
         if do_show
             @c window_func(&do_show)
-            setproperty!(state, window_sym, do_show)
+            setproperty!(state[], window_sym, do_show)
         end
     end
 end
 
 """Start the XFA GUI."""
 function main()
-    state::GuiState = GuiState(; disable_rendering=false, webproxy=WEBPROXY_COMPLETIONS[1])
+    gui_state = GuiState(; disable_rendering=false)
+    gui_state.client.webproxy = WEBPROXY_COMPLETIONS[1]
 
     # Setup Dear ImGui context
     ig.set_backend(:GlfwOpenGL3)
@@ -522,10 +624,10 @@ function main()
     on_exit = () -> begin
         ImNodes.DestroyContext(imnodes_ctx)
         empty!(ImGuiHelpers.safe_input_text_cache)
-        close(state)
+        close(gui_state)
     end
-    t = ig.render(imgui_ctx; on_exit, window_title="XFA", wait=false) do
-        if state.disable_rendering
+    t = ig.render(imgui_ctx; on_exit, window_title="XFA", wait=false, spawn=:interactive) do
+        if gui_state.disable_rendering
             # Occasionally an exception will occur in the middle of a disabled
             # section, which helpfully also disables the continue button
             # below. So here we check if we're currently disabled and end it if
@@ -535,23 +637,23 @@ function main()
             end
 
             ig.Text("Render loop crashed, continue when ready:")
-            draw_revise(state)
+            @with state => gui_state draw_revise()
             ig.SameLine()
-            state.disable_rendering = !ig.Button("Continue")
+            gui_state.disable_rendering = !ig.Button("Continue")
             return
         end
 
         try
-            @lock state begin
-                @invokelatest draw_gui(state)
+            @lock gui_state begin
+                @with state => gui_state @invokelatest draw_gui()
             end
         catch ex
             @error "Error while rendering:" exception=(ex, catch_backtrace())
-            state.disable_rendering = true
+            gui_state.disable_rendering = true
         end
     end
 
-    return t, state
+    return t, gui_state
 end
 
 end

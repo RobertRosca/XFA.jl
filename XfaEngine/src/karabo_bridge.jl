@@ -191,10 +191,15 @@ Close a Karabo bridge server (unbind its socket).
 """
 function Base.close(server::KaraboBridgeServer; wait=true)
     close(server.channel)
-    close(server.socket)
+
+    if isopen(server.context)
+        ZMQ.lib.zmq_ctx_shutdown(server.context)
+    end
+
     if wait
         Base.wait(server.server_task)
     end
+    close(server.socket)
     close(server.context)
 end
 
@@ -204,6 +209,10 @@ end
 Close a Karabo bridge client (disconnect its socket).
 """
 function Base.close(client::KaraboBridgeClient)
+    if isopen(client.context)
+        ZMQ.lib.zmq_ctx_shutdown(client.context)
+    end
+
     close(client.socket)
     close(client.context)
 end
@@ -238,71 +247,65 @@ function startbridge(server::KaraboBridgeServer)
     server.server_task = Threads.@spawn begin
         @lock start_condition notify(start_condition)
 
-        try
-            fake_tid = 0
+        fake_tid = 0
 
-            while true
-                # Wait for some data to send
-                data, metadata = nothing, nothing
-                try
-                    data, metadata = take!(server.channel)
-                catch ex
-                    if ex isa InvalidStateException
-                        # If the channel has been closed, exit the loop
-                        break
-                    else
-                        rethrow()
-                    end
+        while true
+            # Wait for some data to send
+            data, metadata = nothing, nothing
+            try
+                data, metadata = take!(server.channel)
+            catch ex
+                if ex isa InvalidStateException
+                    # If the channel has been closed, exit the loop
+                    break
+                else
+                    rethrow()
                 end
-
-                if isnothing(metadata)
-                    metadata = Dict{String, Any}()
-                    for source in keys(data)
-                        metadata[source] = Dict{String, Any}()
-                        metadata[source]["source"] = source
-                        metadata[source]["timestamp"] = time()
-                        metadata[source]["timestamp.sec"] = ""
-                        metadata[source]["timestamp.frac"] = ""
-                        metadata[source]["timestamp.tid"] = fake_tid
-                    end
-
-                    fake_tid += 1
-                end
-
-                # Wait for the client to request some data
-                msg = nothing
-                try
-                    msg = Sockets.recv(server.socket, String)
-                catch ex
-                    if ex isa ZMQ.StateError || ex isa EOFError
-                        # If the socket was closed or is somehow corrupted,
-                        # exit the loop.
-                        break
-                    else
-                        rethrow()
-                    end
-                end
-
-                if msg != "next"
-                    @error "Unexpected message from Karabo bridge client: '$(msg)'. Expected 'next'."
-                    continue
-                end
-
-                # Serialize the data and send it to the client
-                msgs = serialize(data, metadata)
-                ZMQ.send_multipart(server.socket, msgs)
-                @debug "Sent data from $(server)"
             end
-        finally
-            close(server; wait=false)
+
+            if isnothing(metadata)
+                metadata = Dict{String, Any}()
+                for source in keys(data)
+                    metadata[source] = Dict{String, Any}()
+                    metadata[source]["source"] = source
+                    metadata[source]["timestamp"] = time()
+                    metadata[source]["timestamp.sec"] = ""
+                    metadata[source]["timestamp.frac"] = ""
+                    metadata[source]["timestamp.tid"] = fake_tid
+                end
+
+                fake_tid += 1
+            end
+
+            # Wait for the client to request some data
+            msg = nothing
+            try
+                msg = Sockets.recv(server.socket, String)
+            catch ex
+                if ex isa ZMQ.StateError || ex isa EOFError
+                    # If the socket was closed or is somehow corrupted,
+                    # exit the loop.
+                    break
+                else
+                    rethrow()
+                end
+            end
+
+            if msg != "next"
+                @error "Unexpected message from Karabo bridge client: '$(msg)'. Expected 'next'."
+                continue
+            end
+
+            # Serialize the data and send it to the client
+            msgs = serialize(data, metadata)
+            ZMQ.send_multipart(server.socket, msgs)
+            @debug "Sent data from $(server)"
         end
     end
     errormonitor(server.server_task)
 
     @lock start_condition wait(start_condition)
     close(timeout_timer)
-
-    return
 end
 
 Base.put!(server::KaraboBridgeServer, data, metadata=nothing) = put!(server.channel, (data, metadata))

@@ -4,6 +4,7 @@ authors = ["JamesWrigley <james.wrigley@xfel.eu>"]
 version = "0.1.0"
 
 [deps]
+DimensionalData = "0703355e-b756-11e9-17c0-8b28908087d0"
 DistributedNext = "fab6aee4-877b-4bac-a744-3eca44acbb6f"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
@@ -19,4 +20,5 @@ TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 ZMQ = "c2297ded-f4af-51ae-bb23-16f91089e4e1"
 
 [compat]
+DimensionalData = "0.29.12"
 DistributedNext = "1.0.0"

@@ -1,24 +1,3 @@
-module Client
-
-import TOML
-import Sockets
-import CRC32c: crc32c
-using Serialization
-
-import LibSSH as ssh
-import HTTP
-import HTTP: WebSockets
-
-import XfaEngine: getavailableport
-import XfaEngine.Context: KaraboDependency, Dependency, Parameter
-using XfaEngine.Protocol
-import XfaEngine.Protocol: send
-import ..States: GuiState, SshState, ClientState, KbdintPromptState
-using ..States
-import ..ImGuiHelpers: @guiasync
-import ...Util
-
-
 const BASTION = "bastion.desy.de"
 const GATEWAY = "exflgateway.desy.de"
 
@@ -147,68 +126,73 @@ end
 function initialize_engine(state)
     client = state.client
     client.status = RemoteStatus_Connecting
-    address = state.address
-    ssh_state = client.ssh_hops[end]
-    session = ssh_state.session
 
     bootstrap_process = nothing
 
     try
-        is_local = state.address == "localhost"
-        working_dir = is_local ? pwd() : "/scratch/xfa"
+        if client.is_local
+            client.local_engine = XfaEngine.main(; wait=false)
+        else
+            address = state.address
+            ssh_state = client.ssh_hops[end]
+            session = ssh_state.session
 
-        # Find the Julia binary to use
-        which_proc = run(ignorestatus(`bash -c 'which julia'`), session; print_out=false)
-        if !success(which_proc)
-            error("Couldn't find a Julia binary")
-        end
-        julia_binary = strip(String(which_proc.out))
+            is_local = state.address == "localhost"
+            working_dir = is_local ? pwd() : "/scratch/xfa"
 
-        bootstrap_jl = joinpath(working_dir, "bootstrap.jl")
-        ssh.SftpSession(session) do sftp
-            code = read(joinpath(@__DIR__, "bootstrap.jl"))
-
-            mkpath(dirname(bootstrap_jl), sftp)
-            open(bootstrap_jl, sftp; write=true) do f
-                write(f, code)
+            # Find the Julia binary to use
+            which_proc = run(ignorestatus(`bash -c 'which julia'`), session; print_out=false)
+            if !success(which_proc)
+                error("Couldn't find a Julia binary")
             end
-        end
+            julia_binary = strip(String(which_proc.out))
 
-        bootstrap_env = Dict("XFA_ENVIRONMENT" => state.engine_environment,
-                             "XFA_ENGINE_DIR" => "git/XFA.jl/XfaEngine",
-                             "XFA_WORKING_DIR" => working_dir,
-                             "XFA_JULIA_BINARY" => julia_binary)
-        bootstrap_env_str = join(["$(key)=$(value)" for (key, value) in bootstrap_env], " ")
-        bootstrap_cmd = "$(bootstrap_env_str) bash -c '$(julia_binary) --color=no $(bootstrap_jl)'"
-        bootstrap_process = run(bootstrap_cmd, session; wait=false)
+            bootstrap_jl = joinpath(working_dir, "bootstrap.jl")
+            ssh.SftpSession(session) do sftp
+                code = read(joinpath(@__DIR__, "bootstrap.jl"))
 
-        while !process_exited(bootstrap_process)
+                mkpath(dirname(bootstrap_jl), sftp)
+                open(bootstrap_jl, sftp; write=true) do f
+                    write(f, code)
+                end
+            end
+
+            bootstrap_env = Dict("XFA_ENVIRONMENT" => client.engine_environment,
+                                 "XFA_ENGINE_DIR" => "git/XFA.jl/XfaEngine",
+                                 "XFA_WORKING_DIR" => working_dir,
+                                 "XFA_JULIA_BINARY" => julia_binary)
+            bootstrap_env_str = join(["$(key)=$(value)" for (key, value) in bootstrap_env], " ")
+            bootstrap_cmd = "$(bootstrap_env_str) bash -c '$(julia_binary) --color=no $(bootstrap_jl)'"
+            bootstrap_process = run(bootstrap_cmd, session; wait=false)
+
+            while !process_exited(bootstrap_process)
+                client.cmd_output = String(copy(bootstrap_process.out))
+                sleep(0.5)
+            end
             client.cmd_output = String(copy(bootstrap_process.out))
-            sleep(0.5)
+
+            # Read the worker info
+            output = client.cmd_output
+            find_start = findfirst(">>>", output)
+            if isnothing(find_start)
+                error("Empty output from bootstrap command")
+            end
+            find_end = findfirst("<<<", output)
+            if isnothing(find_end)
+                error("Couldn't read worker info from bootstrap command")
+            end
+
+            toml_str = output[find_start.stop + 1:find_end.start - 1]
+            worker_info = TOML.parse(toml_str)
+            client.worker_info = worker_info
+
+            ws_port = worker_info["1"]["websocket-port"]
+            bridge_port = worker_info["1"]["karabo-bridge-port"]
+
+            local_ws_port = getavailableport(ws_port; interface=Sockets.localhost)
+            client.ws_forwarder = ssh.Forwarder(session, local_ws_port, ssh_state.address, ws_port;
+                                                localinterface=Sockets.localhost)
         end
-        client.cmd_output = String(copy(bootstrap_process.out))
-
-        # Read the worker info
-        output = client.cmd_output
-        find_start = findfirst(">>>", output)
-        if isnothing(find_start)
-            error("Empty output from bootstrap command")
-        end
-        find_end = findfirst("<<<", output)
-        if isnothing(find_end)
-            error("Couldn't read worker info from bootstrap command")
-        end
-
-        toml_str = output[find_start.stop + 1:find_end.start - 1]
-        worker_info = TOML.parse(toml_str)
-        client.worker_info = worker_info
-
-        ws_port = worker_info["1"]["websocket-port"]
-        bridge_port = worker_info["1"]["karabo-bridge-port"]
-
-        local_ws_port = getavailableport(ws_port; interface=Sockets.localhost)
-        client.ws_forwarder = ssh.Forwarder(session, local_ws_port, ssh_state.address, ws_port;
-                                            localinterface=Sockets.localhost)
 
         @guiasync handle_server(state)
     catch ex
@@ -226,7 +210,16 @@ function initialize_engine(state)
     end
 end
 
-function disconnect(state, shutdown_engine)
+function connect_engine()
+    client = state[].client
+    if client.is_local
+        initialize_engine(state[])
+    else
+        ssh_initialize(state[])
+    end
+end
+
+function disconnect_engine(state, shutdown_engine)
     client = state.client
     if shutdown_engine && !isnothing(client.websocket)
         if !WebSockets.isclosed(client.websocket)
@@ -287,6 +280,21 @@ function build_context_state(state, ctx_info)
         end
     end
 
+    for name in keys(ctx_info["inputs"])
+        # Inputs that are part of groups will have been added before
+        if any(startswith(name, "$(group).") for group in ctx_info["groups"])
+            continue
+        end
+
+        if !haskey(ctx_info, name)
+            ctx_state[name] = Dict{String, Any}("id" => node_hash(name))
+            ctx_state[name]["dependencies"] = []
+            ctx_state[name]["outputs"] = [(node_hash(name), name)]
+            ctx_state[name]["type"] = :input
+            ctx_state[name]["links"] = []
+        end
+    end
+
     new_links = []
     for (name, deps) in ctx_info["dag"]
         for (i, dep_pair) in enumerate(deps)
@@ -312,29 +320,44 @@ function build_context_state(state, ctx_info)
 end
 
 function handle_msg(state, msg)
+    client = state.client
+
     if msg isa Pong
         nothing
+    elseif msg isa Started
+        client.pipeline_status = PipelineStatus_Started
+    elseif msg isa Stopped
+        client.pipeline_status = PipelineStatus_Stopped
     elseif msg isa Devices
         if msg.device_names isa Exception
             @error "Error from server with DEVICES" exception=msg
-            state.webproxy_status = WebproxyStatus_Error
+            client.webproxy_status = WebproxyStatus_Error
         else
-            state.karabo_devices = msg.device_names
-            state.webproxy_status = WebproxyStatus_Idle
-            state.trainmatchers = filter(x -> occursin("Matcher", x.second["classId"]),
-                                         state.karabo_devices)
+            client.karabo_devices = msg.device_names
+            client.webproxy_status = WebproxyStatus_Idle
+            client.trainmatchers = filter(x -> occursin("Matcher", x.second["classId"]),
+                                          client.karabo_devices)
         end
     elseif msg isa ContextInfo
-        state.context_state = build_context_state(state, msg.info)
+        if msg.info isa Dict
+            client.context_state = build_context_state(state, msg.info)
+        else
+            @error "Context failed to load"
+        end
     elseif msg isa TrainData
         for variable in msg.variables
-            @show variable
+            if !haskey(client.variable_data, variable.name)
+                array = if variable.data isa Number
+                    DimArray([variable.data], (; trainId=[variable.tid]); name=variable.name)
+                else
+                    @error "Unsupported variable data: $(typeof(variable.data))"
+                end
 
-            if !haskey(state.variable_data, variable.name)
-                state.variable_data[variable.name] = Float64[]
+                client.variable_data[variable.name] = VariableStore(array)
+            else
+                store = client.variable_data[variable.name]
+                push!(store.updates, (variable.tid, variable.data))
             end
-
-            # push!(state.variable_data[variable.name], variable.data)
         end
     else
         @warn "Received unsupported message of type '$(typeof(msg))'"
@@ -343,7 +366,7 @@ end
 
 function handle_server(state)
     client = state.client
-    port = client.ws_forwarder.localport
+    port = client.is_local ? client.local_engine.websocket_port : client.ws_forwarder.localport
 
     # If an SSH tunnel is used it can take a couple of seconds to set up, so we
     # allow multiple attempts.
@@ -401,67 +424,43 @@ function handle_server(state)
         client.status = RemoteStatus_Error
 
         # Call the shutdown function to ensure that the tunnel is killed too
-        disconnect(state, false)
+        disconnect_engine(state, false)
     else
         # Otherwise we've disconnected normally
         client.status = RemoteStatus_Unconnected
     end
 end
 
-"""
-Simple function to create a client and print server messages.
-
-This is an internal function meant to help with debugging.
-"""
-function test_connect(port=1331)
-    client = Client()
-    address = "ws://localhost:$(port)"
-
-    t = Threads.@spawn WebSockets.open(address) do ws
-        client.websocket = ws
-
-        id = WebSockets.receive(ws)
-        client.client_id = id
-
-        for msg_bytes in ws
-            buffer = IOBuffer(msg_bytes)
-            msg::AbstractMessage = deserialize(buffer)
-            @show msg
-        end
-
-        @info "Connection to $(address) closed"
-    end
-
-    return client, errormonitor(t)
-end
-
 function get_devices(state)
-    send(state.client.websocket, GetDevices(state.webproxy))
-    state.webproxy_status = WebproxyStatus_WaitingForDevices
-    empty!(state.karabo_devices)
-    empty!(state.trainmatchers)
+    client = state.client
+    send(client.websocket, GetDevices(client.webproxy))
+    client.webproxy_status = WebproxyStatus_WaitingForDevices
+    empty!(client.karabo_devices)
+    empty!(client.trainmatchers)
 end
 
 function load_context(state)
-    send(state.client.websocket, LoadContext(state.context_path))
+    client = state.client
+    send(client.websocket, LoadContext(client.context_path))
 end
 
 function revise_engine(state)
-    if state.client.status == RemoteStatus_Connected && !isnothing(state.client.websocket)
-        send(state.client.websocket, ReviseCode())
+    client = state.client
+    if client.status == RemoteStatus_Connected && !isnothing(client.websocket)
+        send(client.websocket, ReviseCode())
     end
 end
 
-function change_parameter(state, param::Parameter)
-    send(state.client.websocket, ChangeParameter(param))
+function change_parameter(param::Parameter)
+    send(state[].client.websocket, ChangeParameter(param))
 end
 
 function start(state)
     send(state.client.websocket, Start())
+    state.client.pipeline_status = PipelineStatus_Starting
 end
 
 function stop(state)
     send(state.client.websocket, Stop())
-end
-
+    state.client.pipeline_status = PipelineStatus_Stopping
 end

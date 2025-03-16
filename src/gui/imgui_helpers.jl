@@ -121,7 +121,9 @@ macro Disabled(cond, expr)
     return quote
         local disable = $(esc(cond))
 
-        ig.BeginDisabled(disable)
+        if disable
+            ig.BeginDisabled(disable)
+        end
 
         $(esc(expr))
 
@@ -134,7 +136,7 @@ end
 # Stolen from: https://github.com/ocornut/imgui/pull/4675
 function IsItemDisabled()
     imgui_ctx = unsafe_load(ig.GetCurrentContext())
-    return (imgui_ctx.LastItemData.InFlags & ig.ImGuiItemFlags_Disabled) != 0
+    return (imgui_ctx.LastItemData.ItemFlags & ig.ImGuiItemFlags_Disabled) != 0
 end
 
 function InfoMarker(message::AbstractString, marker::AbstractString="?")

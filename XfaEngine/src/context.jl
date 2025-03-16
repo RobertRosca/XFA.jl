@@ -9,6 +9,7 @@ import DistributedNext: RemoteChannel, remote_do
 import MacroTools
 import MacroTools: @capture, postwalk, prettify
 import OrderedCollections: OrderedDict
+import DimensionalData as DD
 
 
 const registered_variables = Dict{Function, Vector{Any}}()
@@ -20,9 +21,6 @@ struct Neighbour
     name::String
     channel::RemoteChannel
 end
-
-const dag_functions = Dict{String, Function}()
-current_ctx_module::Module = Module()
 
 # Container module for train/variable-specific information. This conflicts with
 # Base.Meta but we accept that for the convenience of the name. In this module
@@ -45,6 +43,15 @@ include("context_types.jl")
 
 import ..KaraboBridge: KaraboBridgeClient
 include("context_builtins.jl")
+
+@kwdef mutable struct WorkerState
+    task_locks = Dict{String, ReentrantLock}()
+    dag_functions = Dict{String, Function}()
+    parameters = Dict{String, Parameter}()
+    current_ctx_module::Module = Module()
+end
+
+worker_state::WorkerState = WorkerState()
 
 @kwdef mutable struct XfaContext
     functions::Dict{String, Any}
@@ -230,8 +237,14 @@ end
 
 VariableData(tid, name, data) = VariableData(UInt64(tid), name, data)
 
+function change_parameter(param::Parameter)
+    foreach(lock, values(worker_state.task_locks))
+    worker_state.parameters[param.name].value = param.value
+    foreach(unlock, values(worker_state.task_locks))
+end
+
 function input_wrapper(name, group, channel)
-    f = dag_functions[name]
+    f = worker_state.dag_functions[name]
 
     try
         if isnothing(group)
@@ -348,14 +361,20 @@ function stream_variable(name, stream_output, upstream, downstream)
             end
 
             # Execute the variable
-            f = dag_functions[name]
+            f = worker_state.dag_functions[name]
             @debug "Executing variable '$(name)'..."
+            lock(worker_state.task_locks[name])
             try
-                out = @with Meta.tid => tid Meta.name => name Meta.scratch => scratch f(unwrapped_args...)
+                out = @with(Meta.tid => tid,
+                            Meta.name => name,
+                            Meta.scratch => scratch,
+                            f(unwrapped_args...))
             catch ex
                 @error "Execution of variable '$(name)' failed" exception=(ex, catch_backtrace())
                 putall!(values(downstream), empty_result)
                 continue
+            finally
+                unlock(worker_state.task_locks[name])
             end
 
             # Send output
@@ -597,7 +616,7 @@ function load_from_string(ctx_str::AbstractString)
         @eval ctx_module $expr
     end
 
-    parameters = Dict{String, Parameter}() # [param.name => param for param in ctx_module._xfa_parameters])
+    parameters = Dict{String, Parameter}()
 
     # Find top-level parameters
     for name in names(ctx_module; all=true)
@@ -769,9 +788,10 @@ function load_from_string(ctx_str::AbstractString)
         ctx_subvariables[string(nameof(func))] = subvars
     end
 
-    empty!(dag_functions)
-    copy!(dag_functions, functions)
-    global current_ctx_module = ctx_module
+    global worker_state = WorkerState(; dag_functions=functions, current_ctx_module=ctx_module, parameters)
+    for name in keys(worker_state.dag_functions)
+        worker_state.task_locks[name] = ReentrantLock()
+    end
 
     return XfaContext(; functions, group_types, groups, dag,
                       subvariables=ctx_subvariables, parameters, exprs,
@@ -816,6 +836,16 @@ function _get_deps(func, parameters)
     end
 
     return final_deps
+end
+
+# Some methods to allow push!'ing to a DimArray
+function Base.push!(data::DD.AbstractDimVector, x, lookup_values=nothing)
+    push!(DD.parent(data), x)
+    for (name, value) in pairs(lookup_values)
+        push!(parent(DD.lookup(data, name)), value)
+    end
+
+    return DD.rebuild(data)
 end
 
 end
