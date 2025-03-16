@@ -294,7 +294,7 @@ function _group(ctx_module, expr, side_effects)
         throw(ArgumentError("Must pass an Expr to @Group"))
     end
 
-    if @capture(expr, struct name_ fields__ end)
+    if @capture(expr, struct name_ fields__ end) || @capture(expr, mutable struct name_ fields__ end)
         # # Look through the fields for parameters
         # param_fields = []
         # new_fields = [if @capture(field, field_name_::Parameter{T_})
