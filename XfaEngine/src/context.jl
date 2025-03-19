@@ -238,9 +238,19 @@ end
 
 VariableData(tid, name, data) = VariableData(UInt64(tid), name, data)
 
-function change_parameter(param::Parameter)
+function change_parameter(new_param::Parameter)
     foreach(lock, values(worker_state.task_locks))
-    worker_state.parameters[param.name].value = param.value
+
+    ctx_param = worker_state.parameters[new_param.name]
+    if !isnothing(ctx_param.update_handler)
+        try
+            ctx_param.update_handler(new_param.value)
+        catch ex
+            @error "Exception in update handler for parameter '$(ctx_param.name)'" exception=ex
+        end
+    end
+
+    ctx_param.value = new_param.value
     foreach(unlock, values(worker_state.task_locks))
 end
 

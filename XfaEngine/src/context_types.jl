@@ -208,9 +208,10 @@ macro Variable(expr)
     _variable(__module__, expr, true)
 end
 
-mutable struct Parameter{T}
+mutable struct Parameter{T, F}
     name::String
     value::T
+    update_handler::F
     set_by_user::Bool
 end
 
@@ -218,8 +219,16 @@ function Base.:(==)(one::Parameter{T}, two::Parameter{T}) where T
     one.name == two.name && one.value == two.value && one.set_by_user == two.set_by_user
 end
 
-Parameter(value) = Parameter("", value, false)
-Parameter(name, value) = Parameter(name, value, false)
+Parameter(name::String, value) = Parameter(name, value, nothing, false)
+Parameter(value) = Parameter("", value, nothing, false)
+
+function Parameter(f::Base.Callable, value)
+    if !isnothing(f) && !applicable(f, value)
+        throw(ArgumentError("Parameter update handler must be either `nothing` or a callable that takes a single argument"))
+    end
+
+    Parameter("", value, f, false)
+end
 
 function tryset(param::Parameter, value; force=false)
     if param.set_by_user && force

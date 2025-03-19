@@ -72,25 +72,19 @@ end
 
 function temp_engine(f::Function; log=Logging.global_logger())
     mktemp() do info_path, io
-        port = Ref{Int}()
         stop_event = Base.Event()
-        t = Threads.@spawn with_logger(log) do
-            XfaEngine.main(stop_event; info_path, port)
+        state = with_logger(log) do
+            XfaEngine.main(stop_event; info_path, wait=false)
         end
+        port = state.websocket_port
+        @test server_exists(port)
 
-        if (timedwait(() -> isassigned(port), 10) == :timed_out
-            || timedwait(() -> server_exists(port[]), 10) == :timed_out)
-            notify(stop_event)
-            wait(t)
-            error("Server didn't start within the timeout")
-        end
-
-        address = "ws://localhost:$(port[])"
+        address = "ws://localhost:$(port)"
         try
             f(address, stop_event, info_path)
         finally
-            notify(stop_event)
-            wait(t)
+            notify(state.stop_event)
+            wait(state.stop_task)
         end
     end
 end
@@ -409,6 +403,12 @@ end
 end
 
 @testset "Parameter" begin
+    # Smoke tests for constructors
+    @test Parameter(0) isa Parameter
+    @test_throws ArgumentError Parameter(() -> 1, 0)
+    @test Parameter(Returns(nothing), 0) isa Parameter
+    @test Parameter("foo", 1) isa Parameter
+
     # Test creating top-level parameters
     ctx = Context.load_from_string(raw"""
     photon_energy = Parameter(0)
@@ -802,7 +802,10 @@ end
             put!(output, (42, Dict("motor1" => Dict("pos" => 1))))
         end
 
-        x = Parameter(0)
+        x_side_effect = 0
+        x = Parameter(0) do x
+            global x_side_effect = x
+        end
 
         @Variable function foo(data -> karabo"motor1.pos")
             return x[]
@@ -813,6 +816,7 @@ end
             Context.change_parameter(Parameter("x", 1))
             notify(Context.worker_state.current_ctx_module.next_input)
             @test take!(ctx.stream_output).data == 1
+            @test Context.worker_state.current_ctx_module.x_side_effect == 1
         end
     end
 end
