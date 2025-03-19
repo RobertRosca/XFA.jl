@@ -78,6 +78,7 @@ worker_state::WorkerState = WorkerState()
     stream_output::Union{RemoteChannel, Nothing} = nothing
     output_forwarder_task::Union{Task, Nothing} = nothing
 
+    is_running::Bool = false
     events_channel::Union{RemoteChannel, Nothing} = nothing
     watcher_task::Task = Task(Returns(nothing))
 end
@@ -503,10 +504,14 @@ function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50, forwarder=Re
     ctx.watcher_task = Threads.@spawn watch_context(ctx)
     errormonitor(ctx.watcher_task)
 
+    ctx.is_running = true
+
     return nothing
 end
 
 function stop_pipeline(ctx::XfaContext; timeout=5)
+    ctx.is_running = false
+
     for ch in values(ctx.input_channels)
         close(ch)
     end

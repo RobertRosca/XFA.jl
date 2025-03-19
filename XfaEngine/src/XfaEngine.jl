@@ -123,6 +123,12 @@ function handle_message(msg::AbstractMessage, state::EngineState, id)
         end
     elseif msg isa LoadContext
         path = abspath(expanduser(msg.path))
+
+        is_running = !isnothing(state.ctx) && state.ctx.is_running
+        if is_running
+            Context.stop_pipeline(state.ctx)
+        end
+
         try
             state.ctx = Context.load_from_file(path)
             Protocol.send(ws, ContextInfo(Context.to_dict(state.ctx)))
@@ -130,6 +136,10 @@ function handle_message(msg::AbstractMessage, state::EngineState, id)
         catch ex
             Protocol.send(ws, ContextInfo(ex))
             @error "Loading context file at $(path) failed" exception=(ex, catch_backtrace())
+        end
+
+        if is_running
+           @invokelatest Context.start_pipeline(state.ctx; forwarder=Base.Fix1(forward_output, state))
         end
     elseif msg isa ReviseCode
         @everywhere Revise.retry()
