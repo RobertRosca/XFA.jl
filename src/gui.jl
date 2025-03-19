@@ -1,5 +1,3 @@
-module GUI
-
 import Base.ScopedValues: ScopedValue, @with
 
 include("imnodes.jl")
@@ -8,13 +6,13 @@ include("imgui_helpers.jl")
 import GLMakie
 import Observables: Observable
 import DimensionalData as DD
-using DimensionalData: DimArray
+import DimensionalData: DimArray
+import GeometryBasics: Rect2d, Point2d
 include("plotting.jl")
 
-import ..Maybe
 import LibSSH as ssh
 import HTTP: WebSockets
-import XfaEngine: EngineState
+import XfaEngine: EngineState, getavailableport
 include("states.jl")
 
 import TOML
@@ -23,7 +21,6 @@ import CRC32c: crc32c
 using Serialization
 import HTTP
 import XfaEngine
-import XfaEngine: getavailableport
 import XfaEngine.Context: KaraboDependency, Dependency, Parameter
 using XfaEngine.Protocol
 import XfaEngine.Protocol: send
@@ -39,7 +36,6 @@ import ModernGL
 import Revise
 
 import .ImNodes
-import ..Util
 
 const WEBPROXY_COMPLETIONS::Vector{String} = [
     "localhost:8484",
@@ -89,11 +85,6 @@ function draw_main_menubar()
         draw_revise()
 
         client = state[].client
-        @Disabled client.status != RemoteStatus_Connected || !client.context_path_valid begin
-            if ig.Button("Load context")
-                load_context(state[])
-            end
-        end
 
         if ig.BeginMenu("Tools")
             if ig.BeginMenu("Demos")
@@ -147,12 +138,20 @@ function get_variable_typeinfo(name)
     end
 end
 
+function clear_variables()
+    client = state[].client
+    empty!(client.variable_data)
+    for plot in client.plots
+        plot.open[] = false
+    end
+end
+
 function draw_dag()
     ctx_state = state[].client.context_state
     client = state[].client
 
     ig.Dummy(0, 10)
-    @Disabled client.pipeline_status != PipelineStatus_Stopped begin
+    @Disabled isempty(client.context_state) || client.pipeline_status != PipelineStatus_Stopped begin
         if ig.Button(" Start ")
             start(state[])
         end
@@ -166,6 +165,18 @@ function draw_dag()
         end
     end
 
+    ig.SameLine()
+    @Disabled isempty(client.variable_data) begin
+        if ig.Button("Clear all")
+            clear_variables()
+        end
+    end
+
+    ig.SameLine()
+    if ig.Button("Load context")
+        load_context(state[])
+    end
+
     if client.pipeline_status in (PipelineStatus_Starting, PipelineStatus_Stopping)
         ig.SameLine()
         Spinner()
@@ -176,6 +187,8 @@ function draw_dag()
     ImNodes.BeginNodeEditor()
 
     for (name, var_data) in ctx_state
+        ig.PushID(name)
+
         min_node_width = 150
         node_id = var_data["id"]
 
@@ -234,19 +247,34 @@ function draw_dag()
             output_name = isempty(label) ? name : "$(name).$(label)"
             ImNodes.BeginOutputAttribute(output_id, ImNodes.ImNodesPinShape_CircleFilled)
 
-            # ig.Indent(min_node_width - ig.CalcTextSize(label).x)
+            ig.Indent(min_node_width - ig.CalcTextSize(label).x)
             typestr = get_variable_typeinfo(output_name)
             if !isempty(typestr)
                 label = isempty(label) ? typestr : "$(label) - $(typestr)"
             end
-            if !isempty(label) && ig.Button(label)
-                push!(client.plots, Plot(name, client.variable_data[output_name].data))
+
+            if !isempty(label)
+                if haskey(client.variable_data, output_name)
+                    if ig.Button("$(label)###plot_button")
+                        push!(client.plots, Plot(output_name, client.variable_data[output_name].data))
+                    end
+                else
+                    ig.Text(label)
+                end
             end
 
             ImNodes.EndOutputAttribute()
         end
 
         ImNodes.EndNode()
+
+        pos = client.node_positions[name]
+        if pos != Point2d(-1, -1)
+            ImNodes.SetNodeGridSpacePos(node_id, (pos[1], pos[2]))
+            client.node_positions[name] = Point2d(-1, -1)
+        end
+        
+        ig.PopID()
     end
 
     for var_data in values(ctx_state)
@@ -373,18 +401,29 @@ function draw_plots()
     client = state[].client
 
     # Update all the observables
+    updated_variables = String[]
     for (name, store) in client.variable_data
+        if !isready(store.updates)
+            continue
+        end
+
         array = store.data[]
         while isready(store.updates)
             tid, x = take!(store.updates)
-            array = push!(array, x, (; trainId=tid))
+            if x isa Number
+                array = push!(array, x, (; trainId=tid))
+            elseif x isa AbstractArray
+                array = x
+            end
         end
+
         store.data[] = array
+        push!(updated_variables, name)
     end
 
     # Draw plot windows
     for plot in client.plots
-        draw_plot(plot)
+        draw_plot(plot, plot.name in updated_variables)
     end
 
     # Remove closed plots
@@ -554,7 +593,7 @@ function draw_gui()
             end
         end
 
-        @Disabled client.status != RemoteStatus_Connected || isempty(client.context_state) begin
+        @Disabled client.status != RemoteStatus_Connected || isempty(client.context_path) begin
             if ig.BeginTabItem("Analysis pipeline")
                 draw_dag()
                 ig.EndTabItem()
@@ -612,6 +651,9 @@ function main()
         ig.AddFontFromFileTTF(font_atlas, font, font_size)
     end
 
+    # Set plotting theme
+    GLMakie.update_theme!(; font=fonts[1], linewidth=3)
+
     # Enable docking and viewports by default
     io = ig.GetIO()
     io.ConfigFlags = unsafe_load(io.ConfigFlags) | ig.ImGuiConfigFlags_DockingEnable
@@ -654,6 +696,4 @@ function main()
     end
 
     return t, gui_state
-end
-
 end

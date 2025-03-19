@@ -36,6 +36,8 @@ EndOutputAttribute = ig.imnodes_EndOutputAttribute
 BeginNodeTitleBar = ig.imnodes_BeginNodeTitleBar
 EndNodeTitleBar = ig.imnodes_EndNodeTitleBar
 
+SetNodeGridSpacePos = ig.imnodes_SetNodeGridSpacePos
+
 function MiniMap()
     ig.imnodes_MiniMap(0.2, ImNodesMiniMapLocation_BottomRight, C_NULL, C_NULL)
 end

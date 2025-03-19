@@ -164,6 +164,7 @@ end
     context_state::Dict{String, Any} = Dict()
     context_path::String = ""
     context_path_valid::Bool = false
+    node_positions::Dict{String, Point2d} = Dict()
     pipeline_status::PipelineStatus = PipelineStatus_Stopped
 
     # Karabo status

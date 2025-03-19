@@ -1,6 +1,6 @@
 module ImGuiHelpers
 
-import ...Util
+import ..Util
 
 export MenuItem, EditableComboBox, Spinner, SafeInputText, BoxedText, @guiasync, @Disabled, IsItemDisabled, InfoMarker
 

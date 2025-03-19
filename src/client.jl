@@ -295,28 +295,63 @@ function build_context_state(state, ctx_info)
         end
     end
 
+    node_dag = Dict(name => String[] for name in keys(ctx_state))
+
     new_links = []
     for (name, deps) in ctx_info["dag"]
-        for (i, dep_pair) in enumerate(deps)
-            dep = dep_pair.second
+        for (i, dep) in enumerate(values(deps))
             link_end_id = ctx_state[name]["dependencies"][i][1]
 
             if dep isa Dependency
                 link_start_id = ctx_state[dep.name]["outputs"][1][1]
                 link_id = node_hash("$(link_start_id)->$(link_end_id)")
                 push!(new_links, (link_id, link_start_id, link_end_id))
+
+                push!(node_dag[name], dep.name)
             elseif dep isa KaraboDependency
                 input_name = only(keys(ctx_info["inputs"]))
                 link_start_id = node_hash(input_name)
                 link_id = node_hash("$(link_start_id)->$(link_end_id)")
                 push!(new_links, (link_id, link_start_id, link_end_id))
+
+                input_node_name = split(input_name, ".")[1]
+                push!(node_dag[name], input_node_name)
             end
         end
 
         ctx_state[name]["links"] = new_links
     end
 
+    # positions = NetworkLayout.squaregrid(adj_matrix) .* 200
+    # positions[node2index[name]]
+    new_positions = Dict{String, Point2d}()
+    levels = coffman_graham(node_dag)
+    for (level, nodes) in levels
+        x_pos = level * 400
+        for (i, node) in enumerate(nodes)
+            new_positions[node] = Point2d(x_pos + i * 300, i * 200)
+        end
+    end
+
+    state.client.node_positions = merge(new_positions, state.client.node_positions)
+
     return ctx_state
+end
+
+function coffman_graham(dag; W=3)
+    order = XfaEngine.Context.topological_sort(dag)
+    levels = Dict(0 => String[])
+    current_level = 0
+    for node in order
+        if length(levels[current_level]) < W
+            push!(levels[current_level], node)
+        else
+            current_level += 1
+            levels[current_level] = String[node]
+        end
+    end
+
+    return levels
 end
 
 function handle_msg(state, msg)
@@ -346,18 +381,22 @@ function handle_msg(state, msg)
         end
     elseif msg isa TrainData
         for variable in msg.variables
-            if !haskey(client.variable_data, variable.name)
-                array = if variable.data isa Number
-                    DimArray([variable.data], (; trainId=[variable.tid]); name=variable.name)
-                else
-                    @error "Unsupported variable data: $(typeof(variable.data))"
-                end
+            is_new = !haskey(client.variable_data, variable.name)
 
-                client.variable_data[variable.name] = VariableStore(array)
-            else
-                store = client.variable_data[variable.name]
-                push!(store.updates, (variable.tid, variable.data))
+            if is_new
+                if variable.data isa Number
+                    array = DimArray([variable.data], (; trainId=[variable.tid]); name=variable.name)
+                    client.variable_data[variable.name] = VariableStore(array)
+                elseif variable.data isa AbstractArray
+                    client.variable_data[variable.name] = VariableStore(variable.data)
+                else
+                    @error "Unsupported variable type: $(typeof(variable.data))"
+                    continue
+                end
             end
+
+            store = client.variable_data[variable.name]
+            push!(store.updates, (variable.tid, variable.data))
         end
     else
         @warn "Received unsupported message of type '$(typeof(msg))'"
@@ -405,6 +444,11 @@ function handle_server(state)
             # closed normally.
             break
         catch ex
+            # If the client was already connected then we don't try again
+            if !isnothing(client.websocket)
+                break
+            end
+
             # If the port is not bound yet (e.g. if the SSH tunnel hasn't been
             # set up), we allow it to fail and retry.
             if ex isa HTTP.ConnectError
