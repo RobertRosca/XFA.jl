@@ -16,7 +16,6 @@ import Revise
 using DimensionalData: DimArray
 
 using .Protocol
-import .WebProxy
 import .Context: XfaContext
 
 
@@ -53,34 +52,21 @@ end
 end
 
 @kwdef mutable struct EngineState
-    websocket_port::Int
+    websocket_port::Int = -1
     karabo_bridge_port::Int = -1
     websocket_listener_task::Union{Task, Nothing} = nothing
     clients::Dict{String, ClientState} = Dict()
 
-    ctx::Union{XfaContext, Nothing} = nothing
+    webproxies::Dict{String, WebProxy} = Dict()
+    default_topic::String = ""
+
+    ctx::XfaContext = XfaContext()
 
     stop_event::Base.Event = Base.Event()
     stop_task::Union{Task, Nothing} = nothing
 end
 
-wip_state::Dict{Symbol, Any} = Dict()
-
-function Base.getproperty(state::EngineState, sym::Symbol)
-    if sym in fieldnames(EngineState)
-        return getfield(state, sym)
-    else
-        return wip_state[sym]
-    end
-end
-
-function Base.setproperty!(state::EngineState, sym::Symbol, value)
-    if sym in fieldnames(EngineState)
-        setfield!(state, sym, value)
-    else
-        wip_state[sym] = value
-    end
-end
+current_engine_state::Union{EngineState, Nothing} = nothing
 
 function forward_output(state::EngineState, stream_output)
     for data in stream_output
@@ -112,9 +98,13 @@ function handle_message(msg::AbstractMessage, state::EngineState, id)
         @info "Received shutdown request from client $(id)"
         shutdown(state)
         notify(state.stop_event)
+    elseif msg isa SetDefaultTopic
+        state.default_topic = msg.topic
+        @info "Set default topic to: $(state.default_topic)"
     elseif msg isa GetDevices
         try
-            devices = WebProxy.get_devices(msg.webproxy_endpoint)
+            wp = state.webproxies[state.default_topic]
+            devices = get_devices(wp)
             Protocol.send(ws, Devices(devices))
             @info "Responded to 'GetDevices' from $(id)"
         catch ex
@@ -124,22 +114,30 @@ function handle_message(msg::AbstractMessage, state::EngineState, id)
     elseif msg isa LoadContext
         path = abspath(expanduser(msg.path))
 
-        is_running = !isnothing(state.ctx) && state.ctx.is_running
-        if is_running
+        was_running = state.ctx.is_running[]
+        if was_running
             Context.stop_pipeline(state.ctx)
         end
 
-        try
-            state.ctx = Context.load_from_file(path)
-            Protocol.send(ws, ContextInfo(Context.to_dict(state.ctx)))
-            @info "Loaded context file $(path): $(state.ctx)"
+        new_ctx_or_ex = try
+            ctx = Context.load_from_file(path)
+            ctx.forwarder = Base.Fix1(forward_output, state)
+            ctx
         catch ex
-            Protocol.send(ws, ContextInfo(ex))
-            @error "Loading context file at $(path) failed" exception=(ex, catch_backtrace())
+            ex
         end
 
-        if is_running
-           @invokelatest Context.start_pipeline(state.ctx; forwarder=Base.Fix1(forward_output, state))
+        if new_ctx_or_ex isa XfaContext
+            state.ctx = new_ctx_or_ex
+            if was_running
+                @invokelatest Context.start_pipeline(state.ctx)
+            end
+
+            @info "Loaded context file $(path): $(state.ctx)"
+            Protocol.send(ws, ContextInfo(state.ctx))
+        else
+            @error "Loading context file at $(path) failed" exception=new_ctx_or_ex
+            Protocol.send(ws, ContextInfo(new_ctx_or_ex, state.ctx.is_running[]))
         end
     elseif msg isa ReviseCode
         @everywhere Revise.retry()
@@ -150,7 +148,7 @@ function handle_message(msg::AbstractMessage, state::EngineState, id)
         @info "ChangeParameter of $(param.name) to $(param.value)"
     elseif msg isa Start
         @info "Starting pipeline..."
-        Context.start_pipeline(state.ctx; forwarder=Base.Fix1(forward_output, state))
+        Context.start_pipeline(state.ctx)
         Protocol.send(ws, Started())
         @info "Started"
     elseif msg isa Stop
@@ -171,6 +169,9 @@ function handle_client(state::EngineState, id)
     # Start by sending their identifier
     WebSockets.send(ws, id)
     @info "Connected to new client: $(id) 🙋"
+
+    # And the available topics
+    Protocol.send(ws, AvailableTopics(collect(keys(state.webproxies))))
 
     for msg_bytes in ws
         buffer = IOBuffer(msg_bytes)
@@ -195,6 +196,14 @@ create_id() = "$(rand(ID_PREFIXES))-$(rand(ID_SUFFIXES))"
 function main(stop_event=Base.Event(); info_path=nothing, wait=true)
     websocket_port = getavailableport(1331)
     state = EngineState(; websocket_port, stop_event)
+    global current_engine_state = state
+
+    if haskey(ENV, "SASE")
+        merge!(state.webproxies, Dict(instrument => WebProxy(address)
+                                      for (instrument, address) in DEFAULT_WEBPROXY_ADDRESSES))
+    elseif !endswith(gethostname(), ".desy.de")
+        state.webproxies["localhost"] = WebProxy("localhost:8484")
+    end
 
     ws_server = WebSockets.listen!("0.0.0.0", state.websocket_port) do ws
         id = create_id()

@@ -115,6 +115,10 @@ end
             @test id isa String
             @test length(id) > 5
 
+            # The next message should be the available topics
+            @test Protocol.receive(ws) isa Protocol.AvailableTopics
+            Protocol.send(ws, Protocol.SetDefaultTopic("localhost"))
+
             # Test Ping
             Protocol.send(ws, Protocol.Ping())
             @test Protocol.receive(ws) isa Protocol.Pong
@@ -122,7 +126,7 @@ end
             # Test GetDevices
             webproxy_port = XfaEngine.getavailableport(8484)
             mock_webproxy(webproxy_port) do
-                Protocol.send(ws, Protocol.GetDevices("localhost:$(webproxy_port)"))
+                Protocol.send(ws, Protocol.GetDevices())
                 @test Protocol.receive(ws) isa Protocol.Devices
             end
 
@@ -833,15 +837,21 @@ end
         @Variable foo -> karabo"foo.x"
         """)
 
+        # Make a mock engine so we can use the mock webproxy
+        webproxies = Dict("localhost" => XfaEngine.WebProxy("localhost:8484"))
+        XfaEngine.current_engine_state = XfaEngine.EngineState(; webproxies, default_topic="localhost")
+
         # Simple example with two trains of data
         put!(bridge_server, Dict("foo" => Dict("x" => 42.0)))
         put!(bridge_server, Dict("foo" => Dict("x" => 40.0)))
-        Context.run(ctx) do
-            @test timedwait(() -> isready(ctx.stream_output), 5) == :ok
-            @test take!(ctx.stream_output) == VariableData(0, "foo", 42.0)
+        mock_webproxy(8484) do
+            Context.run(ctx) do
+                @test timedwait(() -> isready(ctx.stream_output), 5) == :ok
+                @test take!(ctx.stream_output) == VariableData(0, "foo", 42.0)
 
-            @test timedwait(() -> isready(ctx.stream_output), 5) == :ok
-            @test take!(ctx.stream_output) == VariableData(1, "foo", 40.0)
+                @test timedwait(() -> isready(ctx.stream_output), 5) == :ok
+                @test take!(ctx.stream_output) == VariableData(1, "foo", 40.0)
+            end
         end
         close(bridge_server)
 
@@ -876,6 +886,7 @@ end
         mean(data)
     end
     """)
+
     @test Context.to_dict(ctx) == Dict("inputs" => Dict("bridge.stream" => ["bridge"]),
                                        "groups" => ["bridge"],
                                        "dag" =>          Dict("xgm" => OD("data" => karabo"xgm.intensity"),
@@ -887,7 +898,7 @@ end
                                        "parameters" => Dict("period" => Parameter("period", 2π),
                                                             "bridge.hostname" => Parameter("bridge.hostname", ""),
                                                             "bridge.port" => Parameter("bridge.port", 45000),
-                                                            "bridge.sources" => Parameter("bridge.sources", String[])))
+                                                            "bridge.manual_configuration" => Parameter("bridge.manual_configuration", false)))
 end
 
 end

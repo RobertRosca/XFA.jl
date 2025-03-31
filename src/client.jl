@@ -19,6 +19,9 @@ function ssh_initialize(state::GuiState)
         push!(client.ssh_hops, SshState(; address=GATEWAY))
     end
 
+    # This is the blocking SSH session used for SFTP
+    push!(client.ssh_hops, SshState(; address))
+    # And this is the regular, non-blocking SSH session
     push!(client.ssh_hops, SshState(; address))
 
     # Start by initializing the first hop
@@ -28,10 +31,11 @@ end
 function ssh_initialize_hop(state, hop_idx, user)
     client = state.client
     ssh_state = client.ssh_hops[hop_idx]
+    forwarder_idx = findlast(x -> !isnothing(x.forwarder), client.ssh_hops)
 
-    if hop_idx > firstindex(client.ssh_hops)
+    if !isnothing(forwarder_idx) # hop_idx > firstindex(client.ssh_hops)
         # Connect to the forwarded port 22
-        forwarder = client.ssh_hops[hop_idx - 1].forwarder
+        forwarder = client.ssh_hops[forwarder_idx].forwarder
         session = ssh.Session(forwarder.localinterface, forwarder.localport; user)
 
         # Reset the host so that GSSAPI auth works
@@ -88,19 +92,28 @@ function ssh_authenticate_hop(state::GuiState, hop_idx)
     end
 
     if new_auth_state == ssh.AuthStatus_Success
-        if hop_idx == lastindex(client.ssh_hops)
+        last_idx = lastindex(client.ssh_hops)
+        sftp_idx = last_idx - 1
+
+        if hop_idx == last_idx
             # If we're the last hop in the SSH chain and authentication succeeded, start
             # the engine too.
             initialize_engine(state)
         else
-            # Otherwise, create a Forwarder and initialize the next hop
             next_hop = client.ssh_hops[hop_idx + 1]
             next_hop.auth_state = :connecting
 
-            localport = getavailableport(1332; interface=Sockets.localhost)
-            ssh_state.forwarder = ssh.Forwarder(session, localport,
-                                                next_hop.address, next_hop.port;
-                                                localinterface=Sockets.localhost)
+            if hop_idx < sftp_idx
+                # If we haven't gotten to the final node yet, create a forwarder
+                localport = getavailableport(1332; interface=Sockets.localhost)
+                ssh_state.forwarder = ssh.Forwarder(session, localport,
+                                                    next_hop.address, next_hop.port;
+                                                    localinterface=Sockets.localhost)
+            elseif hop_idx == sftp_idx
+                # If we're at the SFTP hop then we can create an SFTP session
+                client.sftp = ssh.SftpSession(session)
+            end
+
             ssh_initialize_hop(state, hop_idx + 1, session.user)
         end
     end
@@ -123,46 +136,77 @@ function auth_supported(auth_method)
     end
 end
 
+function sync_files()
+    client = state[].client
+    if client.embedded_engine
+        return
+    end
+
+    engine_dir = joinpath(pkgdir(XfaEngine), "src")
+    changed_files = split(readchomp(`git diff --name-only $(engine_dir)`), "\n")
+    @info "Syncing files" changed_files
+
+    for path in changed_files
+        local_path = joinpath(engine_dir, basename(path))
+        remote_path = joinpath(client.remote_engine_dir, "src", basename(path))
+
+        open(remote_path, client.sftp; write=true) do f
+            write(f, read(local_path))
+        end
+    end
+end
+
 function initialize_engine(state)
     client = state.client
     client.status = RemoteStatus_Connecting
+    is_local = client.embedded_engine || state.address == "localhost"
+
+    julia_module_prefix = if is_local
+        "true"
+    else
+        "source /etc/profile.d/modules.sh; SASE=0 module load exfel julia > /dev/null 2>&1"
+    end
+
+    julia_binary = if is_local
+        "julia"
+    else
+        out = readchomp("$(julia_module_prefix); which julia", client.ssh_hops[end].session)
+        split(out, "\n")[end]
+    end
+
+    client.remote_engine_dir = if is_local
+        pkgdir(XfaEngine)
+    else
+        proc = run("$(julia_module_prefix); julia --project=@xfa-default -E 'import XfaEngine; pkgdir(XfaEngine)'",
+                   client.ssh_hops[end].session; print_out=false, ignorestatus=true)
+        string(chomp(String(proc.out))[2:end - 1])
+    end
 
     bootstrap_process = nothing
 
     try
-        if client.is_local
-            client.local_engine = XfaEngine.main(; wait=false)
+        if client.embedded_engine
+            client.engine = XfaEngine.main(; wait=false)
         else
             address = state.address
             ssh_state = client.ssh_hops[end]
             session = ssh_state.session
 
-            is_local = state.address == "localhost"
             working_dir = is_local ? pwd() : "/scratch/xfa"
-
-            # Find the Julia binary to use
-            which_proc = run(ignorestatus(`bash -c 'which julia'`), session; print_out=false)
-            if !success(which_proc)
-                error("Couldn't find a Julia binary")
-            end
-            julia_binary = strip(String(which_proc.out))
-
             bootstrap_jl = joinpath(working_dir, "bootstrap.jl")
-            ssh.SftpSession(session) do sftp
-                code = read(joinpath(@__DIR__, "bootstrap.jl"))
+            code = read(joinpath(@__DIR__, "bootstrap.jl"))
 
-                mkpath(dirname(bootstrap_jl), sftp)
-                open(bootstrap_jl, sftp; write=true) do f
-                    write(f, code)
-                end
+            mkpath(dirname(bootstrap_jl), client.sftp)
+            open(bootstrap_jl, client.sftp; write=true) do f
+                write(f, code)
             end
 
-            bootstrap_env = Dict("XFA_ENVIRONMENT" => client.engine_environment,
-                                 "XFA_ENGINE_DIR" => "git/XFA.jl/XfaEngine",
+            bootstrap_env = Dict("XFA_ENVIRONMENT" => state.engine_environment,
+                                 "XFA_ENGINE_DIR" => client.remote_engine_dir,
                                  "XFA_WORKING_DIR" => working_dir,
                                  "XFA_JULIA_BINARY" => julia_binary)
             bootstrap_env_str = join(["$(key)=$(value)" for (key, value) in bootstrap_env], " ")
-            bootstrap_cmd = "$(bootstrap_env_str) bash -c '$(julia_binary) --color=no $(bootstrap_jl)'"
+            bootstrap_cmd = "$(bootstrap_env_str) bash -c '$(julia_module_prefix); julia --color=no $(bootstrap_jl)'"
             bootstrap_process = run(bootstrap_cmd, session; wait=false)
 
             while !process_exited(bootstrap_process)
@@ -212,7 +256,7 @@ end
 
 function connect_engine()
     client = state[].client
-    if client.is_local
+    if client.embedded_engine
         initialize_engine(state[])
     else
         ssh_initialize(state[])
@@ -359,6 +403,12 @@ function handle_msg(state, msg)
 
     if msg isa Pong
         nothing
+    elseif msg isa AvailableTopics
+        client.available_topics = msg.topics
+
+        if !isempty(client.available_topics)
+            set_default_topic(state)
+        end
     elseif msg isa Started
         client.pipeline_status = PipelineStatus_Started
     elseif msg isa Stopped
@@ -379,6 +429,8 @@ function handle_msg(state, msg)
         else
             @error "Context failed to load"
         end
+
+        client.pipeline_status = msg.is_running ? PipelineStatus_Started : PipelineStatus_Stopped
     elseif msg isa TrainData
         for variable in msg.variables
             is_new = !haskey(client.variable_data, variable.name)
@@ -405,7 +457,7 @@ end
 
 function handle_server(state)
     client = state.client
-    port = client.is_local ? client.local_engine.websocket_port : client.ws_forwarder.localport
+    port = client.embedded_engine ? client.engine.websocket_port : client.ws_forwarder.localport
 
     # If an SSH tunnel is used it can take a couple of seconds to set up, so we
     # allow multiple attempts.
@@ -477,7 +529,7 @@ end
 
 function get_devices(state)
     client = state.client
-    send(client.websocket, GetDevices(client.webproxy))
+    send(client.websocket, GetDevices())
     client.webproxy_status = WebproxyStatus_WaitingForDevices
     empty!(client.karabo_devices)
     empty!(client.trainmatchers)
@@ -486,6 +538,7 @@ end
 function load_context(state)
     client = state.client
     send(client.websocket, LoadContext(client.context_path))
+    client.pipeline_status = PipelineStatus_LoadingContext
 end
 
 function revise_engine(state)
@@ -507,4 +560,11 @@ end
 function stop(state)
     send(state.client.websocket, Stop())
     state.client.pipeline_status = PipelineStatus_Stopping
+end
+
+function set_default_topic(state)
+    client = state.client
+    idx = client.default_topic_idx[] + 1 # Add 1 to go from a C index to a Julia index
+    topic = client.available_topics[idx]
+    send(client.websocket, SetDefaultTopic(topic))
 end

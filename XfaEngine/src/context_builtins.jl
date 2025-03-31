@@ -1,15 +1,52 @@
 @Group struct KaraboBridge
+    manual_configuration::Parameter{Bool}
+    trainmatcher::Parameter{String}
     hostname::Parameter{String}
     port::Parameter{Int}
-    sources::Parameter{Vector{String}}
 
-    function KaraboBridge(hostname="", port=45000, sources=String[])
-        new(Parameter(hostname), Parameter(port), Parameter(sources))
+    sources::Vector{String}
+end
+
+function KaraboBridge(hostname, port, sources=String[])
+    KaraboBridge(Parameter(false), Parameter(""),
+                 Parameter(hostname), Parameter(port), sources)
+end
+
+KaraboBridge(trainmatcher) = KaraboBridge(Parameter(false), Parameter(trainmatcher),
+                                          Parameter(""), Parameter(-1), String[])
+
+
+function get_sources(::KaraboBridge)
+    wp = XfaEngine.get_webproxy()
+    devices = XfaEngine.get_devices(wp)
+    return collect(keys(devices))
+end
+
+function update_sources(bridge::KaraboBridge, sources)
+    if bridge.manual_configuration[]
+        @warn "KaraboBridge is in manual configuration mode, cannot automatically configure a trainmatcher"
+        return
     end
+
+    wp = XfaEngine.get_webproxy()
+    params = Dict("sources" => sources)
+    XfaEngine.call_slot(wp, bridge.trainmatcher[], "set_sources", params)
 end
 
 @Input function stream(bridge::KaraboBridge, output)
-    client = KaraboBridgeClient("tcp://$(bridge.hostname[]):$(bridge.port[])")
+    declare_sources(Meta.name[], get_sources(bridge))
+
+    address = ""
+    if bridge.manual_configuration[]
+        address = "tcp://$(bridge.hostname[]):$(bridge.port[])"
+    else
+        # Get the output list
+        wp = XfaEngine.get_webproxy()
+        config = XfaEngine.get_config(wp, bridge.trainmatcher[])
+        address = config["zmqOutputs"][1]["address"]
+    end
+
+    client = KaraboBridgeClient(address)
 
     # Start a task just to read from the bridge. Note that this is separate from
     # the task to put it into the output channel to avoid a race condition where

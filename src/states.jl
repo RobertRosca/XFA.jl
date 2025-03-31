@@ -21,6 +21,7 @@ end
 @enum PipelineStatus begin
     PipelineStatus_Starting
     PipelineStatus_Started
+    PipelineStatus_LoadingContext
     PipelineStatus_Stopping
     PipelineStatus_Stopped
 end
@@ -149,15 +150,18 @@ end
     status::RemoteStatus = RemoteStatus_Unconnected
     websocket::Maybe{WebSockets.WebSocket} = nothing
     ssh_hops::Vector{SshState} = SshState[]
+    sftp::Maybe{ssh.SftpSession} = nothing
     ws_forwarder::Maybe{ssh.Forwarder} = nothing
+    remote_engine_dir::String = ""
 
     cmd_output::String = ""
     last_error::String = ""
 
-    is_local::Bool = false
-    local_engine::Maybe{EngineState} = nothing
+    embedded_engine::Bool = false
+    engine::Maybe{EngineState} = nothing
 
-    webproxy::String = ""
+    default_topic_idx::Ref{Cint} = Ref(Cint(0))
+    available_topics::Vector{String} = String[]
     webproxy_status::WebproxyStatus = WebproxyStatus_Idle
 
     # Context file and pipeline
@@ -192,6 +196,9 @@ function Base.close(client::ClientState)
     end
 
     # Kill the SSH connections
+    if !isnothing(client.sftp)
+        close(client.sftp)
+    end
     if !isnothing(client.ws_forwarder)
         close(client.ws_forwarder)
     end
@@ -201,9 +208,9 @@ function Base.close(client::ClientState)
     end
 
     # Kill any local engine
-    if !isnothing(client.local_engine)
-        notify(client.local_engine.stop_event)
-        wait(client.local_engine.stop_task)
+    if !isnothing(client.engine)
+        notify(client.engine.stop_event)
+        wait(client.engine.stop_task)
     end
 
     # Delete any cached values
@@ -223,7 +230,7 @@ end
     show_debug_log::Bool = false
 
     # Connections to remote things
-    address::String = "wrigleyj@exflonc26.desy.de"
+    address::String = "wrigleyj@exflonc202.desy.de"
     client::ClientState = ClientState()
     engine_environment::String = "@xfa-default"
 

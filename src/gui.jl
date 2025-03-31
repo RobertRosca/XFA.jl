@@ -37,17 +37,6 @@ import Revise
 
 import .ImNodes
 
-const WEBPROXY_COMPLETIONS::Vector{String} = [
-    "localhost:8484",
-    "fxe-rr-sys-con-gui1:8484",
-    "spb-rr-sys-con-gui1:8484",
-    "mid-rr-sys-con-gui1:8484",
-    "hed-rr-sys-con-gui1:8484",
-    "scs-rr-sys-con-gui1:8484",
-    "sqs-rr-sys-con-gui1:8484",
-    "sxp-rr-sys-con-gui1:8484"
-]
-
 const state = ScopedValue{GuiState}()
 
 ## Helper functions for the GUI
@@ -83,6 +72,10 @@ end
 function draw_main_menubar()
     if ig.BeginMenuBar()
         draw_revise()
+
+        if ig.Button("Sync")
+            @guiasync sync_files()
+        end
 
         client = state[].client
 
@@ -123,6 +116,12 @@ end
 
 function draw_parameter(name, param::Parameter{Vector{String}})
     ig.Text("Vector{String}")
+
+    return false, nothing
+end
+
+function draw_parameter(name, param::Parameter{Bool})
+    @c ig.Checkbox(name, &param.value)
 
     return false, nothing
 end
@@ -173,11 +172,14 @@ function draw_dag()
     end
 
     ig.SameLine()
-    if ig.Button("Load context")
-        load_context(state[])
+    changing_states = (PipelineStatus_Starting, PipelineStatus_Stopping, PipelineStatus_LoadingContext)
+    @Disabled client.pipeline_status in changing_states begin
+        if ig.Button("Load context")
+            load_context(state[])
+        end
     end
 
-    if client.pipeline_status in (PipelineStatus_Starting, PipelineStatus_Stopping)
+    if client.pipeline_status in changing_states
         ig.SameLine()
         Spinner()
     end
@@ -462,7 +464,7 @@ function draw_gui()
         if ig.BeginTabItem("Setup")
             ig.EndTabItem()
 
-            can_connect = if client.is_local
+            can_connect = if client.embedded_engine
                 client.status != RemoteStatus_Connecting && client.status != RemoteStatus_Connected
             else
                 client.status != RemoteStatus_Connecting && !fully_authenticated
@@ -471,11 +473,11 @@ function draw_gui()
             @Disabled !can_connect begin
                 ig.Combo("##client-type", state[].client_type_current_item,
                          ["Connect to remote", "Create local engine"])
-                client.is_local = state[].client_type_current_item[] == 1
+                client.embedded_engine = state[].client_type_current_item[] == 1
 
                 ig.Spacing()
 
-                if !state[].client.is_local
+                if !state[].client.embedded_engine
                     ig.Text("Connect to node:")
 
                     ig.SameLine()
@@ -558,38 +560,36 @@ function draw_gui()
                     ig.TextColored(ImVec4(1, 0.2, 0.5, 1), "Path does not point to a valid file!")
                 end
 
-                # Get the webproxy address
-                ig.Text("Use webproxy:")
+                # Get the default topic
+                ig.Text("Default topic:")
                 ig.SameLine()
-                edited, new_webproxy_addr = EditableComboBox("##webproxy-address",
-                                                             client.webproxy, WEBPROXY_COMPLETIONS)
-                if edited
-                    client.webproxy = new_webproxy_addr
+                if ig.Combo("##default-topic", client.default_topic_idx, client.available_topics)
+                    set_default_topic(state[])
                 end
 
-                # Update the list of devices
-                if ig.Button("Update device list")
-                    get_devices(state[])
-                end
-                ig.SameLine()
-                if client.webproxy_status == WebproxyStatus_Idle
-                    ig.Text("Found $(length(client.karabo_devices)) Karabo devices")
-                elseif client.webproxy_status == WebproxyStatus_WaitingForDevices
-                    Spinner("")
-                elseif client.webproxy_status == WebproxyStatus_Error
-                    ig.Text("Error! Check backend logs.")
-                end
+                # # Update the list of devices
+                # if ig.Button("Update device list")
+                #     get_devices(state[])
+                # end
+                # ig.SameLine()
+                # if client.webproxy_status == WebproxyStatus_Idle
+                #     ig.Text("Found $(length(client.karabo_devices)) Karabo devices")
+                # elseif client.webproxy_status == WebproxyStatus_WaitingForDevices
+                #     Spinner("")
+                # elseif client.webproxy_status == WebproxyStatus_Error
+                #     ig.Text("Error! Check backend logs.")
+                # end
 
-                ig.Dummy(0, 10)
+                # ig.Dummy(0, 10)
 
-                # Show a list of trainmatchers
-                ig.Text("Found $(length(client.trainmatchers)) matchers:")
-                if ig.BeginListBox("")
-                    for matcher in sort(collect(keys(client.trainmatchers)))
-                        ig.Selectable(matcher)
-                    end
-                    ig.EndListBox()
-                end
+                # # Show a list of trainmatchers
+                # ig.Text("Found $(length(client.trainmatchers)) matchers:")
+                # if ig.BeginListBox("")
+                #     for matcher in sort(collect(keys(client.trainmatchers)))
+                #         ig.Selectable(matcher)
+                #     end
+                #     ig.EndListBox()
+                # end
             end
         end
 
@@ -623,7 +623,6 @@ end
 """Start the XFA GUI."""
 function main()
     gui_state = GuiState(; disable_rendering=false)
-    gui_state.client.webproxy = WEBPROXY_COMPLETIONS[1]
 
     # Setup Dear ImGui context
     ig.set_backend(:GlfwOpenGL3)
@@ -668,7 +667,7 @@ function main()
         empty!(ImGuiHelpers.safe_input_text_cache)
         close(gui_state)
     end
-    t = ig.render(imgui_ctx; on_exit, window_title="XFA", wait=false, spawn=:interactive) do
+    t = ig.render(imgui_ctx; on_exit, window_title="XFA", wait=false, spawn=true) do
         if gui_state.disable_rendering
             # Occasionally an exception will occur in the middle of a disabled
             # section, which helpfully also disables the continue button

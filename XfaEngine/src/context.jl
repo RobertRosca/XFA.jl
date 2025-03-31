@@ -10,7 +10,7 @@ import MacroTools
 import MacroTools: @capture, postwalk, prettify
 import OrderedCollections: OrderedDict
 import DimensionalData as DD
-
+import ..XfaEngine
 
 const registered_variables = Dict{Function, Vector{Any}}()
 const registered_subvariables = Dict{Function, Vector{String}}()
@@ -51,20 +51,19 @@ include("context_builtins.jl")
     current_ctx_module::Module = Module()
 end
 
-worker_state::WorkerState = WorkerState()
-
 @kwdef mutable struct XfaContext
-    functions::Dict{String, Any}
-    group_types::Dict{DataType, Group}
-    groups::Dict{String, Any}
-    dag::Dict{String, OrderedDict}
-    subvariables::Dict{String, Vector{String}}
-    parameters::Dict{String, Parameter}
-    exprs::Vector{Expr}
+    functions::Dict{String, Any} = Dict()
+    group_types::Dict{DataType, Group} = Dict()
+    groups::Dict{String, Any} = Dict()
+    dag::Dict{String, OrderedDict} = Dict()
+    subvariables::Dict{String, Vector{String}} = Dict()
+    parameters::Dict{String, Parameter} = Dict()
+    exprs::Vector{Expr} = Expr[]
 
-    inputs::Dict{String, Any}
+    inputs::Dict{String, Any} = Dict()
     input_channels::Dict{String, Channel} = Dict()
     input_tasks::Dict{String, Task} = Dict()
+    available_sources::Dict{String, Vector{String}} = Dict()
 
     input_variable_channels::Dict{String, Dict{String, RemoteChannel}} = Dict()
     input_variables_tasks::Dict{String, Task} = Dict()
@@ -76,12 +75,16 @@ worker_state::WorkerState = WorkerState()
     variable_channels::Dict{String, Dict{String, RemoteChannel}} = Dict()
 
     stream_output::Union{RemoteChannel, Nothing} = nothing
+    forwarder::Function = Returns(nothing)
     output_forwarder_task::Union{Task, Nothing} = nothing
 
-    is_running::Bool = false
+    is_running::Threads.Atomic{Bool} = Threads.Atomic{Bool}(false)
     events_channel::Union{RemoteChannel, Nothing} = nothing
     watcher_task::Task = Task(Returns(nothing))
 end
+
+worker_state::WorkerState = WorkerState()
+current_ctx::Union{XfaContext, Nothing} = nothing
 
 function Base.show(io::IO, ctx::XfaContext)
     n_variables = length(ctx.functions)
@@ -92,19 +95,22 @@ end
 """
 Finds all external dependencies (i.e. from Karabo) required by the context.
 """
-function external_dependencies(ctx::XfaContext)
-    ext_deps = Dict{String, KaraboDependency}()
+function external_dependencies(ctx::XfaContext; per_variable=false)
+    deps_per_variable = Dict{String, Vector{KaraboDependency}}()
+    all_deps = KaraboDependency[]
+
     for (name, deps) in ctx.dag
         for (_, dep) in deps
             if dep isa KaraboDependency
-                ext_deps[name] = dep
+                deps_vec = get!(deps_per_variable, name, KaraboDependency[])
+                push!(deps_vec, dep)
+                push!(all_deps, dep)
             end
         end
     end
 
-    return ext_deps
+    return per_variable ? deps_per_variable : unique(all_deps)
 end
-
 
 function find_downstream_neighbours(ctx::XfaContext, dep_name, T::DataType)
     neighbours = Set{String}()
@@ -239,19 +245,18 @@ end
 VariableData(tid, name, data) = VariableData(UInt64(tid), name, data)
 
 function change_parameter(new_param::Parameter)
-    foreach(lock, values(worker_state.task_locks))
-
-    ctx_param = worker_state.parameters[new_param.name]
-    if !isnothing(ctx_param.update_handler)
-        try
-            ctx_param.update_handler(new_param.value)
-        catch ex
-            @error "Exception in update handler for parameter '$(ctx_param.name)'" exception=ex
+    pause_pipeline() do
+        ctx_param = worker_state.parameters[new_param.name]
+        if !isnothing(ctx_param.update_handler)
+            try
+                ctx_param.update_handler(new_param.value)
+            catch ex
+                @error "Exception in update handler for parameter '$(ctx_param.name)'" exception=ex
+            end
         end
-    end
 
-    ctx_param.value = new_param.value
-    foreach(unlock, values(worker_state.task_locks))
+        ctx_param.value = new_param.value
+    end
 end
 
 function input_wrapper(name, group, channel)
@@ -427,11 +432,47 @@ function watch_context(ctx::XfaContext)
     end
 end
 
-function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50, forwarder=Returns(nothing))
+"""
+    declare_sources(input_name, new_sources)
+
+Notify the system of a new list of sources that can be read from `input`.
+An Input should call this function whenever its sources changes.
+"""
+function declare_sources(input_name, new_sources)
+    current_ctx.available_sources[input_name] = new_sources
+
+    pause_pipeline() do
+    end
+end
+
+function update_input_sources(ctx::XfaContext)
+    deps = external_dependencies(ctx)
+    sources = [occursin(':', dep.source) ? dep.source : string(dep) for dep in deps]
+    group_dependency = only(values(only(values(ctx.inputs))))
+    for (group_name, group) in ctx.groups
+        if group isa group_dependency.type
+            update_sources(group, sources)
+        end
+    end
+end
+
+function pause_pipeline(f::Function)
+    foreach(lock, values(worker_state.task_locks))
+
+    try
+        f()
+    finally
+        foreach(unlock, values(worker_state.task_locks))
+    end
+end
+
+function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50)
     ctx.stream_output = RemoteChannel(() -> Channel(100))
     ctx.events_channel = RemoteChannel(() -> Channel(100))
-    ctx.output_forwarder_task = Threads.@spawn forwarder(ctx.stream_output)
+    ctx.output_forwarder_task = Threads.@spawn ctx.forwarder(ctx.stream_output)
     errormonitor(ctx.output_forwarder_task)
+
+    global current_ctx = ctx
 
     # Start the input functions to feed the DAG
     for (name, deps) in ctx.inputs
@@ -453,7 +494,7 @@ function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50, forwarder=Re
     # Start the input variables
     for name in keys(ctx.inputs)
         downstream_neighbours = Dict{String, RemoteChannel}()
-        for dep in values(external_dependencies(ctx))
+        for dep in external_dependencies(ctx)
             downstream_neighbours[string(dep)] = RemoteChannel()
         end
         ctx.input_variable_channels[name] = downstream_neighbours
@@ -463,7 +504,7 @@ function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50, forwarder=Re
     end
 
     # Start the external dependency variables
-    unique_external_deps = unique(values(external_dependencies(ctx)))
+    unique_external_deps = external_dependencies(ctx)
     for dep in unique_external_deps
         dep_name = string(dep)
         input_name = only(keys(ctx.inputs))
@@ -479,6 +520,9 @@ function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50, forwarder=Re
         ctx.external_dependency_tasks[dep_name] = Threads.@spawn stream_external_dependency(dep_name, input_neighbour, downstream_neighbours)
         errormonitor(ctx.external_dependency_tasks[dep_name])
     end
+
+    # Update the inputs
+    update_input_sources(ctx)
 
     # Start the variables themselves
     execution_order = topological_sort(ctx)
@@ -514,13 +558,13 @@ function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50, forwarder=Re
     ctx.watcher_task = Threads.@spawn watch_context(ctx)
     errormonitor(ctx.watcher_task)
 
-    ctx.is_running = true
+    ctx.is_running[] = true
 
     return nothing
 end
 
 function stop_pipeline(ctx::XfaContext; timeout=5)
-    ctx.is_running = false
+    ctx.is_running[] = false
 
     for ch in values(ctx.input_channels)
         close(ch)
@@ -565,6 +609,8 @@ function stop_pipeline(ctx::XfaContext; timeout=5)
     if !isnothing(ctx.output_forwarder_task)
         wait(ctx.output_forwarder_task)
     end
+
+    global current_ctx = nothing
 
     @debug "Pipeline fully stopped"
 
@@ -780,14 +826,10 @@ function load_from_string(ctx_str::AbstractString)
         end
     end
 
-    # Now we do the same for the inputs: go through all of the declared ones and
-    # add them to the context if they're not part of a group. All the grouped
-    # inputs should already have been added.
     for (func, deps) in ctx_inputs
         if isempty(deps) || !(deps[1][2] isa GroupDependency)
             name = string(nameof(func))
-            inputs[name] = Dict(deps)
-            functions[name] = func
+            throw(XfaContextException("'$(name)' must belong to a Group to be a valid Input"))
         end
     end
 

@@ -2,15 +2,16 @@ module Protocol
 
 export AbstractMessage, Ping, Shutdown,
     GetDevices, LoadContext, ReviseCode,
-    ChangeParameter, Start, Stop,
-    Pong, Started, Stopped, Devices, ContextInfo,
-    ParameterChanged, TrainData
+    ChangeParameter, SetDefaultTopic, Start, Stop,
+    Pong, AvailableTopics, Started, Stopped, Devices,
+    ContextInfo, ParameterChanged, TrainData
 
 import Serialization: serialize, deserialize
 
 import HTTP: WebSockets
 
-import ..Context: VariableData, Parameter
+import ..Context
+import ..Context: XfaContext, VariableData, Parameter
 
 
 abstract type AbstractMessage end
@@ -20,7 +21,6 @@ struct Ping <: AbstractMessage end
 struct Shutdown <: AbstractMessage end
 
 struct GetDevices <: AbstractMessage
-    webproxy_endpoint::String
 end
 
 struct LoadContext <: AbstractMessage
@@ -33,11 +33,19 @@ struct ChangeParameter <: AbstractMessage
     parameter::Parameter
 end
 
+struct SetDefaultTopic <: AbstractMessage
+    topic::String
+end
+
 struct Start <: AbstractMessage end
 struct Stop <: AbstractMessage end
 
 # Messages that the server can send
 struct Pong <: AbstractMessage end
+
+struct AvailableTopics <: AbstractMessage
+    topics::Vector{String}
+end
 
 struct Started <: AbstractMessage end
 struct Stopped <: AbstractMessage end
@@ -48,7 +56,10 @@ end
 
 struct ContextInfo <: AbstractMessage
     info::Union{Dict, Exception}
+    is_running::Bool
 end
+
+ContextInfo(ctx::XfaContext) = ContextInfo(Context.to_dict(ctx), ctx.is_running[])
 
 struct ParameterChanged <: AbstractMessage
     parameter::Parameter

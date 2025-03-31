@@ -208,26 +208,28 @@ macro Variable(expr)
     _variable(__module__, expr, true)
 end
 
-mutable struct Parameter{T, F}
+mutable struct Parameter{T, F, G}
     name::String
-    value::T
-    update_handler::F
+    value::Union{T, Nothing}
     set_by_user::Bool
+
+    update_handler::F
+    initializer::G
 end
 
 function Base.:(==)(one::Parameter{T}, two::Parameter{T}) where T
     one.name == two.name && one.value == two.value && one.set_by_user == two.set_by_user
 end
 
-Parameter(name::String, value) = Parameter(name, value, nothing, false)
-Parameter(value) = Parameter("", value, nothing, false)
+Parameter(name::String, value) = Parameter(name, value, false, nothing, nothing)
+Parameter(value) = Parameter("", value, false, nothing, nothing)
 
 function Parameter(f::Base.Callable, value)
     if !isnothing(f) && !applicable(f, value)
         throw(ArgumentError("Parameter update handler must be either `nothing` or a callable that takes a single argument"))
     end
 
-    Parameter("", value, f, false)
+    Parameter("", value, false, f, nothing)
 end
 
 function tryset(param::Parameter, value; force=false)
@@ -287,7 +289,6 @@ Mark a function as an input (i.e a trigger).
 macro Input(expr)
     _input(__module__, expr, true)
 end
-
 
 struct Group
     type::DataType

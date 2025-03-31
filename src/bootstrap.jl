@@ -12,7 +12,8 @@ ENV["JULIA_DEBUG"] = "XfaEngine"
 @info "Bootstrapping..." environment engine_dir working_dir julia_binary
 
 # Install the package
-Pkg.activate(environment; shared=startswith(environment, "@"))
+is_shared_env = startswith(environment, "@")
+Pkg.activate(is_shared_env ? environment[2:end] : environment; shared=is_shared_env)
 proxy = "exflproxy01:3128"
 dependencies = ["Revise", "LoggingFormats", "LoggingExtras", "DistributedNext"]
 
