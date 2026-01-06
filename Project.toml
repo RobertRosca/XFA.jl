@@ -1,7 +1,7 @@
 name = "XFA"
 uuid = "1c39a8db-6709-4730-8fe8-40f12fd2079f"
-authors = ["JamesWrigley <james@puiterwijk.org>"]
 version = "0.1.0"
+authors = ["JamesWrigley <james@puiterwijk.org>"]
 
 [deps]
 CImGui = "5d785b6c-b76f-510e-a07c-3070796c7e87"
@@ -18,8 +18,11 @@ TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 XfaEngine = "df4d7780-7f2f-4694-8ef1-2cbac230b49a"
 ZMQ = "c2297ded-f4af-51ae-bb23-16f91089e4e1"
 
+[sources.XfaEngine]
+path = "./XfaEngine"
+
 [compat]
-CImGui = "3"
+CImGui = "3, 7"
 GLFW = "3"
 HTTP = "1"
 LibSSH = "0.6"
@@ -28,6 +31,3 @@ Revise = "3"
 TOML = "1"
 ZMQ = "1"
 julia = "1.11"
-
-[sources]
-XfaEngine = {path = "./XfaEngine"}
