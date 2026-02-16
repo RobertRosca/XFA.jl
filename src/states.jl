@@ -142,11 +142,11 @@ function Base.close(state::SshState)
     empty!(state.kbdint_prompts)
 end
 
-struct VariableStore
-    updates::Channel
-    data::Observable
+mutable struct VariableStore
+    const updates::Channel
+    data::Union{Vector, Matrix, DimVector, DimMatrix}
 
-    VariableStore(data) = new(Channel(100), Observable(data))
+    VariableStore(data) = new(Channel(100), data)
 end
 
 @kwdef mutable struct ClientState <: ExtendableState

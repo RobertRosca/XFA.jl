@@ -1,12 +1,18 @@
 import Base.ScopedValues: ScopedValue, @with
 
+import CImGui as ig
+import CImGui: ImVec2, ImVec4
+import CImGui.CSyntax: @c
+import ImPlot
+import GLFW
+using ModernGL
+
 include("imnodes.jl")
 include("imgui_helpers.jl")
 
-import Observables: Observable
-import DimensionalData as DD
-import DimensionalData: DimArray
-import GeometryBasics: Rect2d, Point2d
+using NaNStatistics: nanmaximum, nanminimum
+using DimensionalData: DimensionalData as DD, DimVector, DimMatrix, DimArray
+import GeometryBasics: Point2d
 include("plotting.jl")
 
 import LibSSH as ssh
@@ -25,12 +31,6 @@ using XfaEngine.Protocol
 import XfaEngine.Protocol: send
 using .ImGuiHelpers
 include("client.jl")
-
-import CImGui as ig
-import CImGui: ImVec2, ImVec4
-import CImGui.CSyntax: @c
-import GLFW
-import ModernGL
 
 import Revise
 
@@ -134,7 +134,7 @@ end
 function get_variable_typeinfo(name)
     variable_data = state[].client.variable_data
     if haskey(variable_data, name)
-        data = variable_data[name].data[]
+        data = variable_data[name].data
         T = eltype(data)
         return "$T$(size(data))"
     else
@@ -146,10 +146,8 @@ function clear_variables()
     client = state[].client
 
     for store in values(client.variable_data)
-        array = store.data[]
-
-        if array isa AbstractVector
-            store.data[] = array[end:end]
+        if store.data isa AbstractVector
+            empty!(store.data)
         end
     end
 
@@ -273,7 +271,7 @@ function draw_dag()
             if !isempty(label)
                 if haskey(client.variable_data, output_name)
                     if ig.Button("$(label)###plot_button")
-                        push!(client.plots, Plot(output_name, client.variable_data[output_name].data))
+                        push!(client.plots, Plot(output_name))
                     end
                 else
                     ig.Text(label)
@@ -424,23 +422,22 @@ function draw_plots()
             continue
         end
 
-        array = store.data[]
+        array = store.data
         while isready(store.updates)
             tid, x = take!(store.updates)
             if x isa Number
-                array = push!(array, x, (; trainId=tid))
+                push!(array, x, (; trainId=tid))
             elseif x isa AbstractArray
-                array = x
+                store.data = x
             end
         end
 
-        store.data[] = array
         push!(updated_variables, name)
     end
 
     # Draw plot windows
     for plot in client.plots
-        draw_plot(plot, plot.name in updated_variables)
+        draw_plot(plot, client.variable_data[plot.name].data, plot.name in updated_variables)
     end
 
     # Remove closed plots
@@ -681,8 +678,8 @@ function main()
         ig.AddFontFromFileTTF(font_atlas, font, font_size)
     end
 
-    # Set plotting theme
-    GLMakie.update_theme!(; font=fonts[1], linewidth=3)
+    # Setup ImPlot context
+    implot_ctx = ImPlot.CreateContext()
 
     # Enable docking and viewports by default
     io = ig.GetIO()
@@ -694,6 +691,13 @@ function main()
     # io.IniFilename = C_NULL
 
     on_exit = () -> begin
+        # Clean up GPU heatmap resources before destroying contexts
+        for plot in gui_state.client.plots
+            close(plot)
+        end
+        destroy_heatmap_context!()
+
+        ImPlot.DestroyContext(implot_ctx)
         ImNodes.DestroyContext(imnodes_ctx)
         empty!(ImGuiHelpers.safe_input_text_cache)
         close(gui_state)

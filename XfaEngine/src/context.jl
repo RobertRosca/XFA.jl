@@ -35,7 +35,7 @@ const run_number = ScopedValue{Int}()
 const proposal = ScopedValue{Int}()
 const name = ScopedValue{String}()
 
-const scratch = ScopedValue{Dict{String, Any}}()
+const scratch = ScopedValue(Dict{String, Any}())
 
 end
 
@@ -912,6 +912,13 @@ function Base.push!(data::DD.AbstractDimVector, x, lookup_values=nothing)
     for (name, value) in pairs(lookup_values)
         push!(parent(DD.lookup(data, name)), value)
     end
+
+    return DD.rebuild(data)
+end
+
+function Base.empty!(data::DD.DimVector)
+    empty!(parent(data))
+    empty!(parent(DD.lookup(data, DD.dims(data)[1])))
 
     return DD.rebuild(data)
 end
