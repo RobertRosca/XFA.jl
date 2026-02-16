@@ -1,33 +1,15 @@
-module States
-
-import LibSSH as ssh
-import HTTP.WebSockets as ws
-
-import XfaEngine.Protocol: Message, send
-import ...Maybe
-
-export GuiState
-
-macro exportinstances(enum)
-    eval = GlobalRef(Core, :eval)
-    return :($eval($__module__, Expr(:export, map(Symbol, instances($enum))...)))
-end
-
-
 @enum RemoteStatus begin
     RemoteStatus_Unconnected
     RemoteStatus_Connecting
     RemoteStatus_Connected
     RemoteStatus_Error
 end
-@exportinstances RemoteStatus
 
 @enum WebproxyStatus begin
     WebproxyStatus_Idle
     WebproxyStatus_WaitingForDevices
     WebproxyStatus_Error
 end
-@exportinstances WebproxyStatus
 
 @enum SshStatus begin
     SshStatus_Unconnected
@@ -35,7 +17,20 @@ end
     SshStatus_NeedsAuth
     SshStatus_Error
 end
-@exportinstances SshStatus
+
+@enum PipelineStatus begin
+    PipelineStatus_Starting
+    PipelineStatus_Started
+    PipelineStatus_LoadingContext
+    PipelineStatus_Stopping
+    PipelineStatus_Stopped
+end
+
+@enum RemoteReplStatus begin
+    RemoteReplStatus_Running
+    RemoteReplStatus_Changing
+    RemoteReplStatus_Stopped
+end
 
 """
 A type to help with implementing thread-safe revise-able states.
@@ -142,19 +137,57 @@ function Base.close(state::SshState)
     if !isnothing(state.session)
         close(state.session)
     end
+
+    state.password = ""
+    empty!(state.kbdint_prompts)
+end
+
+mutable struct VariableStore
+    const updates::Channel
+    data::Union{Vector, Matrix, DimVector, DimMatrix}
+
+    VariableStore(data) = new(Channel(100), data)
 end
 
 @kwdef mutable struct ClientState <: ExtendableState
     client_id::String = ""
     worker_info::Dict = Dict()
 
+    debug_mode::Ref{Bool} = Ref(false)
+    syncing::Bool = false
     status::RemoteStatus = RemoteStatus_Unconnected
-    websocket::Maybe{ws.WebSocket} = nothing
+    websocket::Maybe{WebSockets.WebSocket} = nothing
     ssh_hops::Vector{SshState} = SshState[]
+    sftp::Maybe{ssh.SftpSession} = nothing
     ws_forwarder::Maybe{ssh.Forwarder} = nothing
+    remote_engine_dir::String = ""
 
     cmd_output::String = ""
     last_error::String = ""
+
+    embedded_engine::Bool = false
+    engine::Maybe{EngineState} = nothing
+
+    default_topic_idx::Ref{Cint} = Ref(Cint(0))
+    available_topics::Vector{String} = String[]
+    webproxy_status::WebproxyStatus = WebproxyStatus_Idle
+    remoterepl_mode::Ref{Bool} = Ref(false)
+    remoterepl_status::RemoteReplStatus = RemoteReplStatus_Stopped
+
+    # Context file and pipeline
+    context_state::Dict{String, Any} = Dict()
+    context_path::String = ""
+    context_path_valid::Bool = false
+    node_positions::Dict{String, Point2d} = Dict()
+    pipeline_status::PipelineStatus = PipelineStatus_Stopped
+
+    # Karabo status
+    trainmatchers::Dict{String, Any} = Dict()
+    karabo_devices::Dict{String, Any} = Dict()
+
+    # Variables
+    variable_data::Dict{String, VariableStore} = Dict()
+    plots::Vector{Plot} = Plot[]
 
     extras::Dict{Symbol, Any} = Dict{Symbol, Any}()
     lock::ReentrantLock = ReentrantLock()
@@ -173,6 +206,9 @@ function Base.close(client::ClientState)
     end
 
     # Kill the SSH connections
+    if !isnothing(client.sftp)
+        close(client.sftp)
+    end
     if !isnothing(client.ws_forwarder)
         close(client.ws_forwarder)
     end
@@ -180,6 +216,16 @@ function Base.close(client::ClientState)
     for ssh_state in Iterators.reverse(client.ssh_hops)
         close(ssh_state)
     end
+
+    # Kill any local engine
+    if !isnothing(client.engine)
+        notify(client.engine.stop_event)
+        wait(client.engine.stop_task)
+    end
+
+    # Delete any cached values
+    empty!(ImGuiHelpers.safe_input_text_cache)
+    empty!(client.variable_data)
 end
 
 @kwdef mutable struct GuiState <: ExtendableState
@@ -194,30 +240,25 @@ end
     show_debug_log::Bool = false
 
     # Connections to remote things
-    address::String = "wrigleyj@exflonc26.desy.de"
+    address::String = "wrigleyj@exflonc202.desy.de"
     client::ClientState = ClientState()
-    webproxy::String = ""
-    webproxy_status::WebproxyStatus = WebproxyStatus_Idle
-
-    # Context file
-    context_state::Dict{String, Any} = Dict()
-    context_path::String = ""
-    context_path_valid::Bool = false
     engine_environment::String = "@xfa-default"
-
-    # Karabo status
-    trainmatchers::Dict{String, Any} = Dict()
-    karabo_devices::Dict{String, Any} = Dict()
 
     extras::Dict{Any, Any} = Dict()
     lock::ReentrantLock = ReentrantLock()
 end
 
+extras_defaults(::GuiState) = Dict(
+    :client_type_current_item => Ref(Cint(0))
+)
+
 function Base.show(io::IO, state::GuiState)
-    print(io, GuiState, "(context_path=\"$(state.context_path)\", engine_environment=\"$(state.engine_environment)\")")
+    print(io, GuiState, "(engine_environment=\"$(state.engine_environment)\")")
 end
 
-Base.close(state::GuiState) = close(state.client)
+function Base.close(state::GuiState)
+    close(state.client)
+end
 
 function Base.lock(state::GuiState)
     lock(state.lock)
@@ -227,6 +268,4 @@ end
 function Base.unlock(state::GuiState)
     unlock(state.client.lock)
     unlock(state.lock)
-end
-
 end

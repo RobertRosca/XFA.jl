@@ -1,14 +1,20 @@
 name = "XFA"
 uuid = "1c39a8db-6709-4730-8fe8-40f12fd2079f"
-authors = ["JamesWrigley <james@puiterwijk.org>"]
 version = "0.1.0"
+authors = ["JamesWrigley <james@puiterwijk.org>"]
 
 [deps]
 CImGui = "5d785b6c-b76f-510e-a07c-3070796c7e87"
+CRC32c = "8bf52ea8-c179-5cab-976a-9e18b702a9bc"
+DimensionalData = "0703355e-b756-11e9-17c0-8b28908087d0"
 GLFW = "f7f18e0c-5ee9-5ccd-a5bf-e8befd85ed98"
+GeometryBasics = "5c1252a2-5f33-56bf-86c9-59e7332b4326"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+ImPlot = "e8efc688-5342-4ad4-b4ba-9025a731b363"
 LibSSH = "00483490-30f8-4353-8aba-35b82f51f4d0"
 ModernGL = "66fc600b-dfda-50eb-8b99-91cfa97b1301"
+NaNStatistics = "b946abbf-3ea7-4610-9019-9858bfdeaf2d"
+PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Revise = "295af30f-e4ad-537b-8983-00126c2a3abe"
@@ -16,18 +22,22 @@ Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 XfaEngine = "df4d7780-7f2f-4694-8ef1-2cbac230b49a"
-ZMQ = "c2297ded-f4af-51ae-bb23-16f91089e4e1"
-
-[compat]
-CImGui = "3"
-GLFW = "3"
-HTTP = "1"
-LibSSH = "0.6"
-ModernGL = "1"
-Revise = "3"
-TOML = "1"
-ZMQ = "1"
-julia = "1.11"
 
 [sources]
-XfaEngine = {path = "./XfaEngine"}
+XfaEngine = {path = "XfaEngine"}
+
+[compat]
+CImGui = "7"
+CRC32c = "1"
+DimensionalData = "0.29.13"
+GLFW = "3"
+GeometryBasics = "0.5.5"
+HTTP = "1"
+ImPlot = "0.7.1"
+LibSSH = "0.7"
+ModernGL = "1"
+NaNStatistics = "0.6.55"
+PrecompileTools = "1.2.1"
+Revise = "<3.13"
+TOML = "1"
+julia = "1.11"

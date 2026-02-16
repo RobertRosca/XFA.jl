@@ -3,37 +3,123 @@ module KaraboBridge
 import ZMQ
 import MsgPack
 import Sockets
+import Sockets
 
-export next
+@kwdef mutable struct IORequest
+    type::Symbol
+    args::Any
+    kwargs::Any
+    result::Any = nothing
+    event::Threads.Event = Threads.Event()
+end
 
-# Sneakily copied from ThreadPinning.jl
-macro tspawnat(thrdid, expr)
-    # Copied from ThreadPools.jl with the change task.sticky = false -> true
-    # https://github.com/tro3/ThreadPools.jl/blob/c2c99a260277c918e2a9289819106dd38625f418/src/macros.jl#L244
-    letargs = Base._lift_one_interp!(expr)
+mutable struct ThreadsafeSocket
+    socket::ZMQ.Socket
+    io_channel::Channel{IORequest}
+    handler::Task
 
-    thunk = esc(:(() -> ($expr)))
-    var = esc(Base.sync_varname)
-    tid = esc(thrdid)
-    nt = :(Threads.maxthreadid())
-    quote
-        if $tid < 1 || $tid > $nt
-            throw(ArgumentError("Invalid thread id ($($tid)). Must be between in " *
-                                "1:(total number of threads), i.e. $(1:$nt)."))
-        end
-        let $(letargs...)
-            local task = Task($thunk)
-            task.sticky = true
-            ccall(:jl_set_task_tid, Cvoid, (Any, Cint), task, $tid - 1)
-            if $(Expr(:islocal, var))
-                put!($var, task)
+    function ThreadsafeSocket(socket; buffer_size=100)
+        self = new(socket, Channel{IORequest}(buffer_size))
+        handler = Threads.@spawn handle_threadsafesocket(self)
+        self.handler = handler
+        errormonitor(handler)
+
+        return self
+    end
+end
+
+function Base.getproperty(tsock::ThreadsafeSocket, name::Symbol)
+    if name in fieldnames(ThreadsafeSocket)
+        getfield(tsock, name)
+    else
+        getproperty(tsock.socket, name)
+    end
+end
+
+function Base.setproperty!(tsock::ThreadsafeSocket, name::Symbol, x)
+    if name in fieldnames(ThreadsafeSocket)
+        setfield!(tsock, name, x)
+    else
+        setproperty!(tsock.socket, name, x)
+    end
+end
+
+Base.isopen(tsock::ThreadsafeSocket) = isopen(tsock.socket)
+Base.wait(tsock::ThreadsafeSocket) = wait(tsock.socket)
+Sockets.bind(tsock::ThreadsafeSocket, args...; kwargs...) = Sockets.bind(tsock.socket, args...; kwargs...)
+
+function Base.close(tsock::ThreadsafeSocket)
+    close(tsock.io_channel)
+    close(tsock.socket)
+    wait(tsock.handler)
+end
+
+function handle_threadsafesocket(tsock::ThreadsafeSocket)
+    while isopen(tsock) || isready(tsock.io_channel)
+        local io_request
+        try
+            io_request = take!(tsock.io_channel)
+        catch ex
+            if !(ex isa InvalidStateException)
+                rethrow()
+            else
+                break
             end
-            schedule(task)
-            task
+        end
+
+        try
+            io_request.result = if io_request.type === :send
+                Sockets.send(tsock.socket, io_request.args...; io_request.kwargs...)
+            elseif io_request.type === :recv
+                Sockets.recv(tsock.socket, io_request.args...; io_request.kwargs...)
+            end
+        catch ex
+            io_request.result = ex
+        finally
+            notify(io_request.event)
         end
     end
 end
 
+function _do_io(tsock::ThreadsafeSocket, io_request::IORequest)
+    put!(tsock.io_channel, io_request)
+    wait(io_request.event)
+
+    if io_request.result isa Exception
+        throw(io_request.result)
+    else
+        return io_request.result
+    end
+end
+
+function Sockets.send(tsock::ThreadsafeSocket, args...; kwargs...)
+    io_request = IORequest(; type=:send, args, kwargs)
+    return _do_io(tsock, io_request)
+end
+
+function Sockets.recv(tsock::ThreadsafeSocket, args...; kwargs...)
+    io_request = IORequest(; type=:recv, args, kwargs)
+    return _do_io(tsock, io_request)
+end
+
+function ZMQ.send_multipart(socket::ThreadsafeSocket, parts)
+    for i in eachindex(parts)
+        is_last = i == lastindex(parts)
+        Sockets.send(socket, parts[i]; more=!is_last)
+    end
+end
+
+Sockets.recv(socket::ThreadsafeSocket, ::Type{ZMQ.Message}) = Sockets.recv(socket)
+function ZMQ.recv_multipart(socket::ThreadsafeSocket, ::Type{T}) where {T}
+    parts = T[Sockets.recv(socket, T)]
+    while socket.rcvmore
+        push!(parts, Sockets.recv(socket, T))
+    end
+
+    return parts
+end
+
+ZMQ.recv_multipart(socket::ThreadsafeSocket) = ZMQ.recv_multipart(socket, ZMQ.Message)
 
 """
     KaraboBridgeClient("tcp://127.0.0.1:1234")
@@ -41,26 +127,19 @@ end
 Connect to the Karabo bridge at the given endpoint.
 """
 mutable struct KaraboBridgeClient
-    socket::ZMQ.Socket
+    socket::ThreadsafeSocket
     context::ZMQ.Context
     ready::Bool
 
     function KaraboBridgeClient(endpoint::String)
         context = ZMQ.Context()
-        socket = _zmq_threadsafe() do
-            socket = ZMQ.Socket(context, ZMQ.REQ)
-            socket.linger = 1
-            socket.rcvhwm = 10
-            socket.sndhwm = 10
-            Sockets.connect(socket, endpoint)
-            return socket
-        end
+        socket = ZMQ.Socket(context, ZMQ.REQ)
+        socket.linger = 1
+        socket.rcvhwm = 10
+        socket.sndhwm = 10
+        Sockets.connect(socket, endpoint)
 
-        new_client = new(socket, context, false)
-        return finalizer(new_client) do client
-            @async close(client)
-            close(client.context)
-        end
+        new_client = new(ThreadsafeSocket(socket), context, false)
     end
 end
 
@@ -70,10 +149,9 @@ end
 Create a Karabo bridge server.
 """
 mutable struct KaraboBridgeServer
-    socket::ZMQ.Socket
+    socket::ThreadsafeSocket
     context::ZMQ.Context
     endpoint::String
-    lock::ReentrantLock
     is_running::Bool
     channel::Channel
     buffer_size::Int
@@ -81,29 +159,16 @@ mutable struct KaraboBridgeServer
 
     function KaraboBridgeServer(endpoint::String; buffer_size::Int=10)
         context = ZMQ.Context()
-        socket = _zmq_threadsafe() do
-            socket = ZMQ.Socket(context, ZMQ.REP)
-            socket.linger = 1
-            socket.rcvhwm = 10
-            socket.sndhwm = 10
-            return socket
-        end
+        socket = ZMQ.Socket(context, ZMQ.REP)
+        socket.linger = 1
+        socket.rcvhwm = 10
+        socket.sndhwm = 10
 
         ch = Channel()
         close(ch)
 
-        new_server = new(socket, context, endpoint, ReentrantLock(), false, ch, buffer_size, nothing)
-        return finalizer(new_server) do server
-            @async close(server)
-            close(server.context)
-        end
+        new_server = new(ThreadsafeSocket(socket), context, endpoint, false, ch, buffer_size, nothing)
     end
-end
-
-function _zmq_threadsafe(f; sync=true)
-    t = @tspawnat 1 f()
-
-    return sync ? fetch(t) : t
 end
 
 function Base.show(io::IO, server::KaraboBridgeServer)
@@ -124,11 +189,18 @@ end
 
 Close a Karabo bridge server (unbind its socket).
 """
-function Base.close(server::KaraboBridgeServer)
-    @lock server.lock begin
-        _zmq_threadsafe(() -> close(server.socket))
-        close(server.channel)
+function Base.close(server::KaraboBridgeServer; wait=true)
+    close(server.channel)
+
+    if isopen(server.context)
+        ZMQ.lib.zmq_ctx_shutdown(server.context)
     end
+
+    if wait
+        Base.wait(server.server_task)
+    end
+    close(server.socket)
+    close(server.context)
 end
 
 """
@@ -137,7 +209,12 @@ end
 Close a Karabo bridge client (disconnect its socket).
 """
 function Base.close(client::KaraboBridgeClient)
-    _zmq_threadsafe(() -> close(client.socket))
+    if isopen(client.context)
+        ZMQ.lib.zmq_ctx_shutdown(client.context)
+    end
+
+    close(client.socket)
+    close(client.context)
 end
 
 """
@@ -152,98 +229,99 @@ function startbridge(server::KaraboBridgeServer)
         error("Karabo bridge server is already running")
     end
 
-    _zmq_threadsafe(() -> bind(server.socket, server.endpoint))
+    bind(server.socket, server.endpoint)
     server.channel = Channel(server.buffer_size)
 
     # This condition is notified when the server loop begins. We wait on it to
     # guarantee the caller that the server loop has started by the time this
     # function returns.
     start_condition = Threads.Condition()
-    timeout_timer = Timer(5) do _
-        close(server)
+    timeout_timer = Timer(10) do _
+        close(server; wait=false)
         @lock start_condition notify(start_condition,
                                      ErrorException("Timeout when starting server on $(server.endpoint)");
                                      error=true)
     end
 
     lock(start_condition)
-    server.server_task = errormonitor(
-        _zmq_threadsafe(; sync=false) do
-            @lock start_condition notify(start_condition)
+    server.server_task = Threads.@spawn begin
+        @lock start_condition notify(start_condition)
 
+        fake_tid = 0
+
+        while true
+            # Wait for some data to send
+            data, metadata = nothing, nothing
             try
-                while true
-                    # Wait for some data to send
-                    data, metadata = nothing, nothing
-                    try
-                        data, metadata = take!(server.channel)
-                    catch ex
-                        if ex isa InvalidStateException
-                            # If the channel has been closed, exit the loop
-                            break
-                        else
-                            rethrow()
-                        end
-                    end
-
-                    # Wait for the client to request some data
-                    msg = nothing
-                    try
-                        msg = Sockets.recv(server.socket, String)
-                    catch ex
-                        if ex isa ZMQ.StateError || ex isa EOFError
-                            # If the socket was closed or is somehow corrupted,
-                            # exit the loop.
-                            break
-                        else
-                            rethrow()
-                        end
-                    end
-
-                    if msg != "next"
-                        @error "Unexpected message from Karabo bridge client: '$(msg)'. Expected 'next'."
-                        continue
-                    end
-
-                    # Serialize the data and send it to the client
-                    msgs = serialize(data, metadata)
-                    send_multipart(server.socket, msgs)
+                data, metadata = take!(server.channel)
+            catch ex
+                if ex isa InvalidStateException
+                    # If the channel has been closed, exit the loop
+                    break
+                else
+                    rethrow()
                 end
-            finally
-                stopbridge(server)
             end
-        end)
+
+            if isnothing(metadata)
+                metadata = Dict{String, Any}()
+                for source in keys(data)
+                    metadata[source] = Dict{String, Any}()
+                    metadata[source]["source"] = source
+                    metadata[source]["timestamp"] = time()
+                    metadata[source]["timestamp.sec"] = ""
+                    metadata[source]["timestamp.frac"] = ""
+                    metadata[source]["timestamp.tid"] = fake_tid
+                end
+
+                fake_tid += 1
+            end
+
+            # Wait for the client to request some data
+            msg = nothing
+            try
+                msg = Sockets.recv(server.socket, String)
+            catch ex
+                if ex isa ZMQ.StateError || ex isa EOFError
+                    # If the socket was closed or is somehow corrupted,
+                    # exit the loop.
+                    break
+                else
+                    rethrow()
+                end
+            end
+
+            if msg != "next"
+                @error "Unexpected message from Karabo bridge client: '$(msg)'. Expected 'next'."
+                continue
+            end
+
+            # Serialize the data and send it to the client
+            msgs = serialize(data, metadata)
+            ZMQ.send_multipart(server.socket, msgs)
+            @debug "Sent data from $(server)"
+        end
+    end
+    errormonitor(server.server_task)
 
     @lock start_condition wait(start_condition)
     close(timeout_timer)
-
-    return
 end
 
-function stopbridge(server::KaraboBridgeServer)
-    @lock server.lock begin
-        if !isopen(server.channel)
-            return
-        end
-
-        _zmq_threadsafe(() -> unbind(server.socket, server.endpoint))
-        close(server.channel)
-    end
-end
 Base.put!(server::KaraboBridgeServer, data, metadata=nothing) = put!(server.channel, (data, metadata))
 
 """
-    next(client)
+    take!(client)
 
 Get the next message from a bridge client.
 """
-function next(client::KaraboBridgeClient)
+function Base.take!(client::KaraboBridgeClient)
     if !client.ready
-        _zmq_threadsafe(() -> Sockets.send(client.socket, Vector{UInt8}("next")))
+        ZMQ.send(client.socket, "next")
         client.ready = true
     end
 
-    msgs = _zmq_threadsafe(() -> recv_multipart(client.socket))
+    msgs = ZMQ.recv_multipart(client.socket)
     client.ready = false
 
     return deserialize(msgs)
@@ -303,7 +381,7 @@ function serialize(data, metadata=nothing)
                 "dtype" => lowercase(string(eltype(array))),
                 "shape" => size(array)
             )))
-            push!(msgs, ZMQ.Message(array))
+            push!(msgs, ZMQ.Message(vec(array)))
         end
     end
 
@@ -350,36 +428,6 @@ function deserialize(msgs::Vector{ZMQ.Message})
     end
 
     return data, meta
-end
-
-"""
-    recv_multipart(socket)
-
-Receives a multipart message from a ZMQ socket.
-"""
-function recv_multipart(socket::ZMQ.Socket)
-    msgs = ZMQ.Message[]
-
-    while true
-        push!(msgs, Sockets.recv(socket))
-
-        if !socket.rcvmore
-            break
-        end
-    end
-
-    return msgs
-end
-
-"""
-    send_multipart(socket)
-
-Sends a multipart message from a ZMQ socket.
-"""
-function send_multipart(socket::ZMQ.Socket, msgs)
-    for msg in msgs
-        Sockets.send(socket, msg, more=msg !== msgs[end])
-    end
 end
 
 """

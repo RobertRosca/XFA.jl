@@ -1,21 +1,23 @@
 module XfaEngine
 
 include("karabo_bridge.jl")
+include("context.jl")
 include("protocol.jl")
 include("webproxy.jl")
-include("context.jl")
 
 import TOML
-import Sockets: listen, close, @ip_str
+import Sockets
+import Sockets: listen, close, @ip_str, TCPServer
 import DistributedNext: @everywhere, @fetchfrom, workers, procs
 using Serialization
 
 import HTTP
 import HTTP: WebSockets
 import Revise
+import RemoteREPL
+using DimensionalData: DimArray
 
 using .Protocol
-import .WebProxy
 import .Context: XfaContext
 
 
@@ -52,30 +54,30 @@ end
 end
 
 @kwdef mutable struct EngineState
-    websocket_port::Int
+    websocket_port::Int = -1
     karabo_bridge_port::Int = -1
     websocket_listener_task::Union{Task, Nothing} = nothing
     clients::Dict{String, ClientState} = Dict()
-    ctx::Union{XfaContext, Nothing} = nothing
 
-    halt_and_catch_fire::Base.Event = Base.Event()
+    webproxies::Dict{String, WebProxy} = Dict()
+    default_topic::String = ""
+
+    remoterepl_server::TCPServer = TCPServer()
+    remoterepl_task::Union{Task, Nothing} = nothing
+
+    ctx::XfaContext = XfaContext()
+
+    stop_event::Base.Event = Base.Event()
+    stop_task::Union{Task, Nothing} = nothing
 end
 
-wip_state::Dict{Symbol, Any} = Dict()
+current_engine_state::Union{EngineState, Nothing} = nothing
 
-function Base.getproperty(state::EngineState, sym::Symbol)
-    if sym in fieldnames(EngineState)
-        return getfield(state, sym)
-    else
-        return wip_state[sym]
-    end
-end
-
-function Base.setproperty!(state::EngineState, sym::Symbol, value)
-    if sym in fieldnames(EngineState)
-        setfield!(state, sym, value)
-    else
-        wip_state[sym] = value
+function forward_output(state::EngineState, stream_output)
+    for data in stream_output
+        for client in values(state.clients)
+            Protocol.send(client.websocket, TrainData([data]))
+        end
     end
 end
 
@@ -90,7 +92,7 @@ function shutdown(state::EngineState, ws_server=nothing)
     end
 end
 
-function handle_message(msg::Message, state::EngineState, id)
+function handle_message(msg::AbstractMessage, state::EngineState, id)
     client_state = state.clients[id]
     ws = client_state.websocket
 
@@ -100,10 +102,14 @@ function handle_message(msg::Message, state::EngineState, id)
     elseif msg isa Shutdown
         @info "Received shutdown request from client $(id)"
         shutdown(state)
-        notify(state.halt_and_catch_fire)
+        notify(state.stop_event)
+    elseif msg isa SetDefaultTopic
+        state.default_topic = msg.topic
+        @info "Set default topic to: $(state.default_topic)"
     elseif msg isa GetDevices
         try
-            devices = WebProxy.get_devices(msg.webproxy_endpoint)
+            wp = state.webproxies[state.default_topic]
+            devices = get_devices(wp)
             Protocol.send(ws, Devices(devices))
             @info "Responded to 'GetDevices' from $(id)"
         catch ex
@@ -111,12 +117,69 @@ function handle_message(msg::Message, state::EngineState, id)
             Protocol.send(ws, Devices(ex))
         end
     elseif msg isa LoadContext
-        state.ctx = Context.load_from_file(msg.path)
-        Protocol.send(ws, ContextInfo(Context.to_dict(state.ctx)))
-        @info "Loaded context file $(context_path): $(state.ctx)"
+        path = abspath(expanduser(msg.path))
+
+        was_running = state.ctx.is_running[]
+        if was_running
+            Context.stop_pipeline(state.ctx)
+        end
+
+        new_ctx_or_ex = try
+            ctx = Context.load_from_file(path)
+            ctx.forwarder = Base.Fix1(forward_output, state)
+            ctx
+        catch ex
+            ex
+        end
+
+        if new_ctx_or_ex isa XfaContext
+            state.ctx = new_ctx_or_ex
+            if was_running
+                @invokelatest Context.start_pipeline(state.ctx)
+            end
+
+            @info "Loaded context file $(path): $(state.ctx)"
+            Protocol.send(ws, ContextInfo(state.ctx))
+        else
+            @error "Loading context file at $(path) failed" exception=new_ctx_or_ex
+            Protocol.send(ws, ContextInfo(new_ctx_or_ex, state.ctx.is_running[]))
+        end
     elseif msg isa ReviseCode
         @everywhere Revise.retry()
         @info "Revised source code"
+    elseif msg isa ChangeParameter
+        param = msg.parameter
+        Context.change_parameter(param)
+        @info "ChangeParameter of $(param.name) to $(param.value)"
+    elseif msg isa Start
+        @info "Starting pipeline..."
+        Context.start_pipeline(state.ctx)
+        Protocol.send(ws, Started())
+        @info "Started"
+    elseif msg isa Stop
+        @info "Stopping pipeline..."
+        Context.stop_pipeline(state.ctx)
+        Protocol.send(ws, Stopped())
+        @info "Stopped"
+    elseif msg isa SetDebugMode
+        @info "Setting debug mode: $(msg.enable)"
+        if msg.enable
+            ENV["JULIA_DEBUG"] = "XfaEngine"
+        else
+            delete!(ENV, "JULIA_DEBUG")
+        end
+    elseif msg isa SetRemoteRepl
+        if msg.enable
+            @info "Starting RemoteREPL"
+            port, state.remoterepl_server = Sockets.listenany(27754)
+            state.remoterepl_task = Threads.@spawn RemoteREPL.serve_repl(state.remoterepl_server)
+            Protocol.send(ws, RemoteReplState(true, Int(port)))
+        else
+            @info "Stopping RemoteREPL"
+            close(state.remoterepl_server)
+            wait(state.remoterepl_task)
+            Protocol.send(ws, RemoteReplState(false, -1))
+        end
     else
         @error "Received unsupported message: $(typeof(msg))"
     end
@@ -130,6 +193,9 @@ function handle_client(state::EngineState, id)
     # Start by sending their identifier
     WebSockets.send(ws, id)
     @info "Connected to new client: $(id) 🙋"
+
+    # And the available topics
+    Protocol.send(ws, AvailableTopics(collect(keys(state.webproxies))))
 
     for msg_bytes in ws
         buffer = IOBuffer(msg_bytes)
@@ -151,14 +217,22 @@ const ID_PREFIXES = ["bothersome", "droopy", "deleterious", "morbid", "snobbish"
 const ID_SUFFIXES = ["elf", "balrog", "wizard", "hobbit", "dwarf", "ent", "troll", "goblin", "tom", "dragon"]
 create_id() = "$(rand(ID_PREFIXES))-$(rand(ID_SUFFIXES))"
 
-function main(halt_and_catch_fire=Base.Event())
+function main(stop_event=Base.Event(); info_path=nothing, wait=true)
     websocket_port = getavailableport(1331)
-    state = EngineState(; websocket_port, halt_and_catch_fire)
+    state = EngineState(; websocket_port, stop_event)
+    global current_engine_state = state
+
+    if haskey(ENV, "SASE")
+        merge!(state.webproxies, Dict(instrument => WebProxy(address)
+                                      for (instrument, address) in DEFAULT_WEBPROXY_ADDRESSES))
+    elseif !endswith(gethostname(), ".desy.de")
+        state.webproxies["localhost"] = WebProxy("localhost:8484")
+    end
 
     ws_server = WebSockets.listen!("0.0.0.0", state.websocket_port) do ws
+        id = create_id()
         try
             # Select their identifier
-            id = create_id()
             while id in keys(state.clients)
                 id = create_id()
             end
@@ -188,15 +262,20 @@ function main(halt_and_catch_fire=Base.Event())
     worker_info["1"]["websocket-port"] = websocket_port
     worker_info["1"]["karabo-bridge-port"] = state.karabo_bridge_port
 
-    info_path = abspath("worker-info.toml")
+    if isnothing(info_path)
+        info_path = abspath("worker-info.toml")
+    else
+        info_path = abspath(expanduser(info_path))
+    end
+
     open(info_path, "w") do io
         TOML.print(io, worker_info)
     end
 
     @info "Wrote worker information to $(info_path)"
 
-    try
-        wait(state.halt_and_catch_fire)
+    state.stop_task = Threads.@spawn try
+        Base.wait(state.stop_event)
     catch ex
         if ex isa InterruptException
             @info "Shutdown requested, shutting down..."
@@ -209,6 +288,12 @@ function main(halt_and_catch_fire=Base.Event())
             HTTP.forceclose(ws_server)
         end
     end
+
+    if wait
+        Base.wait(state.stop_task)
+    end
+
+    return state
 end
 
 end # module XfelAnalyserEngine

@@ -1,9 +1,10 @@
 name = "XfaEngine"
 uuid = "df4d7780-7f2f-4694-8ef1-2cbac230b49a"
-authors = ["JamesWrigley <james.wrigley@xfel.eu>"]
 version = "0.1.0"
+authors = ["JamesWrigley <james.wrigley@xfel.eu>"]
 
 [deps]
+DimensionalData = "0703355e-b756-11e9-17c0-8b28908087d0"
 DistributedNext = "fab6aee4-877b-4bac-a744-3eca44acbb6f"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
@@ -12,6 +13,7 @@ LoggingFormats = "98105f81-4425-4516-93fd-1664fb551ab6"
 MacroTools = "1914dd2f-81c6-5fcd-8719-6d5c9610ff09"
 MsgPack = "99f44e22-a591-53d1-9472-aa23ef4bd671"
 OrderedCollections = "bac558e1-5e72-5ebc-8fee-abe8a469f55d"
+RemoteREPL = "1bd9f7bb-701c-4338-bec7-ac987af7c555"
 Revise = "295af30f-e4ad-537b-8983-00126c2a3abe"
 Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
@@ -19,4 +21,7 @@ TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 ZMQ = "c2297ded-f4af-51ae-bb23-16f91089e4e1"
 
 [compat]
+DimensionalData = "0.29.12"
 DistributedNext = "1.0.0"
+RemoteREPL = "0.3.0"
+Revise = "<3.13"
