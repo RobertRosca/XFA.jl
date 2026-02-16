@@ -470,14 +470,14 @@ mutable struct Plot
     const name::String
     const id::String
     const open::Ref{Bool}
-    autofit::Bool
+    const autofit::Ref{Bool}
+    const fixed_aspect::Ref{Bool}
     gpu_heatmap::Union{Nothing, GPUHeatmap}
-    fixed_aspect::Bool
 end
 
 function Plot(name)
     id = name * "##" * String(rand('a':'z', 10))
-    return Plot(name, id, Ref(true), true, nothing, true)
+    return Plot(name, id, Ref(true), Ref(true), Ref(true), nothing)
 end
 
 function Base.close(plot::Plot)
@@ -487,8 +487,8 @@ function Base.close(plot::Plot)
     end
 end
 
-function check_plot_interaction!(plot::Plot)
-    if !plot.autofit
+function check_plot_interaction!(plot)
+    if !plot.autofit[]
         return
     end
 
@@ -500,7 +500,7 @@ function check_plot_interaction!(plot::Plot)
         io = ig.GetIO()
         mouse_wheel = unsafe_load(io.MouseWheel)
         if ig.IsMouseDragging(ig.ImGuiMouseButton_Left) || mouse_wheel != 0
-            plot.autofit = false
+            plot.autofit[] = false
         end
     end
 end
@@ -514,7 +514,7 @@ function draw_plot(plot::Plot, data, was_updated)
         xlabel = is_dimarray ? DD.label(data_dims[1]) : ""
         label = is_dimarray ? DD.label(data) : plot.name
 
-        if plot.autofit
+        if plot.autofit[]
             ImPlot.SetNextAxesToFit()
         end
 
@@ -550,7 +550,7 @@ function draw_plot(plot::Plot, data, was_updated)
                 render_colormapped!(gpu, ctx, dmin, dmax)
             end
 
-            plot_flags = plot.fixed_aspect ? ImPlot.ImPlotFlags_Equal : ImPlot.ImPlotFlags_None
+            plot_flags = plot.fixed_aspect[] ? ImPlot.ImPlotFlags_Equal : ImPlot.ImPlotFlags_None
             if ImPlot.BeginPlot(plot.id, plot_size, plot_flags)
                 tex_ref = ig.ImTextureRef(ig.ImTextureID(gpu.output_tex))
                 ImPlot.PlotImage("", tex_ref,
@@ -561,11 +561,153 @@ function draw_plot(plot::Plot, data, was_updated)
             end
         end
 
-        @c ig.Checkbox("Autofit", &plot.autofit)
+        ig.Checkbox("Autofit", plot.autofit)
         if data isa AbstractMatrix
             ig.SameLine()
-            @c ig.Checkbox("Fixed aspect", &plot.fixed_aspect)
+            ig.Checkbox("Fixed aspect", plot.fixed_aspect)
         end
+    end
+
+    ig.End()
+end
+
+# --- Correlation plot ---
+
+@kwdef mutable struct CorrelationPlot
+    const id::String = "CorrelationPlot##" * String(rand('a':'z', 10))
+    const open::Ref{Bool} = Ref(true)
+    const variable_names::Vector{String} = String[]
+    const x_var::Ref{Cint} = Ref(Cint(0))
+    const y_var::Ref{Cint} = Ref(Cint(0))
+    const x_data::Vector = Float64[]
+    const y_data::Vector = Float64[]
+    const autofit::Ref{Bool} = Ref(true)
+    trainId::Int = -1
+end
+
+Base.close(::CorrelationPlot) = nothing
+
+function var_type_label(store)
+    if store.type == VariableType_Scalar
+        "scalar"
+    elseif store.type == VariableType_Vector
+        "vector"
+    elseif store.type == VariableType_Array
+        """array $(join(size(store.data), "×"))"""
+    else
+        ""
+    end
+end
+
+function _var_combo(label, selected::Ref{Cint}, var_names, variable_data)
+    n = length(var_names)
+    preview = if n > 0
+        name = var_names[selected[] + 1]
+        type_label = var_type_label(variable_data[name])
+        "$(name)  ($(type_label))"
+    else
+        ""
+    end
+    ig.SetNextItemWidth(250)
+
+    if ig.BeginCombo(label, preview)
+        for (i, name) in enumerate(var_names)
+            if variable_data[name].type ∉ (VariableType_Scalar, VariableType_Vector)
+                continue
+            end
+
+            is_selected = selected[] == i - 1
+            if ig.Selectable(name, is_selected)
+                selected[] = i - 1
+            end
+
+            ig.SameLine()
+
+            ig.TextDisabled(var_type_label(variable_data[name]))
+            if is_selected
+                ig.SetItemDefaultFocus()
+            end
+        end
+
+        ig.EndCombo()
+    end
+end
+
+function draw_plot(plot::CorrelationPlot, variable_data)
+    # Update variable names
+    empty!(plot.variable_names)
+    for (name, variable) in variable_data
+        if variable.type in (VariableType_Scalar, VariableType_Vector)
+            push!(plot.variable_names, name)
+        end
+    end
+    sort!(plot.variable_names)
+
+    ig.SetNextWindowSize((800, 500), ig.ImGuiCond_FirstUseEver)
+
+    if ig.Begin(plot.id, plot.open)
+        n = length(plot.variable_names)
+
+        # Clamp indices to valid range
+        if n > 0
+            plot.x_var[] = clamp(plot.x_var[], 0, n - 1)
+            plot.y_var[] = clamp(plot.y_var[], 0, n - 1)
+        end
+
+        _var_combo("X", plot.x_var, plot.variable_names, variable_data)
+        ig.SameLine()
+        _var_combo("Y", plot.y_var, plot.variable_names, variable_data)
+
+        region_avail = ig.GetContentRegionAvail()
+        plot_size = ImVec2(region_avail.x, max(region_avail.y - 30, 100))
+
+        if n > 0
+            x_name = plot.variable_names[plot.x_var[] + 1]
+            y_name = plot.variable_names[plot.y_var[] + 1]
+            x = variable_data[x_name]
+            y = variable_data[y_name]
+            x_dimarray = x.data isa DimArray
+            y_dimarray = y.data isa DimArray
+
+            if x.type != y.type
+                ig.Text("Both variables must have the same type to correlate against each other.")
+            else
+                # Only update both buffers together when both variables have
+                # data from the same train.
+                needs_copy = x.type == VariableType_Vector && x.trainId == y.trainId && x.trainId != plot.trainId
+                if needs_copy
+                    resize!(plot.x_data, length(x.data))
+                    resize!(plot.y_data, length(y.data))
+                    copyto!(plot.x_data, x.data)
+                    copyto!(plot.y_data, y.data)
+                    plot.trainId = x.trainId
+                end
+
+                if plot.autofit[]
+                    ImPlot.SetNextAxesToFit()
+                end
+
+                if x_dimarray && y_dimarray
+                    ig.Text("Unsupported")
+                else
+                    if ImPlot.BeginPlot(plot.id, x_name, y_name, plot_size)
+                        len = min(length(x.data), length(y.data))
+
+                        if len > 0
+                            ImPlot.PushStyleVar(ImPlot.ImPlotStyleVar_FillAlpha, 0.5)
+                            ImPlot.PlotScatter("$(x_name) vs $(y_name)",
+                                               plot.x_data, plot.y_data)
+                            ImPlot.PopStyleVar()
+                        end
+                        check_plot_interaction!(plot)
+                        ImPlot.EndPlot()
+                    end
+                end
+
+                ig.Checkbox("Autofit", plot.autofit)
+            end
+        end
+
     end
 
     ig.End()

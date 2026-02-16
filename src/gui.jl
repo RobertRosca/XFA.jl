@@ -192,6 +192,13 @@ function draw_dag()
         end
     end
 
+    ig.SameLine()
+    @Disabled isempty(client.variable_data) begin
+        if ig.Button("Correlate")
+            push!(client.plots, CorrelationPlot())
+        end
+    end
+
     if client.pipeline_status in changing_states
         ig.SameLine()
         Spinner()
@@ -424,11 +431,13 @@ function draw_plots()
 
         array = store.data
         while isready(store.updates)
-            tid, x = take!(store.updates)
+            tid, x, type = take!(store.updates)
+            store.type = type
             if x isa Number
                 push!(array, x, (; trainId=tid))
             elseif x isa AbstractArray
                 store.data = x
+                store.trainId = tid
             end
         end
 
@@ -437,7 +446,11 @@ function draw_plots()
 
     # Draw plot windows
     for plot in client.plots
-        draw_plot(plot, client.variable_data[plot.name].data, plot.name in updated_variables)
+        if plot isa CorrelationPlot
+            draw_plot(plot, client.variable_data)
+        else
+            draw_plot(plot, client.variable_data[plot.name].data, plot.name in updated_variables)
+        end
     end
 
     # Remove closed plots

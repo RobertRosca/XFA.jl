@@ -142,12 +142,27 @@ function Base.close(state::SshState)
     empty!(state.kbdint_prompts)
 end
 
+# This enum tracks the original type of the variables. We need to distinguish
+# this from how they're stored because both scalars and vectors are stored as
+# vectors.
+@enum VariableType begin
+    VariableType_Scalar
+    VariableType_Vector
+    VariableType_Array
+    VariableType_Unknown
+end
+
 mutable struct VariableStore
     const updates::Channel
     data::Union{Vector, Matrix, DimVector, DimMatrix}
+    type::VariableType
 
-    VariableStore(data) = new(Channel(100), data)
+    # This field is only used for non-scalar data. Scalar data is stored as a
+    # DimArray with a train ID.
+    trainId::Int
 end
+
+VariableStore(data) = VariableStore(Channel(100), data, VariableType_Unknown, -1)
 
 @kwdef mutable struct ClientState <: ExtendableState
     client_id::String = ""
@@ -187,7 +202,7 @@ end
 
     # Variables
     variable_data::Dict{String, VariableStore} = Dict()
-    plots::Vector{Plot} = Plot[]
+    plots::Vector{Union{Plot, CorrelationPlot}} = Union{Plot, CorrelationPlot}[]
 
     extras::Dict{Symbol, Any} = Dict{Symbol, Any}()
     lock::ReentrantLock = ReentrantLock()

@@ -464,7 +464,16 @@ function handle_msg(state, msg)
             end
 
             store = client.variable_data[variable.name]
-            push!(store.updates, (variable.tid, variable.data))
+            type = if variable.data isa Number
+                VariableType_Scalar
+            elseif variable.data isa AbstractVector
+                VariableType_Vector
+            elseif variable.data isa AbstractArray
+                VariableType_Array
+            else
+                VariableType_Unknown
+            end
+            push!(store.updates, (variable.tid, variable.data, type))
         end
     elseif msg isa RemoteReplState
         client.remoterepl_mode[] = msg.enabled
