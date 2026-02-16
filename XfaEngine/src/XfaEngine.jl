@@ -6,13 +6,15 @@ include("protocol.jl")
 include("webproxy.jl")
 
 import TOML
-import Sockets: listen, close, @ip_str
+import Sockets
+import Sockets: listen, close, @ip_str, TCPServer
 import DistributedNext: @everywhere, @fetchfrom, workers, procs
 using Serialization
 
 import HTTP
 import HTTP: WebSockets
 import Revise
+import RemoteREPL
 using DimensionalData: DimArray
 
 using .Protocol
@@ -59,6 +61,9 @@ end
 
     webproxies::Dict{String, WebProxy} = Dict()
     default_topic::String = ""
+
+    remoterepl_server::TCPServer = TCPServer()
+    remoterepl_task::Union{Task, Nothing} = nothing
 
     ctx::XfaContext = XfaContext()
 
@@ -156,6 +161,25 @@ function handle_message(msg::AbstractMessage, state::EngineState, id)
         Context.stop_pipeline(state.ctx)
         Protocol.send(ws, Stopped())
         @info "Stopped"
+    elseif msg isa SetDebugMode
+        @info "Setting debug mode: $(msg.enable)"
+        if msg.enable
+            ENV["JULIA_DEBUG"] = "XfaEngine"
+        else
+            delete!(ENV, "JULIA_DEBUG")
+        end
+    elseif msg isa SetRemoteRepl
+        if msg.enable
+            @info "Starting RemoteREPL"
+            port, state.remoterepl_server = Sockets.listenany(27754)
+            state.remoterepl_task = Threads.@spawn RemoteREPL.serve_repl(state.remoterepl_server)
+            Protocol.send(ws, RemoteReplState(true, Int(port)))
+        else
+            @info "Stopping RemoteREPL"
+            close(state.remoterepl_server)
+            wait(state.remoterepl_task)
+            Protocol.send(ws, RemoteReplState(false, -1))
+        end
     else
         @error "Received unsupported message: $(typeof(msg))"
     end

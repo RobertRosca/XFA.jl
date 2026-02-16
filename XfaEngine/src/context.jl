@@ -40,6 +40,7 @@ const scratch = ScopedValue{Dict{String, Any}}()
 end
 
 include("context_types.jl")
+include("trainmatching.jl")
 
 import ..KaraboBridge: KaraboBridgeClient
 include("context_builtins.jl")
@@ -236,14 +237,6 @@ end
 
 TrainData(tid, data) = TrainData(UInt64(tid), data)
 
-struct VariableData{T}
-    tid::UInt64
-    name::Union{String, Nothing}
-    data::T
-end
-
-VariableData(tid, name, data) = VariableData(UInt64(tid), name, data)
-
 function change_parameter(new_param::Parameter)
     pause_pipeline() do
         ctx_param = worker_state.parameters[new_param.name]
@@ -320,13 +313,20 @@ function stream_external_dependency(name, input_neighbour, downstream_neighbours
     channel = input_neighbour.channel
 
     dep = KaraboDependency(name)
+    property_value = dep.property * ".value"
 
     try
         while isopen(channel) || isready(channel)
             input = take!(channel)
             data = nothing
-            if haskey(input.data, dep.source) && haskey(input.data[dep.source], dep.property)
-                data = input.data[dep.source][dep.property]
+
+            if haskey(input.data, dep.source)
+                source_data = input.data[dep.source]
+                if haskey(source_data, dep.property)
+                    data = input.data[dep.source][dep.property]
+                elseif haskey(source_data, property_value)
+                    data = input.data[dep.source][property_value]
+                end
             end
 
             result = VariableData(input.tid, name, data)
@@ -350,22 +350,32 @@ function stream_variable(name, stream_output, upstream, downstream)
     # Initialize the scratch space
     scratch = Dict{String, Any}()
 
+    matcher = Trainmatcher(keys(upstream))
+    matched_trains = Dict{Int, Any}()
+    args = Vector{Any}(undef, length(upstream))
     try
         while true
-            args = []
-            for arg in values(upstream)
-                if arg isa RemoteChannel
-                    push!(args, take!(arg))
-                else
-                    push!(args, arg)
+            while isempty(matched_trains)
+                for arg in values(upstream)
+                    if arg isa RemoteChannel
+                        variable = take!(arg)
+
+                        if !isempty(match_train!(matched_trains, matcher, variable))
+                            break
+                        end
+                    end
                 end
             end
 
-            variable_args = filter(x -> x isa VariableData, args)
-            tid = first(variable_args).tid
-            if any([arg.tid != tid for arg in variable_args])
-                @warn "Skipping '$(name)', received inputs from different trains"
-                continue
+            tid, variable_args = only(matched_trains)
+            empty!(matched_trains)
+            for (i, (arg_name, arg)) in enumerate(upstream)
+                if arg isa RemoteChannel
+                    args[i] = pop!(variable_args, arg_name)
+                else
+                    # e.g. a Group object
+                    args[i] = arg
+                end
             end
 
             # Don't execute the variable if any inputs are `nothing`
@@ -379,8 +389,7 @@ function stream_variable(name, stream_output, upstream, downstream)
             # Execute the variable
             f = worker_state.dag_functions[name]
             @debug "Executing variable '$(name)'..."
-            lock(worker_state.task_locks[name])
-            try
+            @lock worker_state.task_locks[name] try
                 out = @with(Meta.tid => tid,
                             Meta.name => name,
                             Meta.scratch => scratch,
@@ -389,8 +398,6 @@ function stream_variable(name, stream_output, upstream, downstream)
                 @error "Execution of variable '$(name)' failed" exception=(ex, catch_backtrace())
                 putall!(values(downstream), empty_result)
                 continue
-            finally
-                unlock(worker_state.task_locks[name])
             end
 
             # Send output
@@ -677,6 +684,10 @@ function load_from_string(ctx_str::AbstractString)
         @eval ctx_module $expr
     end
 
+    @invokelatest load_from_module(ctx_module, exprs)
+end
+
+function load_from_module(ctx_module::Module, exprs::Vector{Expr})
     parameters = Dict{String, Parameter}()
 
     # Find top-level parameters

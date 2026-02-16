@@ -142,19 +142,35 @@ function sync_files()
         return
     end
 
-    engine_dir = joinpath(pkgdir(XfaEngine), "src")
-    changed_files = split(readchomp(`git diff --name-only $(engine_dir)`), "\n")
-    @info "Syncing files" changed_files
-
-    for path in changed_files
-        local_path = joinpath(engine_dir, basename(path))
-        remote_path = joinpath(client.remote_engine_dir, "src", basename(path))
-
-        open(remote_path, client.sftp; write=true) do f
-            write(f, read(local_path))
+    client.syncing = true
+    try
+        engine_dir = joinpath(pkgdir(XfaEngine), "src")
+        git_diff = readchomp(`git diff --name-only $(engine_dir)`)
+        if isempty(git_diff)
+            @info "No files to sync"
+            return
         end
+
+        changed_files = split(git_diff, "\n")
+        @info "Syncing files" changed_files
+
+        for path in changed_files
+            local_path = joinpath(engine_dir, basename(path))
+            remote_path = joinpath(client.remote_engine_dir, "src", basename(path))
+
+            # Note that we read `local_path` before opening `remote_path`. This to
+            # avoid the file getting truncated by `open(; write=true)` if we're
+            # SSH'ing locally.
+            data = read(local_path)
+            open(remote_path, client.sftp; write=true) do f
+                write(f, data)
+            end
+        end
+    finally
+        client.syncing = false
     end
 end
+
 
 function initialize_engine(state)
     client = state.client
@@ -450,6 +466,9 @@ function handle_msg(state, msg)
             store = client.variable_data[variable.name]
             push!(store.updates, (variable.tid, variable.data))
         end
+    elseif msg isa RemoteReplState
+        client.remoterepl_mode[] = msg.enabled
+        client.remoterepl_status = msg.enabled ? RemoteReplStatus_Running : RemoteReplStatus_Stopped
     else
         @warn "Received unsupported message of type '$(typeof(msg))'"
     end
@@ -567,4 +586,15 @@ function set_default_topic(state)
     idx = client.default_topic_idx[] + 1 # Add 1 to go from a C index to a Julia index
     topic = client.available_topics[idx]
     send(client.websocket, SetDefaultTopic(topic))
+end
+
+function set_debug_mode(state)
+    client = state.client
+    send(client.websocket, SetDebugMode(client.debug_mode[]))
+end
+
+function set_remoterepl(state)
+    client = state.client
+    client.remoterepl_status = RemoteReplStatus_Changing
+    send(client.websocket, SetRemoteRepl(client.remoterepl_mode[]))
 end

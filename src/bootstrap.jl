@@ -7,8 +7,6 @@ engine_dir = ENV["XFA_ENGINE_DIR"]
 working_dir = ENV["XFA_WORKING_DIR"]
 julia_binary = ENV["XFA_JULIA_BINARY"]
 
-ENV["JULIA_DEBUG"] = "XfaEngine"
-
 @info "Bootstrapping..." environment engine_dir working_dir julia_binary
 
 # Install the package
@@ -50,8 +48,9 @@ if !isfile(toml_path)
     import XfaEngine
     launcher_script = joinpath(dirname(pathof(XfaEngine)), "launcher.jl")
     mkpath(working_dir)
+    nthreads = cld(Sys.CPU_THREADS, 2)
     cd(working_dir) do
-        cmd = `$(julia_binary) --project="$(environment)" --color=no --startup-file=no -t auto $(launcher_script)`
+        cmd = `$(julia_binary) --project="$(environment)" --color=no --startup-file=no -t $(nthreads) $(launcher_script)`
         println("Launching: " * string(cmd))
         run(detach(cmd); wait=false)
     end

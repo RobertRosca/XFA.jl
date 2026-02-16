@@ -1,3 +1,8 @@
+@Group struct MockInput end
+
+update_sources(::MockInput, _) = nothing
+
+
 @Group struct KaraboBridge
     manual_configuration::Parameter{Bool}
     trainmatcher::Parameter{String}

@@ -3,8 +3,9 @@ module Protocol
 export AbstractMessage, Ping, Shutdown,
     GetDevices, LoadContext, ReviseCode,
     ChangeParameter, SetDefaultTopic, Start, Stop,
+    SetDebugMode, SetRemoteRepl,
     Pong, AvailableTopics, Started, Stopped, Devices,
-    ContextInfo, ParameterChanged, TrainData
+    ContextInfo, ParameterChanged, TrainData, RemoteReplState
 
 import Serialization: serialize, deserialize
 
@@ -40,6 +41,14 @@ end
 struct Start <: AbstractMessage end
 struct Stop <: AbstractMessage end
 
+struct SetDebugMode <: AbstractMessage
+    enable::Bool
+end
+
+struct SetRemoteRepl <: AbstractMessage
+    enable::Bool
+end
+
 # Messages that the server can send
 struct Pong <: AbstractMessage end
 
@@ -67,6 +76,11 @@ end
 
 struct TrainData <: AbstractMessage
     variables::Vector{VariableData}
+end
+
+struct RemoteReplState <: AbstractMessage
+    enabled::Bool
+    port::Int
 end
 
 function send(ws::WebSockets.WebSocket, msg::AbstractMessage)

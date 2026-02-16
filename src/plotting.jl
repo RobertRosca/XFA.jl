@@ -2,8 +2,8 @@ mutable struct Plot
     name::String
     id::String
     data::Observable
-    figure::GLMakie.Figure
-    axis::GLMakie.Axis
+    # figure::GLMakie.Figure
+    # axis::GLMakie.Axis
 
     open::Ref{Bool}
     old_limits::Rect2d

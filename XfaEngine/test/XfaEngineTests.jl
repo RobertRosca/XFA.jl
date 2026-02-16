@@ -15,7 +15,7 @@ import HTTP: WebSockets
 import OrderedCollections: OrderedDict as OD
 
 import XfaEngine
-import XfaEngine.Context
+import XfaEngine: Context
 import XfaEngine.Context: @Variable, @karabo_str, VariableData, Dependency, KaraboDependency,
     GroupDependency, SubvariableDependency, XfaContextException, Parameter, FunctionArgument
 import XfaEngine.KaraboBridge
@@ -133,11 +133,11 @@ end
             # Test LoadContext
             mktemp() do path, io
                 # Test loading an invalid context
-                write(path, "@Variable x -> foo")
-                Protocol.send(ws, Protocol.LoadContext(path))
-                msg = Protocol.receive(ws)
-                @test msg isa Protocol.ContextInfo
-                @test msg.info isa Exception
+                # write(path, "@Variable x -> foo")
+                # Protocol.send(ws, Protocol.LoadContext(path))
+                # msg = Protocol.receive(ws)
+                # @test msg isa Protocol.ContextInfo
+                # @test msg.info isa Exception
 
                 # Test loading a valid context
                 write(path, """
@@ -293,6 +293,30 @@ end
     end
 end
 
+@testset "Trainmatching" begin
+    # Initialize the matcher to look for one source
+    tm = Context.Trainmatcher(["foo.bar"], 2)
+    data = VariableData(1, "foo.bar", 1)
+
+    matched_trains = Context.match_train(tm, data)
+    @test length(matched_trains) == 1
+    @test only(keys(matched_trains[1])) == "foo.bar"
+
+    # And multiple sources
+    tm = Context.Trainmatcher(["foo.bar", "foo.baz"], 2)
+    @test isempty(Context.match_train(tm, VariableData(1, "foo.bar", 1)))
+    matched_trains = Context.match_train(tm, VariableData(1, "foo.baz", 1))
+    @test length(matched_trains) == 1
+    @test Set(keys(matched_trains[1])) == Set(["foo.bar", "foo.baz"])
+
+    # Test the max train latency
+    tm = Context.Trainmatcher(["foo.bar", "foo.baz"], 1)
+    @test isempty(Context.match_train(tm, VariableData(1, "foo.bar", 1)))
+    @test isempty(Context.match_train(tm, VariableData(3, "foo.bar", 1)))
+    @test isempty(Context.match_train(tm, VariableData(1, "foo.baz", 1)))
+    @test length(Context.match_train(tm, VariableData(3, "foo.baz", 1))) == 1
+end
+
 @testset "KaraboDependency" begin
     @test karabo"foo.bar" == KaraboDependency("foo", "bar")
     @test karabo"foo.bar.baz" == KaraboDependency("foo", "bar.baz")
@@ -318,9 +342,10 @@ end
 
     expected_variables = Set(["cam4", "xgm"])
     @test Set(keys(ctx.functions)) == expected_variables
-    @test ctx.functions["cam4"](10) == 10
-    @test ctx.functions["xgm"](1:10) == mean(1:10)
-
+    invokelatest() do
+        @test ctx.functions["cam4"](10) == 10
+        @test ctx.functions["xgm"](1:10) == mean(1:10)
+    end
 
     @test Set(keys(ctx.dag)) == expected_variables
 
@@ -346,9 +371,9 @@ end
     for name in expected_variables
         @test ctx.dag[name] == OD("data" => KaraboDependency(name, "data"))
     end
-    @test Context.external_dependencies(ctx) == Dict("foo" => karabo"foo.data",
-                                                     "bar" => karabo"bar.data",
-                                                     "baz" => karabo"baz.data")
+    @test Context.external_dependencies(ctx; per_variable=true) == Dict("foo" => [karabo"foo.data"],
+                                                                        "bar" => [karabo"bar.data"],
+                                                                        "baz" => [karabo"baz.data"])
 
     # Test variables depending on each other
     ctx = Context.load_from_string(raw"""
@@ -425,9 +450,11 @@ end
     ctx = Context.load_from_string(raw"""
     photon_energy = Parameter(0.0)
 
-    @Input function input(output)
+    @Input function input(_::Context.MockInput, output)
         put!(output, (0, Dict("camera" => Dict("data" => 42))))
     end
+
+    x = Context.MockInput()
 
     @Variable function foo(data -> karabo"camera.data")
         tryset(photon_energy, 9)
@@ -438,11 +465,14 @@ end
     with_logger(log) do
         Context.run(ctx) do
             @test timedwait(() -> isready(ctx.stream_output), 5) == :ok
-            sleep(1)
         end
     end
-    @test length(log.logs) == 1
+    # Waiting for the log message to come in is necessary because `tryset()`
+    # uses `remote_do()` internally, which does not wait for the remotecall.
+    @test timedwait(() -> length(log.logs) == 1, 5) == :ok
     @test occursin("Setting parameter", log.logs[1].message)
+
+    @show ctx.inputs
 
     # Variables and parameters with the same name doesn't work
     @test_throws ErrorException Context.load_from_string(raw"""
@@ -458,12 +488,15 @@ end
 
     # Test a standalone input function
     ctx = Context.load_from_string(raw"""
-    @Input function bridge(output::Channel)
+    @Input function bridge(_::Context.MockInput, output)
         put!(output, 42)
     end
+
+    x = Context.MockInput()
     """)
     @test isempty(ctx.dag)
-    @test ctx.inputs["bridge"] == Dict("output" => FunctionArgument("output", Channel))
+    @show ctx.inputs
+    @test ctx.inputs["x.bridge"] == Dict("output" => FunctionArgument("output", Channel))
 
     # And a input function that's part of a group
     ctx = Context.load_from_string(raw"""

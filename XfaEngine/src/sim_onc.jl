@@ -1,54 +1,53 @@
 using Printf
 
-export OnlineCluster, startonc, stoponc, get_all_devices, generatemockdata, generatetrain
 
-mutable struct OnlineCluster
-    servers::Dict{String, KaraboBridgeServer}
-    single_devices::Vector{Device}
-    device_groups::Vector{DeviceGroup}
-    cal_machines::Int
-    running::Bool
-    trainid::Int
-    sent_trains::Int
+# mutable struct OnlineCluster
+#     servers::Dict{String, KaraboBridgeServer}
+#     single_devices::Vector{Device}
+#     device_groups::Vector{DeviceGroup}
+#     cal_machines::Int
+#     running::Bool
+#     trainid::Int
+#     sent_trains::Int
 
-    function OnlineCluster(devices_and_groups::Vector, bridge_ports::Vector{Int}, cal_machines::Int=0)
-        if length(bridge_ports) != 1
-            throw(ArgumentError("Only 1 bridge server is currently supported, but $(length(bridge_ports)) were requested"))
-        end
+#     function OnlineCluster(devices_and_groups::Vector, bridge_ports::Vector{Int}, cal_machines::Int=0)
+#         if length(bridge_ports) != 1
+#             throw(ArgumentError("Only 1 bridge server is currently supported, but $(length(bridge_ports)) were requested"))
+#         end
 
-        if cal_machines < 0
-            throw(ArgumentError("cal_machines must not be negative, is actually: $(cal_machines)"))
-        end
+#         if cal_machines < 0
+#             throw(ArgumentError("cal_machines must not be negative, is actually: $(cal_machines)"))
+#         end
 
-        servers = Dict{String, KaraboBridgeServer}()
-        for port in bridge_ports
-            if port < 0
-                throw(ArgumentError("Invalid port number: $(port)"))
-            end
+#         servers = Dict{String, KaraboBridgeServer}()
+#         for port in bridge_ports
+#             if port < 0
+#                 throw(ArgumentError("Invalid port number: $(port)"))
+#             end
 
-            endpoint = "tcp://127.0.0.1:$(port)"
-            servers[endpoint] = KaraboBridgeServer(endpoint)
-        end
+#             endpoint = "tcp://127.0.0.1:$(port)"
+#             servers[endpoint] = KaraboBridgeServer(endpoint)
+#         end
 
-        single_devices = [d for d in devices_and_groups if d isa Device]
-        device_groups = [d for d in devices_and_groups if d isa DeviceGroup]
+#         single_devices = [d for d in devices_and_groups if d isa Device]
+#         device_groups = [d for d in devices_and_groups if d isa DeviceGroup]
 
-        new_onc = new(servers, single_devices, device_groups, cal_machines, false, 1_000_000_000, 0)
-        return finalizer(new_onc) do onc
-            close(new_onc)
+#         new_onc = new(servers, single_devices, device_groups, cal_machines, false, 1_000_000_000, 0)
+#         return finalizer(new_onc) do onc
+#             close(new_onc)
 
-            for d in vcat(single_devices, device_groups)
-                finalize(d)
-            end
-        end
-    end
-end
+#             for d in vcat(single_devices, device_groups)
+#                 finalize(d)
+#             end
+#         end
+#     end
+# end
 
-function Base.close(onc::OnlineCluster)
-    for server in values(onc.servers)
-        close(server)
-    end
-end
+# function Base.close(onc::OnlineCluster)
+#     for server in values(onc.servers)
+#         close(server)
+#     end
+# end
 
 function get_all_devices(devices_and_groups::Vector)
     devices = Device[]
@@ -66,7 +65,7 @@ function get_all_devices(devices_and_groups::Vector)
     return devices
 end
 
-get_all_devices(onc::OnlineCluster) = get_all_devices(vcat(onc.single_devices, onc.device_groups))
+# get_all_devices(onc::OnlineCluster) = get_all_devices(vcat(onc.single_devices, onc.device_groups))
 
 function generateproperty(value_hint, trainid)
     is_integer(dtype) = supertype(supertype(dtype)) == Integer
@@ -127,59 +126,59 @@ function generatedevice(device::Device; timestamp=-1, trainid=0)
     return data, metadata
 end
 
-function generatetrain(onc::OnlineCluster)
-    timestamp = time()
+# function generatetrain(onc::OnlineCluster)
+#     timestamp = time()
 
-    data = Dict()
-    metadata = Dict()
+#     data = Dict()
+#     metadata = Dict()
 
-    # Generate the fake trainmatcher data
-    for device in get_all_devices(onc)
-        device_data, device_metadata = generatedevice(device; timestamp)
-        merge!(data, device_data)
-        merge!(metadata, device_metadata)
-    end
+#     # Generate the fake trainmatcher data
+#     for device in get_all_devices(onc)
+#         device_data, device_metadata = generatedevice(device; timestamp)
+#         merge!(data, device_data)
+#         merge!(metadata, device_metadata)
+#     end
 
-    return (data, metadata)
-end
+#     return (data, metadata)
+# end
 
-function startonc(onc::OnlineCluster, rate_hz::Real=10)
-    train_delay = 1 / rate_hz
-    onc.running = true
+# function startonc(onc::OnlineCluster, rate_hz::Real=10)
+#     train_delay = 1 / rate_hz
+#     onc.running = true
 
-    start_condition = Condition()
-    t = errormonitor(
-        @async begin
-            server = first(values(onc.servers))
-            server_task = startbridge(server)
+#     start_condition = Condition()
+#     t = errormonitor(
+#         @async begin
+#             server = first(values(onc.servers))
+#             server_task = startbridge(server)
 
-            notify(start_condition)
+#             notify(start_condition)
 
-            while onc.running
-                # Check if we can write to the channel before writing to it. This is so
-                # that if the channel is full we don't get blocked forever and can
-                # respond to stoponc() calls.
-                if timedwait(() -> !isfull(server.channel), 0.5) === :timed_out
-                    continue
-                end
+#             while onc.running
+#                 # Check if we can write to the channel before writing to it. This is so
+#                 # that if the channel is full we don't get blocked forever and can
+#                 # respond to stoponc() calls.
+#                 if timedwait(() -> !isfull(server.channel), 0.5) === :timed_out
+#                     continue
+#                 end
 
-                data, metadata = generatetrain(onc)
+#                 data, metadata = generatetrain(onc)
 
-                # Send the data
-                put!(server, data, metadata)
+#                 # Send the data
+#                 put!(server, data, metadata)
 
-                onc.trainid += 1
-                onc.sent_trains += 1
-                sleep(train_delay)
-            end
+#                 onc.trainid += 1
+#                 onc.sent_trains += 1
+#                 sleep(train_delay)
+#             end
 
-            stopbridge(server)
-            wait(server_task)
-        end
-    )
+#             stopbridge(server)
+#             wait(server_task)
+#         end
+#     )
 
-    wait(start_condition)
-    return t
-end
+#     wait(start_condition)
+#     return t
+# end
 
-stoponc(onc::OnlineCluster) = onc.running = false
+# stoponc(onc::OnlineCluster) = onc.running = false

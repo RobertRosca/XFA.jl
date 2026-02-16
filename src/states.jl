@@ -26,6 +26,12 @@ end
     PipelineStatus_Stopped
 end
 
+@enum RemoteReplStatus begin
+    RemoteReplStatus_Running
+    RemoteReplStatus_Changing
+    RemoteReplStatus_Stopped
+end
+
 """
 A type to help with implementing thread-safe revise-able states.
 
@@ -147,6 +153,8 @@ end
     client_id::String = ""
     worker_info::Dict = Dict()
 
+    debug_mode::Ref{Bool} = Ref(false)
+    syncing::Bool = false
     status::RemoteStatus = RemoteStatus_Unconnected
     websocket::Maybe{WebSockets.WebSocket} = nothing
     ssh_hops::Vector{SshState} = SshState[]
@@ -163,6 +171,8 @@ end
     default_topic_idx::Ref{Cint} = Ref(Cint(0))
     available_topics::Vector{String} = String[]
     webproxy_status::WebproxyStatus = WebproxyStatus_Idle
+    remoterepl_mode::Ref{Bool} = Ref(false)
+    remoterepl_status::RemoteReplStatus = RemoteReplStatus_Stopped
 
     # Context file and pipeline
     context_state::Dict{String, Any} = Dict()

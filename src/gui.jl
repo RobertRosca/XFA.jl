@@ -3,7 +3,6 @@ import Base.ScopedValues: ScopedValue, @with
 include("imnodes.jl")
 include("imgui_helpers.jl")
 
-import GLMakie
 import Observables: Observable
 import DimensionalData as DD
 import DimensionalData: DimArray
@@ -70,14 +69,20 @@ function draw_revise()
 end
 
 function draw_main_menubar()
+    client = state[].client
+
     if ig.BeginMenuBar()
         draw_revise()
 
-        if ig.Button("Sync")
-            @guiasync sync_files()
+        can_sync = client.status == RemoteStatus_Connected && !client.syncing
+        @Disabled !can_sync begin
+            if ig.Button("Sync")
+                @guiasync sync_files()
+            end
+            if client.syncing
+                Spinner()
+            end
         end
-
-        client = state[].client
 
         if ig.BeginMenu("Tools")
             if ig.BeginMenu("Demos")
@@ -139,10 +144,20 @@ end
 
 function clear_variables()
     client = state[].client
-    empty!(client.variable_data)
-    for plot in client.plots
-        plot.open[] = false
+
+    for store in values(client.variable_data)
+        array = store.data[]
+
+        if array isa AbstractVector
+            store.data[] = array[end:end]
+        end
     end
+
+    # empty!(client.variable_data)
+
+    # for plot in client.plots
+    #     plot.open[] = false
+    # end
 end
 
 function draw_dag()
@@ -275,7 +290,7 @@ function draw_dag()
             ImNodes.SetNodeGridSpacePos(node_id, (pos[1], pos[2]))
             client.node_positions[name] = Point2d(-1, -1)
         end
-        
+
         ig.PopID()
     end
 
@@ -546,6 +561,22 @@ function draw_gui()
                 ig.Dummy(0, 2)
                 ig.Separator()
                 ig.Dummy(0, 2)
+
+                ig.Text("Debug mode")
+                ig.SameLine()
+                if ig.Checkbox("##debug-mode", client.debug_mode)
+                    set_debug_mode(state[])
+                end
+
+                @Disabled client.remoterepl_status == RemoteReplStatus_Changing begin
+                    ig.Text("Remote REPL")
+                    ig.SameLine()
+                    if client.remoterepl_status == RemoteReplStatus_Changing
+                        Spinner()
+                    elseif ig.Checkbox("##remoterepl-mode", client.remoterepl_mode)
+                        set_remoterepl(state[])
+                    end
+                end
 
                 ig.Text("Use context file:")
                 ig.SameLine()
