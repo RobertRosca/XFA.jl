@@ -32,86 +32,13 @@ end
     RemoteReplStatus_Stopped
 end
 
-"""
-A type to help with implementing thread-safe revise-able states.
-
-TL;DR:
-- An ExtendableState must have a extras::Dict field to store extra properties
-  dynamically, and a lock::AbstractLock field to lock the state object during
-  modification.
-- To add/remove properties dynamically the extras_defaults(T) method must
-  return a Dict of all extra properties and their default value.
-"""
-abstract type ExtendableState end
-
-extras_defaults(::ExtendableState) = Dict()
-
-function update_extras(state::T) where T <: ExtendableState
-    defaults = extras_defaults(state)
-    extras = getfield(state, :extras)
-
-    # Fast path
-    if keys(defaults) == keys(extras)
-        return
-    end
-
-    for (key, value) in defaults
-        if !haskey(extras, key)
-            extras[key] = value
-        end
-    end
-
-    for key in collect(keys(extras))
-        if !haskey(defaults, key)
-            pop!(extras, key)
-        end
-    end
-end
-
-function Base.getproperty(state::T, sym::Symbol) where T <: ExtendableState
-    update_extras(state)
-
-    if hasfield(T, sym)
-        getfield(state, sym)
-    elseif haskey(state.extras, sym)
-        state.extras[sym]
-    else
-        error("Type $(T) has no field '$(sym)'")
-    end
-end
-
-Base.lock(state::ExtendableState) = lock(state.lock)
-Base.unlock(state::ExtendableState) = unlock(state.lock)
-
-function _state_setproperty!(state::T, sym, x) where T <: ExtendableState
-    if hasfield(T, sym)
-        setfield!(state, sym, x)
-    elseif haskey(state.extras, sym)
-        state.extras[sym] = x
-    else
-        error("Type $(T) has no field '$(sym)'")
-    end
-end
-
-function Base.setproperty!(state::T, sym::Symbol, x) where T <: ExtendableState
-    update_extras(state)
-
-    if getproperty(state, sym) isa ExtendableState
-        _state_setproperty!(state, sym, x)
-    else
-        @lock state begin
-            _state_setproperty!(state, sym, x)
-        end
-    end
-end
-
 mutable struct KbdintPromptState
     msg::String
     display::Bool
     answer::String
 end
 
-@kwdef mutable struct SshState <: ExtendableState
+@kwdef mutable struct SshState
     address::String
     port::Int = 22
 
@@ -123,12 +50,11 @@ end
     password::String = ""
     kbdint_prompts::Vector{KbdintPromptState} = KbdintPromptState[]
 
-    extras::Dict{Symbol, Any} = Dict{Symbol, Any}()
     lock::ReentrantLock = ReentrantLock()
 end
 
-extras_defaults(::SshState) = Dict(
-)
+Base.lock(state::SshState) = lock(state.lock)
+Base.unlock(state::SshState) = unlock(state.lock)
 
 function Base.close(state::SshState)
     if !isnothing(state.forwarder)
@@ -164,7 +90,7 @@ end
 
 VariableStore(data) = VariableStore(Channel(100), data, VariableType_Unknown, -1)
 
-@kwdef mutable struct ClientState <: ExtendableState
+@kwdef mutable struct ClientState
     client_id::String = ""
     worker_info::Dict = Dict()
 
@@ -204,12 +130,11 @@ VariableStore(data) = VariableStore(Channel(100), data, VariableType_Unknown, -1
     variable_data::Dict{String, VariableStore} = Dict()
     plots::Vector{Union{Plot, CorrelationPlot}} = Union{Plot, CorrelationPlot}[]
 
-    extras::Dict{Symbol, Any} = Dict{Symbol, Any}()
     lock::ReentrantLock = ReentrantLock()
 end
 
-extras_defaults(::ClientState) = Dict(
-)
+Base.lock(state::ClientState) = lock(state.lock)
+Base.unlock(state::ClientState) = unlock(state.lock)
 
 function Base.show(io::IO, client::ClientState)
     print(io, ClientState, "(client_id=$(client.client_id), $(client.status), $(length(client.ssh_hops)) SSH hops)")
@@ -243,7 +168,7 @@ function Base.close(client::ClientState)
     empty!(client.variable_data)
 end
 
-@kwdef mutable struct GuiState <: ExtendableState
+@kwdef mutable struct GuiState
     disable_rendering::Bool = false
 
     # Showing external tool windows
@@ -258,14 +183,32 @@ end
     address::String = "wrigleyj@exflonc202.desy.de"
     client::ClientState = ClientState()
     engine_environment::String = "@xfa-default"
+    client_type_current_item::Cint = Cint(0)
 
-    extras::Dict{Any, Any} = Dict()
     lock::ReentrantLock = ReentrantLock()
 end
 
-extras_defaults(::GuiState) = Dict(
-    :client_type_current_item => Ref(Cint(0))
-)
+function GuiState(settings::Dict; kwargs...)
+    address = get(settings, "address", "wrigleyj@exflonc202.desy.de")
+    engine_environment = get(settings, "engine_environment", "@xfa-default")
+    client_type_current_item = Cint(get(settings, "client_type", 0))
+
+    plots = map(get(settings, "plots", Dict[])) do p
+        if p["type"] == "Plot"
+            Plot(p["name"])
+        else
+            CorrelationPlot()
+        end
+    end
+    client = ClientState(; embedded_engine = client_type_current_item == 1, plots)
+
+    GuiState(; address, engine_environment, client_type_current_item, client, kwargs...)
+end
+
+function Base.setproperty!(state::GuiState, sym::Symbol, x)
+    @lock state setfield!(state, sym, x)
+    save_settings(state, sym)
+end
 
 function Base.show(io::IO, state::GuiState)
     print(io, GuiState, "(engine_environment=\"$(state.engine_environment)\")")

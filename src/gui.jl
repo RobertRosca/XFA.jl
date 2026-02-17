@@ -196,6 +196,7 @@ function draw_dag()
     @Disabled isempty(client.variable_data) begin
         if ig.Button("Correlate")
             push!(client.plots, CorrelationPlot())
+            save_state(state[])
         end
     end
 
@@ -279,6 +280,7 @@ function draw_dag()
                 if haskey(client.variable_data, output_name)
                     if ig.Button("$(label)###plot_button")
                         push!(client.plots, Plot(output_name))
+                        save_state(state[])
                     end
                 else
                     ig.Text(label)
@@ -454,11 +456,15 @@ function draw_plots()
     end
 
     # Remove closed plots
+    n = length(client.plots)
     for i in reverse(eachindex(client.plots))
         if !client.plots[i].open[]
             close(client.plots[i])
             deleteat!(client.plots, i)
         end
+    end
+    if length(client.plots) != n
+        save_state(state[])
     end
 end
 
@@ -496,9 +502,9 @@ function draw_gui()
             end
 
             @Disabled !can_connect begin
-                ig.Combo("##client-type", state[].client_type_current_item,
-                         ["Connect to remote", "Create local engine"])
-                client.embedded_engine = state[].client_type_current_item[] == 1
+                @c ig.Combo("##client-type", &state[].client_type_current_item,
+                           ["Connect to remote", "Create local engine"])
+                client.embedded_engine = state[].client_type_current_item == 1
 
                 ig.Spacing()
 
@@ -662,8 +668,8 @@ function draw_gui()
 end
 
 """Start the XFA GUI."""
-function main()
-    gui_state = GuiState(; disable_rendering=false)
+function main(; test_engine=nothing)
+    gui_state = GuiState(load_settings())
 
     # Setup Dear ImGui context
     ig.set_backend(:GlfwOpenGL3)
@@ -715,7 +721,7 @@ function main()
         empty!(ImGuiHelpers.safe_input_text_cache)
         close(gui_state)
     end
-    t = ig.render(imgui_ctx; on_exit, window_title="XFA", wait=false, spawn=true) do
+    t = ig.render(imgui_ctx; on_exit, window_title="XFA", wait=false, spawn=true, engine=test_engine) do
         if gui_state.disable_rendering
             # Occasionally an exception will occur in the middle of a disabled
             # section, which helpfully also disables the continue button
