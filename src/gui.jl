@@ -11,8 +11,7 @@ include("imnodes.jl")
 include("imgui_helpers.jl")
 
 using NaNStatistics: nanmaximum, nanminimum
-using DimensionalData: DimensionalData as DD, DimVector, DimMatrix, DimArray
-import GeometryBasics: Point2d
+using DimensionalData: DimensionalData as DD, DimVector, DimMatrix, DimArray, At, lookup
 include("plotting.jl")
 
 import LibSSH as ssh
@@ -151,11 +150,9 @@ function clear_variables()
         end
     end
 
-    # empty!(client.variable_data)
-
-    # for plot in client.plots
-    #     plot.open[] = false
-    # end
+    for plot in client.plots
+        clear_plot(plot)
+    end
 end
 
 function draw_dag()
@@ -189,14 +186,15 @@ function draw_dag()
     @Disabled client.pipeline_status in changing_states begin
         if ig.Button("Load context")
             load_context(state[])
+            restore_plots(state[])
         end
     end
 
     ig.SameLine()
     @Disabled isempty(client.variable_data) begin
         if ig.Button("Correlate")
-            push!(client.plots, CorrelationPlot())
-            save_state(state[])
+            push!(client.plots, CorrelationPlot(client.plot_counter))
+            client.plot_counter += 1
         end
     end
 
@@ -279,8 +277,8 @@ function draw_dag()
             if !isempty(label)
                 if haskey(client.variable_data, output_name)
                     if ig.Button("$(label)###plot_button")
-                        push!(client.plots, Plot(output_name))
-                        save_state(state[])
+                        push!(client.plots, Plot(output_name, client.plot_counter))
+                        client.plot_counter += 1
                     end
                 else
                     ig.Text(label)
@@ -294,7 +292,8 @@ function draw_dag()
 
         pos = client.node_positions[name]
         if pos != Point2d(-1, -1)
-            ImNodes.SetNodeGridSpacePos(node_id, (pos[1], pos[2]))
+            @show "Setting $name to $(pos)"
+            ImNodes.SetNodeGridSpacePos(node_id, (pos.x, pos.y))
             client.node_positions[name] = Point2d(-1, -1)
         end
 
@@ -309,6 +308,12 @@ function draw_dag()
 
     ImNodes.MiniMap()
     ImNodes.EndNodeEditor()
+
+    if ig.GetFrameCount() % (2 * 60) == 0
+        if !isempty(client.context_state)
+            save_settings(client)
+        end
+    end
 end
 
 function draw_ssh_auth()
@@ -421,19 +426,71 @@ function draw_ssh_auth()
     end
 end
 
+function restore_plots(state::GuiState)
+    client = state.client
+    ctx_path = client.context_path
+    if !haskey(state.saved_contexts, ctx_path)
+        return
+    end
+
+    ctx = state.saved_contexts[ctx_path]
+
+    if haskey(ctx, "node_positions") && isempty(client.node_positions)
+        saved_positions = ctx["node_positions"]
+        for (name, pos) in saved_positions
+            client.node_positions[name] = Point2d(pos[1], pos[2])
+        end
+    end
+
+    ## Code to restore plots is buggy, so it's disabled for now
+
+    # # Close existing plots before restoring
+    # for plot in gui_state.client.plots
+    #     close(plot)
+    # end
+    # empty!(gui_state.client.plots)
+
+    # for p in get(ctx, "plots", [])
+    #     dock_id = UInt32(get(p, "dock_id", 0))
+    #     if p["type"] == "Plot"
+    #         push!(gui_state.client.plots, Plot(p["name"], p["id"], dock_id))
+    #     else
+    #         push!(gui_state.client.plots, CorrelationPlot(p["id"], dock_id))
+    #     end
+    # end
+
+    # gui_state.plot_counter = Int(get(ctx, "plot_counter", 0))
+
+    # layout = get(ctx, "saved_layout", "")
+    # if !isempty(layout)
+    #     # Load the INI to restore dock node topology, then explicitly assign
+    #     # each window to its saved dock node. DockBuilderDockWindow stores the
+    #     # assignment in ImGui's window settings; it takes effect on the next
+    #     # frame once the dock nodes are recreated from the INI.
+    #     ig.LoadIniSettingsFromMemory(layout)
+    #     # for plot in gui_state.client.plots
+    #     #     if plot.dock_id != 0
+    #     #         ig.DockBuilderDockWindow(plot.id, plot.dock_id)
+    #     #     end
+    #     # end
+    # end
+end
+
 function draw_plots()
     client = state[].client
 
     # Update all the observables
-    updated_variables = String[]
+    updated_variables = Dict{String, Set{Int}}()
     for (name, store) in client.variable_data
         if !isready(store.updates)
             continue
         end
 
         array = store.data
+        new_tids = Set{Int}()
         while isready(store.updates)
             tid, x, type = take!(store.updates)
+            push!(new_tids, tid)
             store.type = type
             if x isa Number
                 push!(array, x, (; trainId=tid))
@@ -443,15 +500,17 @@ function draw_plots()
             end
         end
 
-        push!(updated_variables, name)
+        updated_variables[name] = new_tids
     end
 
     # Draw plot windows
     for plot in client.plots
         if plot isa CorrelationPlot
-            draw_plot(plot, client.variable_data)
+            draw_plot(plot, client.variable_data, updated_variables)
         else
-            draw_plot(plot, client.variable_data[plot.name].data, plot.name in updated_variables)
+            store = get(client.variable_data, plot.name, nothing)
+            data = isnothing(store) ? nothing : store.data
+            draw_plot(plot, data, !isnothing(store) && haskey(updated_variables, plot.name))
         end
     end
 
@@ -464,7 +523,7 @@ function draw_plots()
         end
     end
     if length(client.plots) != n
-        save_state(state[])
+        save_settings(client)
     end
 end
 
@@ -665,6 +724,13 @@ function draw_gui()
             setproperty!(state[], window_sym, do_show)
         end
     end
+
+    # Save layout when ImGui signals changes
+    io = ig.GetIO()
+    if unsafe_load(io.WantSaveIniSettings) && !isempty(state[].client.plots)
+        save_settings(client)
+        io.WantSaveIniSettings = false
+    end
 end
 
 """Start the XFA GUI."""
@@ -705,13 +771,30 @@ function main(; test_engine=nothing)
     io.ConfigFlags = unsafe_load(io.ConfigFlags) | ig.ImGuiConfigFlags_DockingEnable
     io.ConfigFlags = unsafe_load(io.ConfigFlags) | ig.ImGuiConfigFlags_ViewportsEnable
 
-    # # Disable INI file
-    # io.WantSaveIniSettings = false
-    # io.IniFilename = C_NULL
+    # Disable built-in INI file — we manage layout persistence ourselves
+    io.IniFilename = C_NULL
 
     on_exit = () -> begin
+        client = gui_state.client
+
+        # Save layout and node positions before tearing down
+        if !isempty(client.plots) || !isempty(client.context_state)
+            save_settings(client)
+        end
+
+        # Disconnect from engine if connected
+        if client.status == RemoteStatus_Connected && !isnothing(client.websocket)
+            if !WebSockets.isclosed(client.websocket)
+                try
+                    send(client.websocket, Shutdown())
+                    timedwait(() -> WebSockets.isclosed(client.websocket), 5)
+                catch
+                end
+            end
+        end
+
         # Clean up GPU heatmap resources before destroying contexts
-        for plot in gui_state.client.plots
+        for plot in client.plots
             close(plot)
         end
         destroy_heatmap_context!()

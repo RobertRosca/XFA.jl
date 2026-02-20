@@ -126,15 +126,28 @@ VariableStore(data) = VariableStore(Channel(100), data, VariableType_Unknown, -1
     trainmatchers::Dict{String, Any} = Dict()
     karabo_devices::Dict{String, Any} = Dict()
 
-    # Variables
+    # Variables and plots
     variable_data::Dict{String, VariableStore} = Dict()
+    plot_counter::Int = 0
     plots::Vector{Union{Plot, CorrelationPlot}} = Union{Plot, CorrelationPlot}[]
 
     lock::ReentrantLock = ReentrantLock()
 end
 
+function ClientState(settings::Dict; kwargs...)
+    client_settings = get(settings, "ClientState", Dict{String, Any}())
+    context_path = get(client_settings, "context_path", "")
+
+    ClientState(; context_path, kwargs...)
+end
+
 Base.lock(state::ClientState) = lock(state.lock)
 Base.unlock(state::ClientState) = unlock(state.lock)
+
+function Base.setproperty!(state::ClientState, sym::Symbol, x)
+    @lock state setfield!(state, sym, x)
+    save_settings(state, sym)
+end
 
 function Base.show(io::IO, client::ClientState)
     print(io, ClientState, "(client_id=$(client.client_id), $(client.status), $(length(client.ssh_hops)) SSH hops)")
@@ -185,24 +198,27 @@ end
     engine_environment::String = "@xfa-default"
     client_type_current_item::Cint = Cint(0)
 
+    # Plot layout persistence, keyed by context path
+    saved_contexts::Dict{String, Dict{String, Any}} = Dict()
+
     lock::ReentrantLock = ReentrantLock()
 end
 
 function GuiState(settings::Dict; kwargs...)
-    address = get(settings, "address", "wrigleyj@exflonc202.desy.de")
-    engine_environment = get(settings, "engine_environment", "@xfa-default")
-    client_type_current_item = Cint(get(settings, "client_type", 0))
+    gui = get(settings, "GuiState", Dict{String, Any}())
+    client_settings = get(settings, "ClientState", Dict{String, Any}())
 
-    plots = map(get(settings, "plots", Dict[])) do p
-        if p["type"] == "Plot"
-            Plot(p["name"])
-        else
-            CorrelationPlot()
-        end
-    end
-    client = ClientState(; embedded_engine = client_type_current_item == 1, plots)
+    address = get(gui, "address", "wrigleyj@exflonc202.desy.de")
+    engine_environment = get(gui, "engine_environment", "@xfa-default")
+    client_type_current_item = Cint(get(gui, "client_type", 0))
+    saved_contexts = Dict{String, Dict{String, Any}}(
+        k => Dict{String, Any}(v) for (k, v)
+            in get(client_settings, "contexts", Dict()))
 
-    GuiState(; address, engine_environment, client_type_current_item, client, kwargs...)
+    client = ClientState(settings; embedded_engine = client_type_current_item == 1)
+
+    GuiState(; address, engine_environment, client_type_current_item,
+             saved_contexts, client, kwargs...)
 end
 
 function Base.setproperty!(state::GuiState, sym::Symbol, x)

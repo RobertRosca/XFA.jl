@@ -473,12 +473,12 @@ mutable struct Plot
     const autofit::Ref{Bool}
     const fixed_aspect::Ref{Bool}
     gpu_heatmap::Union{Nothing, GPUHeatmap}
+    dock_id::UInt32
 end
 
-function Plot(name)
-    id = name * "##" * String(rand('a':'z', 10))
-    return Plot(name, id, Ref(true), Ref(true), Ref(true), nothing)
-end
+Plot(name, counter::Int) = Plot(name, "$(name)##plot-$(counter)")
+
+Plot(name, id::String, dock_id = 0) = Plot(name, id, Ref(true), Ref(true), Ref(true), nothing, UInt32(dock_id))
 
 function Base.close(plot::Plot)
     if !isnothing(plot.gpu_heatmap)
@@ -486,6 +486,8 @@ function Base.close(plot::Plot)
         plot.gpu_heatmap = nothing
     end
 end
+
+clear_plot(::Plot) = nothing
 
 function check_plot_interaction!(plot)
     if !plot.autofit[]
@@ -505,10 +507,22 @@ function check_plot_interaction!(plot)
     end
 end
 
+function draw_plot(plot::Plot, data::Nothing, was_updated)
+    ig.SetNextWindowSize((800, 500), ig.ImGuiCond_FirstUseEver)
+
+    if ig.Begin(plot.id, plot.open)
+        plot.dock_id = ig.GetWindowDockID()
+        ig.Text("Waiting for data: $(plot.name)")
+    end
+
+    ig.End()
+end
+
 function draw_plot(plot::Plot, data, was_updated)
     ig.SetNextWindowSize((800, 500), ig.ImGuiCond_FirstUseEver)
 
     if ig.Begin(plot.id, plot.open)
+        plot.dock_id = ig.GetWindowDockID()
         is_dimarray = data isa DimArray
         data_dims = is_dimarray ? DD.dims(data) : nothing
         xlabel = is_dimarray ? DD.label(data_dims[1]) : ""
@@ -523,7 +537,11 @@ function draw_plot(plot::Plot, data, was_updated)
 
         if data isa AbstractVector
             if ImPlot.BeginPlot(plot.id, xlabel, "", plot_size)
-                ImPlot.PlotLine(label, data)
+                if is_dimarray
+                    ImPlot.PlotLine(label, parent(lookup(data)[1]), parent(data))
+                else
+                    ImPlot.PlotLine(label, data)
+                end
                 check_plot_interaction!(plot)
                 ImPlot.EndPlot()
             end
@@ -574,15 +592,29 @@ end
 # --- Correlation plot ---
 
 @kwdef mutable struct CorrelationPlot
-    const id::String = "CorrelationPlot##" * String(rand('a':'z', 10))
+    const id::String
     const open::Ref{Bool} = Ref(true)
     const variable_names::Vector{String} = String[]
     const x_var::Ref{Cint} = Ref(Cint(0))
     const y_var::Ref{Cint} = Ref(Cint(0))
-    const x_data::Vector = Float64[]
-    const y_data::Vector = Float64[]
+    const x_data::Vector{Float64} = Float64[]
+    const y_data::Vector{Float64} = Float64[]
     const autofit::Ref{Bool} = Ref(true)
     trainId::Int = -1
+    dock_id::UInt32 = 0
+end
+
+function clear_plot(plot::CorrelationPlot)
+    empty!(plot.x_data)
+    empty!(plot.y_data)
+end
+
+function CorrelationPlot(counter::Integer)
+    CorrelationPlot(; id="CorrelationPlot##plot-$(counter)")
+end
+
+function CorrelationPlot(id::String, dock_id::Integer = 0)
+    CorrelationPlot(; id, dock_id=UInt32(dock_id))
 end
 
 Base.close(::CorrelationPlot) = nothing
@@ -610,6 +642,7 @@ function _var_combo(label, selected::Ref{Cint}, var_names, variable_data)
     end
     ig.SetNextItemWidth(250)
 
+    changed = false
     if ig.BeginCombo(label, preview)
         for (i, name) in enumerate(var_names)
             if variable_data[name].type ∉ (VariableType_Scalar, VariableType_Vector)
@@ -619,6 +652,7 @@ function _var_combo(label, selected::Ref{Cint}, var_names, variable_data)
             is_selected = selected[] == i - 1
             if ig.Selectable(name, is_selected)
                 selected[] = i - 1
+                changed = true
             end
 
             ig.SameLine()
@@ -631,9 +665,17 @@ function _var_combo(label, selected::Ref{Cint}, var_names, variable_data)
 
         ig.EndCombo()
     end
+
+    return changed
 end
 
-function draw_plot(plot::CorrelationPlot, variable_data)
+function swap_arrays(x, y)
+    for i in eachindex(x, y)
+        x[i], y[i] = y[i], x[i]
+    end
+end
+
+function draw_plot(plot::CorrelationPlot, variable_data, updated_variables)
     # Update variable names
     empty!(plot.variable_names)
     for (name, variable) in variable_data
@@ -645,23 +687,33 @@ function draw_plot(plot::CorrelationPlot, variable_data)
 
     ig.SetNextWindowSize((800, 500), ig.ImGuiCond_FirstUseEver)
 
+    # Clamp indices to valid range
+    n_variables = length(plot.variable_names)
+    if n_variables > 0
+        plot.x_var[] = clamp(plot.x_var[], 0, n_variables - 1)
+        plot.y_var[] = clamp(plot.y_var[], 0, n_variables - 1)
+    end
+
     if ig.Begin(plot.id, plot.open)
-        n = length(plot.variable_names)
-
-        # Clamp indices to valid range
-        if n > 0
-            plot.x_var[] = clamp(plot.x_var[], 0, n - 1)
-            plot.y_var[] = clamp(plot.y_var[], 0, n - 1)
+        plot.dock_id = ig.GetWindowDockID()
+        if ig.Button("Swap axes")
+            plot.x_var[], plot.y_var[] = plot.y_var[], plot.x_var[]
+            swap_arrays(plot.x_data, plot.y_data)
         end
-
-        _var_combo("X", plot.x_var, plot.variable_names, variable_data)
         ig.SameLine()
-        _var_combo("Y", plot.y_var, plot.variable_names, variable_data)
+        x_changed = _var_combo("X", plot.x_var, plot.variable_names, variable_data)
+        ig.SameLine()
+        y_changed = _var_combo("Y", plot.y_var, plot.variable_names, variable_data)
+
+        if x_changed || y_changed
+            empty!(plot.x_data)
+            empty!(plot.y_data)
+        end
 
         region_avail = ig.GetContentRegionAvail()
         plot_size = ImVec2(region_avail.x, max(region_avail.y - 30, 100))
 
-        if n > 0
+        if n_variables > 0
             x_name = plot.variable_names[plot.x_var[] + 1]
             y_name = plot.variable_names[plot.y_var[] + 1]
             x = variable_data[x_name]
@@ -672,36 +724,51 @@ function draw_plot(plot::CorrelationPlot, variable_data)
             if x.type != y.type
                 ig.Text("Both variables must have the same type to correlate against each other.")
             else
-                # Only update both buffers together when both variables have
-                # data from the same train.
-                needs_copy = x.type == VariableType_Vector && x.trainId == y.trainId && x.trainId != plot.trainId
-                if needs_copy
-                    resize!(plot.x_data, length(x.data))
-                    resize!(plot.y_data, length(y.data))
-                    copyto!(plot.x_data, x.data)
-                    copyto!(plot.y_data, y.data)
-                    plot.trainId = x.trainId
-                end
-
                 if plot.autofit[]
                     ImPlot.SetNextAxesToFit()
                 end
 
-                if x_dimarray && y_dimarray
-                    ig.Text("Unsupported")
-                else
-                    if ImPlot.BeginPlot(plot.id, x_name, y_name, plot_size)
-                        len = min(length(x.data), length(y.data))
+                if x.type == VariableType_Scalar
+                    if haskey(updated_variables, x_name) || haskey(updated_variables, y_name)
+                        new_tids = get(updated_variables, x_name, Set{Int}())
+                        intersect!(new_tids, get(updated_variables, x_name, Set{Int}()))
 
-                        if len > 0
-                            ImPlot.PushStyleVar(ImPlot.ImPlotStyleVar_FillAlpha, 0.5)
-                            ImPlot.PlotScatter("$(x_name) vs $(y_name)",
-                                               plot.x_data, plot.y_data)
-                            ImPlot.PopStyleVar()
+                        for tid in new_tids
+                            if tid in lookup(x.data, :trainId) && tid in lookup(y.data, :trainId)
+                                push!(plot.x_data, x.data[trainId=At(tid)])
+                                push!(plot.y_data, y.data[trainId=At(tid)])
+                            end
                         end
+                    end
+
+                    if ImPlot.BeginPlot(plot.id, x_name, y_name, plot_size)
+                        ImPlot.PushStyleVar(ImPlot.ImPlotStyleVar_FillAlpha, 0.5)
+                        ImPlot.PlotScatter("$(x_name) vs $(y_name)", plot.x_data, plot.y_data)
+                        ImPlot.PopStyleVar()
                         check_plot_interaction!(plot)
                         ImPlot.EndPlot()
                     end
+                elseif x.type == VariableType_Vector
+                    # Only update both buffers together when both variables have
+                    # data from the same train.
+                    needs_copy = x.type == VariableType_Vector && x.trainId == y.trainId && x.trainId != plot.trainId
+                    if needs_copy
+                        resize!(plot.x_data, length(x.data))
+                        resize!(plot.y_data, length(y.data))
+                        copyto!(plot.x_data, x.data)
+                        copyto!(plot.y_data, y.data)
+                        plot.trainId = x.trainId
+                    end
+
+                    if ImPlot.BeginPlot(plot.id, x_name, y_name, plot_size)
+                        ImPlot.PushStyleVar(ImPlot.ImPlotStyleVar_FillAlpha, 0.5)
+                        ImPlot.PlotScatter("$(x_name) vs $(y_name)", plot.x_data, plot.y_data)
+                        ImPlot.PopStyleVar()
+                        check_plot_interaction!(plot)
+                        ImPlot.EndPlot()
+                    end
+                else
+                    ig.Text("Unsupported correlation of data type '$(x.type)'")
                 end
 
                 ig.Checkbox("Autofit", plot.autofit)

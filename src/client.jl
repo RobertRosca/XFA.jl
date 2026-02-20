@@ -291,7 +291,9 @@ function disconnect_engine(state, shutdown_engine)
     end
 
     close(state.client)
-    state.client = ClientState()
+    # Note that we use setfield!() here to bypass the locking, which would
+    # otherwise cause locking mismatches.
+    setfield!(state, :client, ClientState(load_settings()))
 end
 
 # Create a Int32 hash to use for ImNodes
