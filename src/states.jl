@@ -90,6 +90,38 @@ end
 
 VariableStore(data) = VariableStore(Channel(100), data, VariableType_Unknown, -1)
 
+@kwdef mutable struct ContextState
+    context_state::Dict{String, Any} = Dict()
+    context_path::String = ""
+    node_positions::Dict{String, Point2d} = Dict()
+    pipeline_status::PipelineStatus = PipelineStatus_Stopped
+
+    lock::ReentrantLock = ReentrantLock()
+end
+
+function ContextState(settings::Dict; kwargs...)
+    client_settings = get(settings, "ClientState", Dict{String, Any}())
+    context_path = get(client_settings, "context_path", "")
+
+    node_positions = Dict{String, Point2d}()
+    contexts = get(client_settings, "contexts", Dict())
+    if haskey(contexts, context_path)
+        saved_positions = get(contexts[context_path], "node_positions", Dict())
+        for (name, pos) in saved_positions
+            node_positions[name] = Point2d(pos[1], pos[2])
+        end
+    end
+
+    ContextState(; context_path, node_positions, kwargs...)
+end
+
+Base.lock(ctx::ContextState) = lock(ctx.lock)
+Base.unlock(ctx::ContextState) = unlock(ctx.lock)
+
+function Base.setproperty!(ctx::ContextState, sym::Symbol, x)
+    @lock ctx setfield!(ctx, sym, x)
+end
+
 @kwdef mutable struct ClientState
     client_id::String = ""
     worker_info::Dict = Dict()
@@ -116,11 +148,9 @@ VariableStore(data) = VariableStore(Channel(100), data, VariableType_Unknown, -1
     remoterepl_status::RemoteReplStatus = RemoteReplStatus_Stopped
 
     # Context file and pipeline
-    context_state::Dict{String, Any} = Dict()
     context_path::String = ""
     context_path_valid::Bool = false
-    node_positions::Dict{String, Point2d} = Dict()
-    pipeline_status::PipelineStatus = PipelineStatus_Stopped
+    context::ContextState = ContextState()
 
     # Karabo status
     trainmatchers::Dict{String, Any} = Dict()
@@ -137,12 +167,20 @@ end
 function ClientState(settings::Dict; kwargs...)
     client_settings = get(settings, "ClientState", Dict{String, Any}())
     context_path = get(client_settings, "context_path", "")
+    context = ContextState(settings)
 
-    ClientState(; context_path, kwargs...)
+    ClientState(; context_path, context, kwargs...)
 end
 
-Base.lock(state::ClientState) = lock(state.lock)
-Base.unlock(state::ClientState) = unlock(state.lock)
+function Base.lock(state::ClientState)
+    lock(state.lock)
+    lock(state.context)
+end
+
+function Base.unlock(state::ClientState)
+    unlock(state.context)
+    unlock(state.lock)
+end
 
 function Base.setproperty!(state::ClientState, sym::Symbol, x)
     @lock state setfield!(state, sym, x)

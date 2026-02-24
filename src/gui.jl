@@ -156,11 +156,12 @@ function clear_variables()
 end
 
 function draw_dag()
-    ctx_state = state[].client.context_state
     client = state[].client
+    context = client.context
+    ctx_state = context.context_state
 
     ig.Dummy(0, 10)
-    @Disabled isempty(client.context_state) || client.pipeline_status != PipelineStatus_Stopped begin
+    @Disabled isempty(ctx_state) || context.pipeline_status != PipelineStatus_Stopped begin
         if ig.Button(" Start ")
             start(state[])
         end
@@ -168,7 +169,7 @@ function draw_dag()
 
     ig.SameLine()
 
-    @Disabled client.pipeline_status != PipelineStatus_Started begin
+    @Disabled context.pipeline_status != PipelineStatus_Started begin
         if ig.Button(" Stop ")
             stop(state[])
         end
@@ -183,7 +184,7 @@ function draw_dag()
 
     ig.SameLine()
     changing_states = (PipelineStatus_Starting, PipelineStatus_Stopping, PipelineStatus_LoadingContext)
-    @Disabled client.pipeline_status in changing_states begin
+    @Disabled context.pipeline_status in changing_states begin
         if ig.Button("Load context")
             load_context(state[])
             restore_plots(state[])
@@ -198,7 +199,7 @@ function draw_dag()
         end
     end
 
-    if client.pipeline_status in changing_states
+    if context.pipeline_status in changing_states
         ig.SameLine()
         Spinner()
     end
@@ -290,11 +291,10 @@ function draw_dag()
 
         ImNodes.EndNode()
 
-        pos = client.node_positions[name]
+        pos = context.node_positions[name]
         if pos != Point2d(-1, -1)
-            @show "Setting $name to $(pos)"
             ImNodes.SetNodeGridSpacePos(node_id, (pos.x, pos.y))
-            client.node_positions[name] = Point2d(-1, -1)
+            context.node_positions[name] = Point2d(-1, -1)
         end
 
         ig.PopID()
@@ -309,8 +309,11 @@ function draw_dag()
     ImNodes.MiniMap()
     ImNodes.EndNodeEditor()
 
-    if ig.GetFrameCount() % (2 * 60) == 0
-        if !isempty(client.context_state)
+    # Timer to save the current settings periodically. Mostly useful for the
+    # node positions.
+    framerate = round(Int, unsafe_load(ig.GetIO().Framerate))
+    if ig.GetFrameCount() % (5 * framerate) == 0
+        if !isempty(ctx_state)
             save_settings(client)
         end
     end
@@ -435,10 +438,11 @@ function restore_plots(state::GuiState)
 
     ctx = state.saved_contexts[ctx_path]
 
-    if haskey(ctx, "node_positions") && isempty(client.node_positions)
+    context = client.context
+    if haskey(ctx, "node_positions") && isempty(context.node_positions)
         saved_positions = ctx["node_positions"]
         for (name, pos) in saved_positions
-            client.node_positions[name] = Point2d(pos[1], pos[2])
+            context.node_positions[name] = Point2d(pos[1], pos[2])
         end
     end
 
@@ -778,7 +782,7 @@ function main(; test_engine=nothing)
         client = gui_state.client
 
         # Save layout and node positions before tearing down
-        if !isempty(client.plots) || !isempty(client.context_state)
+        if !isempty(client.plots) || !isempty(client.context.context_state)
             save_settings(client)
         end
 

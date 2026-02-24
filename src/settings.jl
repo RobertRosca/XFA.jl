@@ -69,9 +69,9 @@ function save_settings(client::ClientState, updated_field=nothing)
     contexts = get!(client_settings, "contexts", Dict{String, Any}())
 
     # Query actual node positions from ImNodes rather than using
-    # client.node_positions, which contains stale sentinel values.
+    # client.context.node_positions, which contains stale sentinel values.
     node_positions = Dict{String, Vector}()
-    for (name, var_data) in client.context_state
+    for (name, var_data) in client.context.context_state
         pos = ImNodes.GetNodeGridSpacePos(var_data["id"])
         node_positions[name] = [pos.x, pos.y]
     end

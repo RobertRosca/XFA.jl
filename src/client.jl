@@ -395,7 +395,7 @@ function build_context_state(state, ctx_info)
         end
     end
 
-    state.client.node_positions = merge(new_positions, state.client.node_positions)
+    state.client.context.node_positions = merge(new_positions, state.client.context.node_positions)
 
     return ctx_state
 end
@@ -428,9 +428,9 @@ function handle_msg(state, msg)
             set_default_topic(state)
         end
     elseif msg isa Started
-        client.pipeline_status = PipelineStatus_Started
+        client.context.pipeline_status = PipelineStatus_Started
     elseif msg isa Stopped
-        client.pipeline_status = PipelineStatus_Stopped
+        client.context.pipeline_status = PipelineStatus_Stopped
     elseif msg isa Devices
         if msg.device_names isa Exception
             @error "Error from server with DEVICES" exception=msg
@@ -443,12 +443,12 @@ function handle_msg(state, msg)
         end
     elseif msg isa ContextInfo
         if msg.info isa Dict
-            client.context_state = build_context_state(state, msg.info)
+            client.context.context_state = build_context_state(state, msg.info)
         else
             @error "Context failed to load"
         end
 
-        client.pipeline_status = msg.is_running ? PipelineStatus_Started : PipelineStatus_Stopped
+        client.context.pipeline_status = msg.is_running ? PipelineStatus_Started : PipelineStatus_Stopped
     elseif msg isa TrainData
         for variable in msg.variables
             is_new = !haskey(client.variable_data, variable.name)
@@ -568,7 +568,7 @@ end
 function load_context(state)
     client = state.client
     send(client.websocket, LoadContext(client.context_path))
-    client.pipeline_status = PipelineStatus_LoadingContext
+    client.context.pipeline_status = PipelineStatus_LoadingContext
 end
 
 function revise_engine(state)
@@ -584,12 +584,12 @@ end
 
 function start(state)
     send(state.client.websocket, Start())
-    state.client.pipeline_status = PipelineStatus_Starting
+    state.client.context.pipeline_status = PipelineStatus_Starting
 end
 
 function stop(state)
     send(state.client.websocket, Stop())
-    state.client.pipeline_status = PipelineStatus_Stopping
+    state.client.context.pipeline_status = PipelineStatus_Stopping
 end
 
 function set_default_topic(state)
