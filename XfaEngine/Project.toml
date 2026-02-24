@@ -21,7 +21,7 @@ TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 ZMQ = "c2297ded-f4af-51ae-bb23-16f91089e4e1"
 
 [compat]
-DimensionalData = "0.29.12"
+DimensionalData = "0.30"
 DistributedNext = "1.0.0"
 RemoteREPL = "0.3.0"
 Revise = "<3.13"
