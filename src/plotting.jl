@@ -700,6 +700,7 @@ function draw_plot(plot::CorrelationPlot, variable_data, updated_variables)
             plot.x_var[], plot.y_var[] = plot.y_var[], plot.x_var[]
             swap_arrays(plot.x_data, plot.y_data)
         end
+
         ig.SameLine()
         x_changed = _var_combo("X", plot.x_var, plot.variable_names, variable_data)
         ig.SameLine()
@@ -731,7 +732,9 @@ function draw_plot(plot::CorrelationPlot, variable_data, updated_variables)
                 if x.type == VariableType_Scalar
                     if haskey(updated_variables, x_name) || haskey(updated_variables, y_name)
                         new_tids = get(updated_variables, x_name, Set{Int}())
-                        intersect!(new_tids, get(updated_variables, x_name, Set{Int}()))
+                        if haskey(updated_variables, y_name)
+                            union!(new_tids, updated_variables[y_name])
+                        end
 
                         for tid in new_tids
                             if tid in lookup(x.data, :trainId) && tid in lookup(y.data, :trainId)
