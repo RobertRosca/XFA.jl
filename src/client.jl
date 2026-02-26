@@ -281,6 +281,8 @@ end
 
 function disconnect_engine(state, shutdown_engine)
     client = state.client
+    client.status = RemoteStatus_Disconnecting
+
     if shutdown_engine && !isnothing(client.websocket)
         if !WebSockets.isclosed(client.websocket)
             send(client.websocket, Shutdown())

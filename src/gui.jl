@@ -558,11 +558,14 @@ function draw_gui()
         if ig.BeginTabItem("Setup")
             ig.EndTabItem()
 
+            initializing = client.status == RemoteStatus_Initializing
+            disconnecting = client.status == RemoteStatus_Disconnecting
             can_connect = if client.embedded_engine
                 client.status != RemoteStatus_Connecting && client.status != RemoteStatus_Connected
             else
                 client.status != RemoteStatus_Connecting && !fully_authenticated
             end
+            can_connect = can_connect && !initializing && !disconnecting
 
             @Disabled !can_connect begin
                 @c ig.Combo("##client-type", &state[].client_type_current_item,
@@ -600,25 +603,34 @@ function draw_gui()
                 if ig.Button("Connect")
                     client.cmd_output = ""
                     client.last_error = ""
+                    client.status = RemoteStatus_Initializing
                     @guiasync connect_engine()
                 end
             end
             ig.SameLine()
 
-            @Disabled can_connect begin
+            @Disabled can_connect || initializing || disconnecting begin
                 if ig.Button("Disconnect")
                     @guiasync disconnect_engine(state[], false)
                 end
+            end
 
-                ig.SameLine()
+            ig.SameLine()
 
+            @Disabled client.status != RemoteStatus_Connected begin
                 if ig.Button("Disconnect & shutdown")
                     @guiasync disconnect_engine(state[], true)
                 end
             end
 
+            ig.Text(string(length(client.ssh_hops)))
+
             ig.Dummy(0, 20)
-            if client.status == RemoteStatus_Connecting && !fully_authenticated
+            if client.status == RemoteStatus_Disconnecting
+                Spinner("Disconnecting...")
+            elseif client.status == RemoteStatus_Initializing
+                Spinner("Initializing...")
+            elseif client.status == RemoteStatus_Connecting && !fully_authenticated
                 draw_ssh_auth()
             elseif client.status == RemoteStatus_Connecting && fully_authenticated
                 Spinner("Starting engine...")

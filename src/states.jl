@@ -1,7 +1,9 @@
 @enum RemoteStatus begin
     RemoteStatus_Unconnected
+    RemoteStatus_Initializing
     RemoteStatus_Connecting
     RemoteStatus_Connected
+    RemoteStatus_Disconnecting
     RemoteStatus_Error
 end
 
