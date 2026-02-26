@@ -180,7 +180,7 @@ function initialize_engine(state)
     julia_module_prefix = if is_local
         "true"
     else
-        "source /etc/profile.d/modules.sh; SASE=0 module load exfel julia > /dev/null 2>&1"
+        "source /etc/profile.d/modules.sh; SASE=0 module load exfel julia/202502 > /dev/null 2>&1"
     end
 
     julia_binary = if is_local
@@ -193,8 +193,11 @@ function initialize_engine(state)
     client.remote_engine_dir = if is_local
         pkgdir(XfaEngine)
     else
-        proc = run("$(julia_module_prefix); julia --project=@xfa-default -E 'import XfaEngine; pkgdir(XfaEngine)'",
-                   client.ssh_hops[end].session; print_out=false, ignorestatus=true)
+        cmd_str = "$(julia_module_prefix); julia --project=@xfa-default -E 'import XfaEngine; pkgdir(XfaEngine)'"
+        cmd = `bash -c $(cmd_str)`
+        @show cmd
+        proc = run(ignorestatus(cmd),
+                   client.ssh_hops[end].session; print_out=false)
         string(chomp(String(proc.out))[2:end - 1])
     end
 
