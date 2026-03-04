@@ -470,7 +470,8 @@ mutable struct Plot
     const name::String
     const id::String
     const open::Ref{Bool}
-    const autofit::Ref{Bool}
+    const autofit_x::Ref{Bool}
+    const autofit_y::Ref{Bool}
     const fixed_aspect::Ref{Bool}
     gpu_heatmap::Union{Nothing, GPUHeatmap}
     dock_id::UInt32
@@ -478,7 +479,7 @@ end
 
 Plot(name, counter::Int) = Plot(name, "$(name)##plot-$(counter)")
 
-Plot(name, id::String, dock_id = 0) = Plot(name, id, Ref(true), Ref(true), Ref(true), nothing, UInt32(dock_id))
+Plot(name, id::String, dock_id = 0) = Plot(name, id, Ref(true), Ref(true), Ref(true), Ref(true), nothing, UInt32(dock_id))
 
 function Base.close(plot::Plot)
     if !isnothing(plot.gpu_heatmap)
@@ -490,20 +491,81 @@ end
 clear_plot(::Plot) = nothing
 
 function check_plot_interaction!(plot)
-    if !plot.autofit[]
-        return
+    io = ig.GetIO()
+    mouse_wheel = unsafe_load(io.MouseWheel)
+    dragging = ig.IsMouseDragging(ig.ImGuiMouseButton_Left)
+    interacting = dragging || mouse_wheel != 0
+
+    x_hovered = ImPlot.IsAxisHovered(ImPlot.ImAxis_X1)
+    y_hovered = ImPlot.IsAxisHovered(ImPlot.ImAxis_Y1)
+    plot_hovered = ImPlot.IsPlotHovered()
+
+    # Disable autofit on the axes being interacted with
+    if interacting
+        if plot_hovered
+            plot.autofit_x[] = false
+            plot.autofit_y[] = false
+        elseif x_hovered
+            plot.autofit_x[] = false
+        elseif y_hovered
+            plot.autofit_y[] = false
+        end
     end
 
-    hovered = ImPlot.IsPlotHovered() ||
-              ImPlot.IsAxisHovered(ImPlot.ImAxis_X1) ||
-              ImPlot.IsAxisHovered(ImPlot.ImAxis_Y1)
-
-    if hovered
-        io = ig.GetIO()
-        mouse_wheel = unsafe_load(io.MouseWheel)
-        if ig.IsMouseDragging(ig.ImGuiMouseButton_Left) || mouse_wheel != 0
-            plot.autofit[] = false
+    # Double-click to re-enable autofit
+    if ig.IsMouseDoubleClicked(ig.ImGuiMouseButton_Left)
+        if plot_hovered
+            plot.autofit_x[] = true
+            plot.autofit_y[] = true
+        elseif x_hovered
+            plot.autofit_x[] = true
+        elseif y_hovered
+            plot.autofit_y[] = true
         end
+    end
+end
+
+"""Draw a small toggle button that appears highlighted when active."""
+function toggle_button(label, active::Bool)
+    if active
+        ig.PushStyleColor(ig.ImGuiCol_Button, unsafe_load(ig.GetStyleColorVec4(ig.ImGuiCol_ButtonActive)))
+    end
+    clicked = ig.SmallButton(label)
+    if active
+        ig.PopStyleColor()
+    end
+    return clicked
+end
+
+"""Draw the autofit toggle button group: [X] [Y] [XY]"""
+function autofit_buttons(plot)
+    ig.AlignTextToFramePadding()
+    ig.Text("Autofit:")
+    ig.SameLine()
+    if toggle_button("X##$(plot.id)", plot.autofit_x[])
+        plot.autofit_x[] = !plot.autofit_x[]
+    end
+    ig.SameLine()
+    if toggle_button("Y##$(plot.id)", plot.autofit_y[])
+        plot.autofit_y[] = !plot.autofit_y[]
+    end
+    ig.SameLine()
+    both = plot.autofit_x[] && plot.autofit_y[]
+    if toggle_button("XY##$(plot.id)", both)
+        new_state = !both
+        plot.autofit_x[] = new_state
+        plot.autofit_y[] = new_state
+    end
+end
+
+"""Call per-axis SetNextAxisToFit based on autofit state."""
+function apply_autofit(plot)
+    if plot.autofit_x[] && plot.autofit_y[]
+        ImPlot.SetNextAxesToFit()
+    elseif plot.autofit_x[]
+        ImPlot.SetNextAxisToFit(ImPlot.ImAxis_X1)
+    elseif plot.autofit_y[]
+        ImPlot.SetNextAxisToFit(ImPlot.ImAxis_Y1)
     end
 end
 
@@ -528,9 +590,7 @@ function draw_plot(plot::Plot, data, was_updated)
         xlabel = is_dimarray ? DD.label(data_dims[1]) : ""
         label = is_dimarray ? DD.label(data) : plot.name
 
-        if plot.autofit[]
-            ImPlot.SetNextAxesToFit()
-        end
+        apply_autofit(plot)
 
         region_avail = ig.GetContentRegionAvail()
         plot_size = ImVec2(region_avail.x, max(region_avail.y - 30, 100))
@@ -579,7 +639,7 @@ function draw_plot(plot::Plot, data, was_updated)
             end
         end
 
-        ig.Checkbox("Autofit", plot.autofit)
+        autofit_buttons(plot)
         if data isa AbstractMatrix
             ig.SameLine()
             ig.Checkbox("Fixed aspect", plot.fixed_aspect)
@@ -599,7 +659,8 @@ end
     const y_var::Ref{Cint} = Ref(Cint(0))
     const x_data::Vector{Float64} = Float64[]
     const y_data::Vector{Float64} = Float64[]
-    const autofit::Ref{Bool} = Ref(true)
+    const autofit_x::Ref{Bool} = Ref(true)
+    const autofit_y::Ref{Bool} = Ref(true)
     trainId::Int = -1
     dock_id::UInt32 = 0
 end
@@ -725,9 +786,7 @@ function draw_plot(plot::CorrelationPlot, variable_data, updated_variables)
             if x.type != y.type
                 ig.Text("Both variables must have the same type to correlate against each other.")
             else
-                if plot.autofit[]
-                    ImPlot.SetNextAxesToFit()
-                end
+                apply_autofit(plot)
 
                 if x.type == VariableType_Scalar
                     if haskey(updated_variables, x_name) || haskey(updated_variables, y_name)
@@ -774,7 +833,7 @@ function draw_plot(plot::CorrelationPlot, variable_data, updated_variables)
                     ig.Text("Unsupported correlation of data type '$(x.type)'")
                 end
 
-                ig.Checkbox("Autofit", plot.autofit)
+                autofit_buttons(plot)
             end
         end
 
