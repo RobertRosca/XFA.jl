@@ -29,6 +29,7 @@ import XfaEngine.Context: KaraboDependency, Dependency, Parameter
 using XfaEngine.Protocol
 import XfaEngine.Protocol: send
 using .ImGuiHelpers
+include("state_inspector.jl")
 include("client.jl")
 
 import Revise
@@ -92,6 +93,7 @@ function draw_main_menubar()
             @c MenuItem("ImGui metrics", &state[].show_imgui_metrics)
             @c MenuItem("Stack tool", &state[].show_stacktool)
             @c MenuItem("Debug log", &state[].show_debug_log)
+            @c MenuItem("State inspector", &state[].show_state_inspector)
 
             ig.EndMenu()
         end
@@ -361,12 +363,12 @@ function draw_ssh_auth()
             ig.Text("Password: ")
             ig.SameLine()
             edited, new_password = SafeInputText("##password"; password=true, max_len=127,
-                                                 current_text=ssh_state.password)
+                                                 current_text=ssh_state.password[])
             if edited
-                ssh_state.password = new_password
+                ssh_state.password[] = new_password
             end
 
-            can_authenticate = !isempty(ssh_state.password)
+            can_authenticate = !isempty(ssh_state.password[])
         elseif auth_method == ssh.AuthMethod_Interactive
             all_answers_filled = true
 
@@ -623,8 +625,6 @@ function draw_gui()
                 end
             end
 
-            ig.Text(string(length(client.ssh_hops)))
-
             ig.Dummy(0, 20)
             if client.status == RemoteStatus_Disconnecting
                 Spinner("Disconnecting...")
@@ -733,7 +733,8 @@ function draw_gui()
     for (window_sym, window_func) in [(:show_imgui_demo,     ig.ShowDemoWindow),
                                       (:show_imgui_metrics,  ig.ShowMetricsWindow),
                                       (:show_stacktool,      ig.ShowIDStackToolWindow),
-                                      (:show_debug_log,      ig.ShowDebugLogWindow)]
+                                      (:show_debug_log,      ig.ShowDebugLogWindow),
+                                      (:show_state_inspector, draw_state_inspector)]
         do_show = getproperty(state[], window_sym)
         if do_show
             @c window_func(&do_show)

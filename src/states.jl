@@ -40,6 +40,33 @@ mutable struct KbdintPromptState
     answer::String
 end
 
+mutable struct PasswordStore
+    const buf::Base.SecretBuffer
+
+    function PasswordStore(password=nothing)
+        buf = Base.SecretBuffer()
+        if !isnothing(password)
+            write(buf, password)
+        end
+
+        finalizer(new(buf)) do x
+            Base.shred!(x.buf)
+        end
+    end
+end
+
+function Base.getindex(x::PasswordStore)
+    str = read(x.buf, String)
+    seekstart(x.buf)
+    str
+end
+
+function Base.setindex!(x::PasswordStore, value::String)
+    Base.shred!(x.buf)
+    write(x.buf, value)
+    seekstart(x.buf)
+end
+
 @kwdef mutable struct SshState
     address::String
     port::Int = 22
@@ -49,7 +76,7 @@ end
     session::Maybe{ssh.Session} = nothing
     forwarder::Maybe{ssh.Forwarder} = nothing
 
-    password::String = ""
+    password::PasswordStore = PasswordStore()
     kbdint_prompts::Vector{KbdintPromptState} = KbdintPromptState[]
 
     lock::ReentrantLock = ReentrantLock()
@@ -66,7 +93,7 @@ function Base.close(state::SshState)
         close(state.session)
     end
 
-    state.password = ""
+    state.password = PasswordStore()
     empty!(state.kbdint_prompts)
 end
 
@@ -231,6 +258,7 @@ end
     show_implot_demo::Bool = false
     show_stacktool::Bool = false
     show_debug_log::Bool = false
+    show_state_inspector::Bool = false
 
     # Connections to remote things
     address::String = "wrigleyj@exflonc202.desy.de"

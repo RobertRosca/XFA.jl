@@ -63,7 +63,7 @@ function ssh_authenticate_hop(state::GuiState, hop_idx)
     ssh_state.auth_state = :authenticating
 
     new_auth_state = if auth_method == ssh.AuthMethod_Password
-        ssh.authenticate(session; password=ssh_state.password, throw=false)
+        ssh.authenticate(session; password=ssh_state.password[], throw=false)
     elseif auth_method == ssh.AuthMethod_Interactive
         kbdint_answers = [prompt.answer for prompt in ssh_state.kbdint_prompts]
 
