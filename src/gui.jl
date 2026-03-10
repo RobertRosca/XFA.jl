@@ -562,6 +562,10 @@ function draw_gui()
         # Draw the menubar
         draw_main_menubar()
 
+        if Threads.threadid() == 1
+            BorderedText("Warning: GUI is running on thread 1, this may cause performance issues")
+        end
+
         ig.BeginTabBar("main-tab-bar")
         if ig.BeginTabItem("Setup")
             ig.EndTabItem()
