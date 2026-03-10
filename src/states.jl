@@ -7,10 +7,10 @@
     RemoteStatus_Error
 end
 
-@enum WebproxyStatus begin
-    WebproxyStatus_Idle
-    WebproxyStatus_WaitingForDevices
-    WebproxyStatus_Error
+@enum RequestStatus begin
+    RequestStatus_Idle
+    RequestStatus_Waiting
+    RequestStatus_Error
 end
 
 @enum SshStatus begin
@@ -178,7 +178,7 @@ end
 
     default_topic_idx::Ref{Cint} = Ref(Cint(0))
     available_topics::Vector{String} = String[]
-    webproxy_status::WebproxyStatus = WebproxyStatus_Idle
+    webproxy_status::RequestStatus = RequestStatus_Idle
     remoterepl_mode::Ref{Bool} = Ref(false)
     remoterepl_status::RemoteReplStatus = RemoteReplStatus_Stopped
 
@@ -188,7 +188,8 @@ end
     context::ContextState = ContextState()
 
     # Karabo status
-    trainmatchers::Dict{String, Any} = Dict()
+    trainmatchers::Dict{String, Vector{String}} = Dict()
+    trainmatchers_request_status::RequestStatus = RequestStatus_Idle
     karabo_devices::Dict{String, Any} = Dict()
 
     # Variables and plots

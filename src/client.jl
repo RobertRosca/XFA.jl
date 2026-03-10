@@ -439,13 +439,16 @@ function handle_msg(state, msg)
     elseif msg isa Devices
         if msg.device_names isa Exception
             @error "Error from server with DEVICES" exception=msg
-            client.webproxy_status = WebproxyStatus_Error
+            client.webproxy_status = RequestStatus_Error
         else
             client.karabo_devices = msg.device_names
-            client.webproxy_status = WebproxyStatus_Idle
+            client.webproxy_status = RequestStatus_Idle
             client.trainmatchers = filter(x -> occursin("Matcher", x.second["classId"]),
                                           client.karabo_devices)
         end
+    elseif msg isa AvailableTrainmatchers
+        client.trainmatchers = msg.trainmatchers
+        client.trainmatchers_request_status = RequestStatus_Idle
     elseif msg isa ContextInfo
         if msg.info isa Dict
             client.context.context_state = build_context_state(state, msg.info)
@@ -574,9 +577,14 @@ end
 function get_devices(state)
     client = state.client
     send(client.websocket, GetDevices())
-    client.webproxy_status = WebproxyStatus_WaitingForDevices
+    client.webproxy_status = RequestStatus_Waiting
     empty!(client.karabo_devices)
     empty!(client.trainmatchers)
+end
+
+function get_trainmatchers(client)
+    send(client.websocket, GetTrainmatchers())
+    client.trainmatchers_request_status = RequestStatus_Waiting
 end
 
 function load_context(state)
