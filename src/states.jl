@@ -115,9 +115,15 @@ mutable struct VariableStore
     # This field is only used for non-scalar data. Scalar data is stored as a
     # DimArray with a train ID.
     trainId::Int
+
+    # Timestamps of recent updates for computing average rate (updates/sec)
+    const update_timestamps::Vector{Float64}
+    update_rate::Float64
 end
 
-VariableStore(data) = VariableStore(Channel(100), data, VariableType_Unknown, -1)
+function VariableStore(data)
+    VariableStore(Channel(100), data, VariableType_Unknown, -1, Float64[], 0.0)
+end
 
 @kwdef mutable struct ContextState
     context_state::Dict{String, Any} = Dict()

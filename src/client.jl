@@ -481,6 +481,15 @@ function handle_msg(state, msg)
                 VariableType_Unknown
             end
             push!(store.updates, (variable.tid, variable.data, type))
+
+            ts = store.update_timestamps
+            push!(ts, time())
+            if length(ts) > 100
+                popfirst!(ts)
+            end
+            if length(ts) >= 2
+                store.update_rate = 1 / nanmean(diff(ts))
+            end
         end
     elseif msg isa RemoteReplState
         client.remoterepl_mode[] = msg.enabled
@@ -588,6 +597,11 @@ function change_parameter(param::Parameter)
 end
 
 function start(state)
+    for store in values(state.client.variable_data)
+        empty!(store.update_timestamps)
+        store.update_rate = 0
+    end
+
     send(state.client.websocket, Start())
     state.client.context.pipeline_status = PipelineStatus_Starting
 end

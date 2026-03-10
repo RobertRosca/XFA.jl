@@ -10,7 +10,7 @@ using ModernGL
 include("imnodes.jl")
 include("imgui_helpers.jl")
 
-using NaNStatistics: nanmaximum, nanminimum
+using NaNStatistics: nanmean, nanmaximum, nanminimum
 using DimensionalData: DimensionalData as DD, DimVector, DimMatrix, DimArray, At, lookup
 include("plotting.jl")
 
@@ -19,6 +19,7 @@ import HTTP: WebSockets
 import XfaEngine: EngineState, getavailableport
 include("states.jl")
 
+using Printf: @sprintf
 import TOML
 import Sockets
 import CRC32c: crc32c
@@ -215,6 +216,7 @@ function draw_dag()
 
         min_node_width = 150
         node_id = var_data["id"]
+        variable_store = get(client.variable_data, name, nothing)
 
         # Draw titlebar
         ImNodes.BeginNode(node_id)
@@ -259,6 +261,10 @@ function draw_dag()
         ig.Dummy(min_node_width, 10)
 
         ig.TextDisabled("Outputs")
+        if !isnothing(variable_store)
+            ig.SameLine()
+            ig.TextDisabled(@sprintf "%.2f Hz" variable_store.update_rate)
+        end
         draw_list = ig.GetWindowDrawList()
         start_pos = ig.GetCursorScreenPos()
         gray = ig.IM_COL32(100, 100, 100, 255)
