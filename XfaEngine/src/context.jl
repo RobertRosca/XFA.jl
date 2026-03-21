@@ -220,7 +220,7 @@ function execute_variables(ctx::XfaContext, inputs::Dict)
         # Call the function
         if length(args) == length(ctx.dag[name])
             try
-                results[name] = ctx.functions[name](args...)
+                results[name] = @invokelatest ctx.functions[name](args...)
             catch ex
                 @error "Error executing $(name)!" exception=ex
             end
@@ -350,7 +350,7 @@ function stream_variable(name, stream_output, upstream, downstream)
     # Initialize the scratch space
     scratch = Dict{String, Any}()
 
-    matcher = Trainmatcher(keys(upstream))
+    matcher = Trainmatcher(k for (k, v) in upstream if v isa RemoteChannel)
     matched_trains = Dict{Int, Any}()
     args = Vector{Any}(undef, length(upstream))
     try

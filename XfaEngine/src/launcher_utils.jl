@@ -52,7 +52,7 @@ end
 
 const formatter = LogFmt()
 
-"""Create a customized global logger."""
+# Create a customized global logger
 function initialize_logger(min_level=Logging.Info)
     # Create a logger that rotates the log files every month and uses the logfmt
     # format.
@@ -68,4 +68,4 @@ function initialize_logger(min_level=Logging.Info)
 end
 
 """Return the number of workers added with addprocs()."""
-extra_workers() = count(x -> x != 1, workers())
+extra_workers() = count(!=(1), workers())
