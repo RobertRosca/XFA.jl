@@ -692,36 +692,39 @@ function draw_gui()
                     ig.TextColored(ImVec4(1, 0.2, 0.5, 1), "Path does not point to a valid file!")
                 end
 
-                # Get the default topic
-                ig.Text("Default topic:")
-                ig.SameLine()
-                if ig.Combo("##default-topic", client.default_topic_idx, client.available_topics)
-                    set_default_topic(state[])
+                ig.Dummy(0, 10)
+
+                if ig.Button("Update trainmatchers")
+                    get_trainmatchers(client)
                 end
 
-                # # Update the list of devices
-                # if ig.Button("Update device list")
-                #     get_devices(state[])
-                # end
-                # ig.SameLine()
-                # if client.webproxy_status == WebproxyStatus_Idle
-                #     ig.Text("Found $(length(client.karabo_devices)) Karabo devices")
-                # elseif client.webproxy_status == WebproxyStatus_WaitingForDevices
-                #     Spinner("")
-                # elseif client.webproxy_status == WebproxyStatus_Error
-                #     ig.Text("Error! Check backend logs.")
-                # end
+                # Show trainmatchers as a table
+                if client.trainmatchers_request_status == RequestStatus_Waiting
+                    Spinner("Waiting for trainmatcher list")
+                else ig.BeginTable("##trainmatchers", 2, ig.ImGuiTableFlags_Borders | ig.ImGuiTableFlags_RowBg)
+                    ig.TableSetupColumn("Topic")
+                    ig.TableSetupColumn("Default trainmatcher")
+                    ig.TableHeadersRow()
 
-                # ig.Dummy(0, 10)
+                    for topic in sort(collect(keys(client.trainmatchers)))
+                        matchers = client.trainmatchers[topic]
+                        ig.TableNextRow()
+                        ig.TableNextColumn()
+                        ig.Text(topic)
+                        ig.TableNextColumn()
 
-                # # Show a list of trainmatchers
-                # ig.Text("Found $(length(client.trainmatchers)) matchers:")
-                # if ig.BeginListBox("")
-                #     for matcher in sort(collect(keys(client.trainmatchers)))
-                #         ig.Selectable(matcher)
-                #     end
-                #     ig.EndListBox()
-                # end
+                        if length(matchers) == 1
+                            ig.Text(matchers[1])
+                        elseif length(matchers) > 1
+                            if !haskey(client.trainmatcher_selected_idx, topic)
+                                client.trainmatcher_selected_idx[topic] = Ref(Cint(0))
+                            end
+                            ig.Combo("##matcher-$topic", client.trainmatcher_selected_idx[topic], matchers)
+                        end
+                    end
+
+                    ig.EndTable()
+                end
             end
         end
 

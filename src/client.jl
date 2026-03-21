@@ -428,6 +428,7 @@ function handle_msg(state, msg)
         nothing
     elseif msg isa AvailableTopics
         client.available_topics = msg.topics
+        sort!(client.available_topics)
 
         if !isempty(client.available_topics)
             set_default_topic(state)
@@ -447,7 +448,7 @@ function handle_msg(state, msg)
                                           client.karabo_devices)
         end
     elseif msg isa AvailableTrainmatchers
-        client.trainmatchers = msg.trainmatchers
+        client.trainmatchers = msg.topic_trainmatchers
         client.trainmatchers_request_status = RequestStatus_Idle
     elseif msg isa ContextInfo
         if msg.info isa Dict
@@ -580,6 +581,7 @@ function get_devices(state)
     client.webproxy_status = RequestStatus_Waiting
     empty!(client.karabo_devices)
     empty!(client.trainmatchers)
+    empty!(client.trainmatcher_selected_idx)
 end
 
 function get_trainmatchers(client)

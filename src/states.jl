@@ -190,6 +190,7 @@ end
     # Karabo status
     trainmatchers::Dict{String, Vector{String}} = Dict()
     trainmatchers_request_status::RequestStatus = RequestStatus_Idle
+    trainmatcher_selected_idx::Dict{String, Ref{Cint}} = Dict{String, Ref{Cint}}()
     karabo_devices::Dict{String, Any} = Dict()
 
     # Variables and plots
