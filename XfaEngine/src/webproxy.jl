@@ -84,13 +84,31 @@ function get_topology(wp; timeout=5, max_age=10)
     return wp.topology_cache.value
 end
 
-function get_devices(wp; timeout=5, max_age=10)
+function get_devices(wp; timeout=5, max_age=10, classId=nothing)
     if time() - wp.devices_cache.timestamp > max_age
         value = get_json(wp, "/devices.json"; timeout)["devices"]
         wp.devices_cache = (; timestamp=time(), value)
     end
 
-    return wp.devices_cache.value
+    devices = wp.devices_cache.value
+    if !isnothing(classId)
+        devices = filter(p -> p.second["classId"] == classId, devices)
+    end
+
+    return devices
+end
+
+# This takes in a dict from topic to webproxy
+function get_all_trainmatchers(webproxies::Dict)
+    trainmatchers = Dict{String, Vector{String}}()
+
+    for (topic, wp) in webproxies
+        devices = get_devices(wp; classId="TrainMatcher")
+        trainmatchers[topic] = collect(keys(devices))
+        sort!(trainmatchers[topic])
+    end
+
+    return trainmatchers
 end
 
 function get_config(wp, device; timeout=5)

@@ -116,6 +116,9 @@ function handle_message(msg::AbstractMessage, state::EngineState, id)
             @error "Error in 'GetDevices', requested by $(id)" exception=(ex, catch_backtrace())
             Protocol.send(ws, Devices(ex))
         end
+    elseif msg isa GetTrainmatchers
+        trainmatchers = get_all_trainmatchers(state.webproxies)
+        Protocol.send(ws, AvailableTrainmatchers(trainmatchers))
     elseif msg isa LoadContext
         path = abspath(expanduser(msg.path))
 
@@ -145,7 +148,7 @@ function handle_message(msg::AbstractMessage, state::EngineState, id)
             Protocol.send(ws, ContextInfo(new_ctx_or_ex, state.ctx.is_running[]))
         end
     elseif msg isa ReviseCode
-        @everywhere Revise.retry()
+        @everywhere Revise.revise()
         @info "Revised source code"
     elseif msg isa ChangeParameter
         param = msg.parameter

@@ -10,9 +10,8 @@ using ModernGL
 include("imnodes.jl")
 include("imgui_helpers.jl")
 
-using NaNStatistics: nanmaximum, nanminimum
-using DimensionalData: DimensionalData as DD, DimVector, DimMatrix, DimArray
-import GeometryBasics: Point2d
+using NaNStatistics: nanmean, nanmaximum, nanminimum
+using DimensionalData: DimensionalData as DD, DimVector, DimMatrix, DimArray, At, lookup
 include("plotting.jl")
 
 import LibSSH as ssh
@@ -20,6 +19,7 @@ import HTTP: WebSockets
 import XfaEngine: EngineState, getavailableport
 include("states.jl")
 
+using Printf: @sprintf
 import TOML
 import Sockets
 import CRC32c: crc32c
@@ -30,6 +30,7 @@ import XfaEngine.Context: KaraboDependency, Dependency, Parameter
 using XfaEngine.Protocol
 import XfaEngine.Protocol: send
 using .ImGuiHelpers
+include("state_inspector.jl")
 include("client.jl")
 
 import Revise
@@ -93,6 +94,7 @@ function draw_main_menubar()
             @c MenuItem("ImGui metrics", &state[].show_imgui_metrics)
             @c MenuItem("Stack tool", &state[].show_stacktool)
             @c MenuItem("Debug log", &state[].show_debug_log)
+            @c MenuItem("State inspector", &state[].show_state_inspector)
 
             ig.EndMenu()
         end
@@ -151,19 +153,18 @@ function clear_variables()
         end
     end
 
-    # empty!(client.variable_data)
-
-    # for plot in client.plots
-    #     plot.open[] = false
-    # end
+    for plot in client.plots
+        clear_plot(plot)
+    end
 end
 
 function draw_dag()
-    ctx_state = state[].client.context_state
     client = state[].client
+    context = client.context
+    ctx_state = context.context_state
 
     ig.Dummy(0, 10)
-    @Disabled isempty(client.context_state) || client.pipeline_status != PipelineStatus_Stopped begin
+    @Disabled isempty(ctx_state) || context.pipeline_status != PipelineStatus_Stopped begin
         if ig.Button(" Start ")
             start(state[])
         end
@@ -171,7 +172,7 @@ function draw_dag()
 
     ig.SameLine()
 
-    @Disabled client.pipeline_status != PipelineStatus_Started begin
+    @Disabled context.pipeline_status != PipelineStatus_Started begin
         if ig.Button(" Stop ")
             stop(state[])
         end
@@ -186,13 +187,22 @@ function draw_dag()
 
     ig.SameLine()
     changing_states = (PipelineStatus_Starting, PipelineStatus_Stopping, PipelineStatus_LoadingContext)
-    @Disabled client.pipeline_status in changing_states begin
+    @Disabled context.pipeline_status in changing_states begin
         if ig.Button("Load context")
             load_context(state[])
+            restore_plots(state[])
         end
     end
 
-    if client.pipeline_status in changing_states
+    ig.SameLine()
+    @Disabled isempty(client.variable_data) begin
+        if ig.Button("Correlate")
+            push!(client.plots, CorrelationPlot(client.plot_counter))
+            client.plot_counter += 1
+        end
+    end
+
+    if context.pipeline_status in changing_states
         ig.SameLine()
         Spinner()
     end
@@ -206,6 +216,7 @@ function draw_dag()
 
         min_node_width = 150
         node_id = var_data["id"]
+        variable_store = get(client.variable_data, name, nothing)
 
         # Draw titlebar
         ImNodes.BeginNode(node_id)
@@ -250,6 +261,10 @@ function draw_dag()
         ig.Dummy(min_node_width, 10)
 
         ig.TextDisabled("Outputs")
+        if !isnothing(variable_store)
+            ig.SameLine()
+            ig.TextDisabled(@sprintf "%.2f Hz" variable_store.update_rate)
+        end
         draw_list = ig.GetWindowDrawList()
         start_pos = ig.GetCursorScreenPos()
         gray = ig.IM_COL32(100, 100, 100, 255)
@@ -271,7 +286,8 @@ function draw_dag()
             if !isempty(label)
                 if haskey(client.variable_data, output_name)
                     if ig.Button("$(label)###plot_button")
-                        push!(client.plots, Plot(output_name))
+                        push!(client.plots, Plot(output_name, client.plot_counter))
+                        client.plot_counter += 1
                     end
                 else
                     ig.Text(label)
@@ -283,10 +299,10 @@ function draw_dag()
 
         ImNodes.EndNode()
 
-        pos = client.node_positions[name]
+        pos = context.node_positions[name]
         if pos != Point2d(-1, -1)
-            ImNodes.SetNodeGridSpacePos(node_id, (pos[1], pos[2]))
-            client.node_positions[name] = Point2d(-1, -1)
+            ImNodes.SetNodeGridSpacePos(node_id, (pos.x, pos.y))
+            context.node_positions[name] = Point2d(-1, -1)
         end
 
         ig.PopID()
@@ -300,6 +316,15 @@ function draw_dag()
 
     ImNodes.MiniMap()
     ImNodes.EndNodeEditor()
+
+    # Timer to save the current settings periodically. Mostly useful for the
+    # node positions.
+    framerate = round(Int, unsafe_load(ig.GetIO().Framerate))
+    if ig.GetFrameCount() % (5 * framerate) == 0
+        if !isempty(ctx_state)
+            save_settings(client)
+        end
+    end
 end
 
 function draw_ssh_auth()
@@ -344,12 +369,12 @@ function draw_ssh_auth()
             ig.Text("Password: ")
             ig.SameLine()
             edited, new_password = SafeInputText("##password"; password=true, max_len=127,
-                                                 current_text=ssh_state.password)
+                                                 current_text=ssh_state.password[])
             if edited
-                ssh_state.password = new_password
+                ssh_state.password[] = new_password
             end
 
-            can_authenticate = !isempty(ssh_state.password)
+            can_authenticate = !isempty(ssh_state.password[])
         elseif auth_method == ssh.AuthMethod_Interactive
             all_answers_filled = true
 
@@ -412,40 +437,105 @@ function draw_ssh_auth()
     end
 end
 
+function restore_plots(state::GuiState)
+    client = state.client
+    ctx_path = client.context_path
+    if !haskey(state.saved_contexts, ctx_path)
+        return
+    end
+
+    ctx = state.saved_contexts[ctx_path]
+
+    context = client.context
+    if haskey(ctx, "node_positions") && isempty(context.node_positions)
+        saved_positions = ctx["node_positions"]
+        for (name, pos) in saved_positions
+            context.node_positions[name] = Point2d(pos[1], pos[2])
+        end
+    end
+
+    ## Code to restore plots is buggy, so it's disabled for now
+
+    # # Close existing plots before restoring
+    # for plot in gui_state.client.plots
+    #     close(plot)
+    # end
+    # empty!(gui_state.client.plots)
+
+    # for p in get(ctx, "plots", [])
+    #     dock_id = UInt32(get(p, "dock_id", 0))
+    #     if p["type"] == "Plot"
+    #         push!(gui_state.client.plots, Plot(p["name"], p["id"], dock_id))
+    #     else
+    #         push!(gui_state.client.plots, CorrelationPlot(p["id"], dock_id))
+    #     end
+    # end
+
+    # gui_state.plot_counter = Int(get(ctx, "plot_counter", 0))
+
+    # layout = get(ctx, "saved_layout", "")
+    # if !isempty(layout)
+    #     # Load the INI to restore dock node topology, then explicitly assign
+    #     # each window to its saved dock node. DockBuilderDockWindow stores the
+    #     # assignment in ImGui's window settings; it takes effect on the next
+    #     # frame once the dock nodes are recreated from the INI.
+    #     ig.LoadIniSettingsFromMemory(layout)
+    #     # for plot in gui_state.client.plots
+    #     #     if plot.dock_id != 0
+    #     #         ig.DockBuilderDockWindow(plot.id, plot.dock_id)
+    #     #     end
+    #     # end
+    # end
+end
+
 function draw_plots()
     client = state[].client
 
     # Update all the observables
-    updated_variables = String[]
+    updated_variables = Dict{String, Set{Int}}()
     for (name, store) in client.variable_data
         if !isready(store.updates)
             continue
         end
 
         array = store.data
+        new_tids = Set{Int}()
         while isready(store.updates)
-            tid, x = take!(store.updates)
+            tid, x, type = take!(store.updates)
+            push!(new_tids, tid)
+            store.type = type
             if x isa Number
                 push!(array, x, (; trainId=tid))
             elseif x isa AbstractArray
                 store.data = x
+                store.trainId = tid
             end
         end
 
-        push!(updated_variables, name)
+        updated_variables[name] = new_tids
     end
 
     # Draw plot windows
     for plot in client.plots
-        draw_plot(plot, client.variable_data[plot.name].data, plot.name in updated_variables)
+        if plot isa CorrelationPlot
+            draw_plot(plot, client.variable_data, updated_variables)
+        else
+            store = get(client.variable_data, plot.name, nothing)
+            data = isnothing(store) ? nothing : store.data
+            draw_plot(plot, data, !isnothing(store) && haskey(updated_variables, plot.name))
+        end
     end
 
     # Remove closed plots
+    n = length(client.plots)
     for i in reverse(eachindex(client.plots))
         if !client.plots[i].open[]
             close(client.plots[i])
             deleteat!(client.plots, i)
         end
+    end
+    if length(client.plots) != n
+        save_settings(client)
     end
 end
 
@@ -472,20 +562,27 @@ function draw_gui()
         # Draw the menubar
         draw_main_menubar()
 
+        if Threads.threadid() == 1
+            BorderedText("Warning: GUI is running on thread 1, this may cause performance issues")
+        end
+
         ig.BeginTabBar("main-tab-bar")
         if ig.BeginTabItem("Setup")
             ig.EndTabItem()
 
+            initializing = client.status == RemoteStatus_Initializing
+            disconnecting = client.status == RemoteStatus_Disconnecting
             can_connect = if client.embedded_engine
                 client.status != RemoteStatus_Connecting && client.status != RemoteStatus_Connected
             else
                 client.status != RemoteStatus_Connecting && !fully_authenticated
             end
+            can_connect = can_connect && !initializing && !disconnecting
 
             @Disabled !can_connect begin
-                ig.Combo("##client-type", state[].client_type_current_item,
-                         ["Connect to remote", "Create local engine"])
-                client.embedded_engine = state[].client_type_current_item[] == 1
+                @c ig.Combo("##client-type", &state[].client_type_current_item,
+                           ["Connect to remote", "Create local engine"])
+                client.embedded_engine = state[].client_type_current_item == 1
 
                 ig.Spacing()
 
@@ -518,25 +615,32 @@ function draw_gui()
                 if ig.Button("Connect")
                     client.cmd_output = ""
                     client.last_error = ""
+                    client.status = RemoteStatus_Initializing
                     @guiasync connect_engine()
                 end
             end
             ig.SameLine()
 
-            @Disabled can_connect begin
+            @Disabled can_connect || initializing || disconnecting begin
                 if ig.Button("Disconnect")
                     @guiasync disconnect_engine(state[], false)
                 end
+            end
 
-                ig.SameLine()
+            ig.SameLine()
 
+            @Disabled client.status != RemoteStatus_Connected begin
                 if ig.Button("Disconnect & shutdown")
                     @guiasync disconnect_engine(state[], true)
                 end
             end
 
             ig.Dummy(0, 20)
-            if client.status == RemoteStatus_Connecting && !fully_authenticated
+            if client.status == RemoteStatus_Disconnecting
+                Spinner("Disconnecting...")
+            elseif client.status == RemoteStatus_Initializing
+                Spinner("Initializing...")
+            elseif client.status == RemoteStatus_Connecting && !fully_authenticated
                 draw_ssh_auth()
             elseif client.status == RemoteStatus_Connecting && fully_authenticated
                 Spinner("Starting engine...")
@@ -588,36 +692,39 @@ function draw_gui()
                     ig.TextColored(ImVec4(1, 0.2, 0.5, 1), "Path does not point to a valid file!")
                 end
 
-                # Get the default topic
-                ig.Text("Default topic:")
-                ig.SameLine()
-                if ig.Combo("##default-topic", client.default_topic_idx, client.available_topics)
-                    set_default_topic(state[])
+                ig.Dummy(0, 10)
+
+                if ig.Button("Update trainmatchers")
+                    get_trainmatchers(client)
                 end
 
-                # # Update the list of devices
-                # if ig.Button("Update device list")
-                #     get_devices(state[])
-                # end
-                # ig.SameLine()
-                # if client.webproxy_status == WebproxyStatus_Idle
-                #     ig.Text("Found $(length(client.karabo_devices)) Karabo devices")
-                # elseif client.webproxy_status == WebproxyStatus_WaitingForDevices
-                #     Spinner("")
-                # elseif client.webproxy_status == WebproxyStatus_Error
-                #     ig.Text("Error! Check backend logs.")
-                # end
+                # Show trainmatchers as a table
+                if client.trainmatchers_request_status == RequestStatus_Waiting
+                    Spinner("Waiting for trainmatcher list")
+                else ig.BeginTable("##trainmatchers", 2, ig.ImGuiTableFlags_Borders | ig.ImGuiTableFlags_RowBg)
+                    ig.TableSetupColumn("Topic")
+                    ig.TableSetupColumn("Default trainmatcher")
+                    ig.TableHeadersRow()
 
-                # ig.Dummy(0, 10)
+                    for topic in sort(collect(keys(client.trainmatchers)))
+                        matchers = client.trainmatchers[topic]
+                        ig.TableNextRow()
+                        ig.TableNextColumn()
+                        ig.Text(topic)
+                        ig.TableNextColumn()
 
-                # # Show a list of trainmatchers
-                # ig.Text("Found $(length(client.trainmatchers)) matchers:")
-                # if ig.BeginListBox("")
-                #     for matcher in sort(collect(keys(client.trainmatchers)))
-                #         ig.Selectable(matcher)
-                #     end
-                #     ig.EndListBox()
-                # end
+                        if length(matchers) == 1
+                            ig.Text(matchers[1])
+                        elseif length(matchers) > 1
+                            if !haskey(client.trainmatcher_selected_idx, topic)
+                                client.trainmatcher_selected_idx[topic] = Ref(Cint(0))
+                            end
+                            ig.Combo("##matcher-$topic", client.trainmatcher_selected_idx[topic], matchers)
+                        end
+                    end
+
+                    ig.EndTable()
+                end
             end
         end
 
@@ -639,18 +746,26 @@ function draw_gui()
     for (window_sym, window_func) in [(:show_imgui_demo,     ig.ShowDemoWindow),
                                       (:show_imgui_metrics,  ig.ShowMetricsWindow),
                                       (:show_stacktool,      ig.ShowIDStackToolWindow),
-                                      (:show_debug_log,      ig.ShowDebugLogWindow)]
+                                      (:show_debug_log,      ig.ShowDebugLogWindow),
+                                      (:show_state_inspector, draw_state_inspector)]
         do_show = getproperty(state[], window_sym)
         if do_show
             @c window_func(&do_show)
             setproperty!(state[], window_sym, do_show)
         end
     end
+
+    # Save layout when ImGui signals changes
+    io = ig.GetIO()
+    if unsafe_load(io.WantSaveIniSettings) && !isempty(state[].client.plots)
+        save_settings(client)
+        io.WantSaveIniSettings = false
+    end
 end
 
 """Start the XFA GUI."""
-function main()
-    gui_state = GuiState(; disable_rendering=false)
+function main(; test_engine=nothing)
+    gui_state = GuiState(load_settings())
 
     # Setup Dear ImGui context
     ig.set_backend(:GlfwOpenGL3)
@@ -686,13 +801,30 @@ function main()
     io.ConfigFlags = unsafe_load(io.ConfigFlags) | ig.ImGuiConfigFlags_DockingEnable
     io.ConfigFlags = unsafe_load(io.ConfigFlags) | ig.ImGuiConfigFlags_ViewportsEnable
 
-    # # Disable INI file
-    # io.WantSaveIniSettings = false
-    # io.IniFilename = C_NULL
+    # Disable built-in INI file — we manage layout persistence ourselves
+    io.IniFilename = C_NULL
 
     on_exit = () -> begin
+        client = gui_state.client
+
+        # Save layout and node positions before tearing down
+        if !isempty(client.plots) || !isempty(client.context.context_state)
+            save_settings(client)
+        end
+
+        # Disconnect from engine if connected
+        if client.status == RemoteStatus_Connected && !isnothing(client.websocket)
+            if !WebSockets.isclosed(client.websocket)
+                try
+                    send(client.websocket, Shutdown())
+                    timedwait(() -> WebSockets.isclosed(client.websocket), 5)
+                catch
+                end
+            end
+        end
+
         # Clean up GPU heatmap resources before destroying contexts
-        for plot in gui_state.client.plots
+        for plot in client.plots
             close(plot)
         end
         destroy_heatmap_context!()
@@ -702,7 +834,7 @@ function main()
         empty!(ImGuiHelpers.safe_input_text_cache)
         close(gui_state)
     end
-    t = ig.render(imgui_ctx; on_exit, window_title="XFA", wait=false, spawn=true) do
+    t = ig.render(imgui_ctx; on_exit, window_title="XFA", wait=false, spawn=true, engine=test_engine) do
         if gui_state.disable_rendering
             # Occasionally an exception will occur in the middle of a disabled
             # section, which helpfully also disables the continue button

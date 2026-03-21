@@ -1,14 +1,16 @@
 @enum RemoteStatus begin
     RemoteStatus_Unconnected
+    RemoteStatus_Initializing
     RemoteStatus_Connecting
     RemoteStatus_Connected
+    RemoteStatus_Disconnecting
     RemoteStatus_Error
 end
 
-@enum WebproxyStatus begin
-    WebproxyStatus_Idle
-    WebproxyStatus_WaitingForDevices
-    WebproxyStatus_Error
+@enum RequestStatus begin
+    RequestStatus_Idle
+    RequestStatus_Waiting
+    RequestStatus_Error
 end
 
 @enum SshStatus begin
@@ -32,86 +34,40 @@ end
     RemoteReplStatus_Stopped
 end
 
-"""
-A type to help with implementing thread-safe revise-able states.
-
-TL;DR:
-- An ExtendableState must have a extras::Dict field to store extra properties
-  dynamically, and a lock::AbstractLock field to lock the state object during
-  modification.
-- To add/remove properties dynamically the extras_defaults(T) method must
-  return a Dict of all extra properties and their default value.
-"""
-abstract type ExtendableState end
-
-extras_defaults(::ExtendableState) = Dict()
-
-function update_extras(state::T) where T <: ExtendableState
-    defaults = extras_defaults(state)
-    extras = getfield(state, :extras)
-
-    # Fast path
-    if keys(defaults) == keys(extras)
-        return
-    end
-
-    for (key, value) in defaults
-        if !haskey(extras, key)
-            extras[key] = value
-        end
-    end
-
-    for key in collect(keys(extras))
-        if !haskey(defaults, key)
-            pop!(extras, key)
-        end
-    end
-end
-
-function Base.getproperty(state::T, sym::Symbol) where T <: ExtendableState
-    update_extras(state)
-
-    if hasfield(T, sym)
-        getfield(state, sym)
-    elseif haskey(state.extras, sym)
-        state.extras[sym]
-    else
-        error("Type $(T) has no field '$(sym)'")
-    end
-end
-
-Base.lock(state::ExtendableState) = lock(state.lock)
-Base.unlock(state::ExtendableState) = unlock(state.lock)
-
-function _state_setproperty!(state::T, sym, x) where T <: ExtendableState
-    if hasfield(T, sym)
-        setfield!(state, sym, x)
-    elseif haskey(state.extras, sym)
-        state.extras[sym] = x
-    else
-        error("Type $(T) has no field '$(sym)'")
-    end
-end
-
-function Base.setproperty!(state::T, sym::Symbol, x) where T <: ExtendableState
-    update_extras(state)
-
-    if getproperty(state, sym) isa ExtendableState
-        _state_setproperty!(state, sym, x)
-    else
-        @lock state begin
-            _state_setproperty!(state, sym, x)
-        end
-    end
-end
-
 mutable struct KbdintPromptState
     msg::String
     display::Bool
     answer::String
 end
 
-@kwdef mutable struct SshState <: ExtendableState
+mutable struct PasswordStore
+    const buf::Base.SecretBuffer
+
+    function PasswordStore(password=nothing)
+        buf = Base.SecretBuffer()
+        if !isnothing(password)
+            write(buf, password)
+        end
+
+        finalizer(new(buf)) do x
+            Base.shred!(x.buf)
+        end
+    end
+end
+
+function Base.getindex(x::PasswordStore)
+    str = read(x.buf, String)
+    seekstart(x.buf)
+    str
+end
+
+function Base.setindex!(x::PasswordStore, value::String)
+    Base.shred!(x.buf)
+    write(x.buf, value)
+    seekstart(x.buf)
+end
+
+@kwdef mutable struct SshState
     address::String
     port::Int = 22
 
@@ -120,15 +76,14 @@ end
     session::Maybe{ssh.Session} = nothing
     forwarder::Maybe{ssh.Forwarder} = nothing
 
-    password::String = ""
+    password::PasswordStore = PasswordStore()
     kbdint_prompts::Vector{KbdintPromptState} = KbdintPromptState[]
 
-    extras::Dict{Symbol, Any} = Dict{Symbol, Any}()
     lock::ReentrantLock = ReentrantLock()
 end
 
-extras_defaults(::SshState) = Dict(
-)
+Base.lock(state::SshState) = lock(state.lock)
+Base.unlock(state::SshState) = unlock(state.lock)
 
 function Base.close(state::SshState)
     if !isnothing(state.forwarder)
@@ -138,18 +93,71 @@ function Base.close(state::SshState)
         close(state.session)
     end
 
-    state.password = ""
+    state.password = PasswordStore()
     empty!(state.kbdint_prompts)
+end
+
+# This enum tracks the original type of the variables. We need to distinguish
+# this from how they're stored because both scalars and vectors are stored as
+# vectors.
+@enum VariableType begin
+    VariableType_Scalar
+    VariableType_Vector
+    VariableType_Array
+    VariableType_Unknown
 end
 
 mutable struct VariableStore
     const updates::Channel
     data::Union{Vector, Matrix, DimVector, DimMatrix}
+    type::VariableType
 
-    VariableStore(data) = new(Channel(100), data)
+    # This field is only used for non-scalar data. Scalar data is stored as a
+    # DimArray with a train ID.
+    trainId::Int
+
+    # Timestamps of recent updates for computing average rate (updates/sec)
+    const update_timestamps::Vector{Float64}
+    update_rate::Float64
 end
 
-@kwdef mutable struct ClientState <: ExtendableState
+function VariableStore(data)
+    VariableStore(Channel(100), data, VariableType_Unknown, -1, Float64[], 0.0)
+end
+
+@kwdef mutable struct ContextState
+    context_state::Dict{String, Any} = Dict()
+    context_path::String = ""
+    node_positions::Dict{String, Point2d} = Dict()
+    pipeline_status::PipelineStatus = PipelineStatus_Stopped
+
+    lock::ReentrantLock = ReentrantLock()
+end
+
+function ContextState(settings::Dict; kwargs...)
+    client_settings = get(settings, "ClientState", Dict{String, Any}())
+    context_path = get(client_settings, "context_path", "")
+
+    node_positions = Dict{String, Point2d}()
+    contexts = get(client_settings, "contexts", Dict())
+    if haskey(contexts, context_path)
+        saved_positions = get(contexts[context_path], "node_positions", Dict())
+        for (name, pos) in saved_positions
+            node_positions[name] = Point2d(pos[1], pos[2])
+        end
+    end
+
+    ContextState(; context_path, node_positions, kwargs...)
+end
+
+Base.lock(ctx::ContextState) = lock(ctx.lock)
+Base.unlock(ctx::ContextState) = unlock(ctx.lock)
+
+function Base.setproperty!(ctx::ContextState, sym::Symbol, x)
+    @lock ctx setfield!(ctx, sym, x)
+end
+
+@kwdef mutable struct ClientState
     client_id::String = ""
     worker_info::Dict = Dict()
 
@@ -170,31 +178,51 @@ end
 
     default_topic_idx::Ref{Cint} = Ref(Cint(0))
     available_topics::Vector{String} = String[]
-    webproxy_status::WebproxyStatus = WebproxyStatus_Idle
+    webproxy_status::RequestStatus = RequestStatus_Idle
     remoterepl_mode::Ref{Bool} = Ref(false)
     remoterepl_status::RemoteReplStatus = RemoteReplStatus_Stopped
 
     # Context file and pipeline
-    context_state::Dict{String, Any} = Dict()
     context_path::String = ""
     context_path_valid::Bool = false
-    node_positions::Dict{String, Point2d} = Dict()
-    pipeline_status::PipelineStatus = PipelineStatus_Stopped
+    context::ContextState = ContextState()
 
     # Karabo status
-    trainmatchers::Dict{String, Any} = Dict()
+    trainmatchers::Dict{String, Vector{String}} = Dict()
+    trainmatchers_request_status::RequestStatus = RequestStatus_Idle
+    trainmatcher_selected_idx::Dict{String, Ref{Cint}} = Dict{String, Ref{Cint}}()
     karabo_devices::Dict{String, Any} = Dict()
 
-    # Variables
+    # Variables and plots
     variable_data::Dict{String, VariableStore} = Dict()
-    plots::Vector{Plot} = Plot[]
+    plot_counter::Int = 0
+    plots::Vector{Union{Plot, CorrelationPlot}} = Union{Plot, CorrelationPlot}[]
 
-    extras::Dict{Symbol, Any} = Dict{Symbol, Any}()
     lock::ReentrantLock = ReentrantLock()
 end
 
-extras_defaults(::ClientState) = Dict(
-)
+function ClientState(settings::Dict; kwargs...)
+    client_settings = get(settings, "ClientState", Dict{String, Any}())
+    context_path = get(client_settings, "context_path", "")
+    context = ContextState(settings)
+
+    ClientState(; context_path, context, kwargs...)
+end
+
+function Base.lock(state::ClientState)
+    lock(state.lock)
+    lock(state.context)
+end
+
+function Base.unlock(state::ClientState)
+    unlock(state.context)
+    unlock(state.lock)
+end
+
+function Base.setproperty!(state::ClientState, sym::Symbol, x)
+    @lock state setfield!(state, sym, x)
+    save_settings(state, sym)
+end
 
 function Base.show(io::IO, client::ClientState)
     print(io, ClientState, "(client_id=$(client.client_id), $(client.status), $(length(client.ssh_hops)) SSH hops)")
@@ -228,7 +256,7 @@ function Base.close(client::ClientState)
     empty!(client.variable_data)
 end
 
-@kwdef mutable struct GuiState <: ExtendableState
+@kwdef mutable struct GuiState
     disable_rendering::Bool = false
 
     # Showing external tool windows
@@ -238,19 +266,41 @@ end
     show_implot_demo::Bool = false
     show_stacktool::Bool = false
     show_debug_log::Bool = false
+    show_state_inspector::Bool = false
 
     # Connections to remote things
     address::String = "wrigleyj@exflonc202.desy.de"
     client::ClientState = ClientState()
     engine_environment::String = "@xfa-default"
+    client_type_current_item::Cint = Cint(0)
 
-    extras::Dict{Any, Any} = Dict()
+    # Plot layout persistence, keyed by context path
+    saved_contexts::Dict{String, Dict{String, Any}} = Dict()
+
     lock::ReentrantLock = ReentrantLock()
 end
 
-extras_defaults(::GuiState) = Dict(
-    :client_type_current_item => Ref(Cint(0))
-)
+function GuiState(settings::Dict; kwargs...)
+    gui = get(settings, "GuiState", Dict{String, Any}())
+    client_settings = get(settings, "ClientState", Dict{String, Any}())
+
+    address = get(gui, "address", "wrigleyj@exflonc202.desy.de")
+    engine_environment = get(gui, "engine_environment", "@xfa-default")
+    client_type_current_item = Cint(get(gui, "client_type", 0))
+    saved_contexts = Dict{String, Dict{String, Any}}(
+        k => Dict{String, Any}(v) for (k, v)
+            in get(client_settings, "contexts", Dict()))
+
+    client = ClientState(settings; embedded_engine = client_type_current_item == 1)
+
+    GuiState(; address, engine_environment, client_type_current_item,
+             saved_contexts, client, kwargs...)
+end
+
+function Base.setproperty!(state::GuiState, sym::Symbol, x)
+    @lock state setfield!(state, sym, x)
+    save_settings(state, sym)
+end
 
 function Base.show(io::IO, state::GuiState)
     print(io, GuiState, "(engine_environment=\"$(state.engine_environment)\")")

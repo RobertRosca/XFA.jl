@@ -63,7 +63,7 @@ function ssh_authenticate_hop(state::GuiState, hop_idx)
     ssh_state.auth_state = :authenticating
 
     new_auth_state = if auth_method == ssh.AuthMethod_Password
-        ssh.authenticate(session; password=ssh_state.password, throw=false)
+        ssh.authenticate(session; password=ssh_state.password[], throw=false)
     elseif auth_method == ssh.AuthMethod_Interactive
         kbdint_answers = [prompt.answer for prompt in ssh_state.kbdint_prompts]
 
@@ -180,7 +180,7 @@ function initialize_engine(state)
     julia_module_prefix = if is_local
         "true"
     else
-        "source /etc/profile.d/modules.sh; SASE=0 module load exfel julia > /dev/null 2>&1"
+        "source /etc/profile.d/modules.sh; SASE=0 module load exfel julia/202502 > /dev/null 2>&1"
     end
 
     julia_binary = if is_local
@@ -193,8 +193,11 @@ function initialize_engine(state)
     client.remote_engine_dir = if is_local
         pkgdir(XfaEngine)
     else
-        proc = run("$(julia_module_prefix); julia --project=@xfa-default -E 'import XfaEngine; pkgdir(XfaEngine)'",
-                   client.ssh_hops[end].session; print_out=false, ignorestatus=true)
+        cmd_str = "$(julia_module_prefix); julia --project=@xfa-default -E 'import XfaEngine; pkgdir(XfaEngine)'"
+        cmd = `bash -c $(cmd_str)`
+        @show cmd
+        proc = run(ignorestatus(cmd),
+                   client.ssh_hops[end].session; print_out=false)
         string(chomp(String(proc.out))[2:end - 1])
     end
 
@@ -281,6 +284,8 @@ end
 
 function disconnect_engine(state, shutdown_engine)
     client = state.client
+    client.status = RemoteStatus_Disconnecting
+
     if shutdown_engine && !isnothing(client.websocket)
         if !WebSockets.isclosed(client.websocket)
             send(client.websocket, Shutdown())
@@ -291,7 +296,9 @@ function disconnect_engine(state, shutdown_engine)
     end
 
     close(state.client)
-    state.client = ClientState()
+    # Note that we use setfield!() here to bypass the locking, which would
+    # otherwise cause locking mismatches.
+    setfield!(state, :client, ClientState(load_settings()))
 end
 
 # Create a Int32 hash to use for ImNodes
@@ -393,7 +400,7 @@ function build_context_state(state, ctx_info)
         end
     end
 
-    state.client.node_positions = merge(new_positions, state.client.node_positions)
+    state.client.context.node_positions = merge(new_positions, state.client.context.node_positions)
 
     return ctx_state
 end
@@ -421,32 +428,36 @@ function handle_msg(state, msg)
         nothing
     elseif msg isa AvailableTopics
         client.available_topics = msg.topics
+        sort!(client.available_topics)
 
         if !isempty(client.available_topics)
             set_default_topic(state)
         end
     elseif msg isa Started
-        client.pipeline_status = PipelineStatus_Started
+        client.context.pipeline_status = PipelineStatus_Started
     elseif msg isa Stopped
-        client.pipeline_status = PipelineStatus_Stopped
+        client.context.pipeline_status = PipelineStatus_Stopped
     elseif msg isa Devices
         if msg.device_names isa Exception
             @error "Error from server with DEVICES" exception=msg
-            client.webproxy_status = WebproxyStatus_Error
+            client.webproxy_status = RequestStatus_Error
         else
             client.karabo_devices = msg.device_names
-            client.webproxy_status = WebproxyStatus_Idle
+            client.webproxy_status = RequestStatus_Idle
             client.trainmatchers = filter(x -> occursin("Matcher", x.second["classId"]),
                                           client.karabo_devices)
         end
+    elseif msg isa AvailableTrainmatchers
+        client.trainmatchers = msg.topic_trainmatchers
+        client.trainmatchers_request_status = RequestStatus_Idle
     elseif msg isa ContextInfo
         if msg.info isa Dict
-            client.context_state = build_context_state(state, msg.info)
+            client.context.context_state = build_context_state(state, msg.info)
         else
             @error "Context failed to load"
         end
 
-        client.pipeline_status = msg.is_running ? PipelineStatus_Started : PipelineStatus_Stopped
+        client.context.pipeline_status = msg.is_running ? PipelineStatus_Started : PipelineStatus_Stopped
     elseif msg isa TrainData
         for variable in msg.variables
             is_new = !haskey(client.variable_data, variable.name)
@@ -464,7 +475,25 @@ function handle_msg(state, msg)
             end
 
             store = client.variable_data[variable.name]
-            push!(store.updates, (variable.tid, variable.data))
+            type = if variable.data isa Number
+                VariableType_Scalar
+            elseif variable.data isa AbstractVector
+                VariableType_Vector
+            elseif variable.data isa AbstractArray
+                VariableType_Array
+            else
+                VariableType_Unknown
+            end
+            push!(store.updates, (variable.tid, variable.data, type))
+
+            ts = store.update_timestamps
+            push!(ts, time())
+            if length(ts) > 100
+                popfirst!(ts)
+            end
+            if length(ts) >= 2
+                store.update_rate = 1 / nanmean(diff(ts))
+            end
         end
     elseif msg isa RemoteReplState
         client.remoterepl_mode[] = msg.enabled
@@ -549,15 +578,21 @@ end
 function get_devices(state)
     client = state.client
     send(client.websocket, GetDevices())
-    client.webproxy_status = WebproxyStatus_WaitingForDevices
+    client.webproxy_status = RequestStatus_Waiting
     empty!(client.karabo_devices)
     empty!(client.trainmatchers)
+    empty!(client.trainmatcher_selected_idx)
+end
+
+function get_trainmatchers(client)
+    send(client.websocket, GetTrainmatchers())
+    client.trainmatchers_request_status = RequestStatus_Waiting
 end
 
 function load_context(state)
     client = state.client
     send(client.websocket, LoadContext(client.context_path))
-    client.pipeline_status = PipelineStatus_LoadingContext
+    client.context.pipeline_status = PipelineStatus_LoadingContext
 end
 
 function revise_engine(state)
@@ -572,13 +607,18 @@ function change_parameter(param::Parameter)
 end
 
 function start(state)
+    for store in values(state.client.variable_data)
+        empty!(store.update_timestamps)
+        store.update_rate = 0
+    end
+
     send(state.client.websocket, Start())
-    state.client.pipeline_status = PipelineStatus_Starting
+    state.client.context.pipeline_status = PipelineStatus_Starting
 end
 
 function stop(state)
     send(state.client.websocket, Stop())
-    state.client.pipeline_status = PipelineStatus_Stopping
+    state.client.context.pipeline_status = PipelineStatus_Stopping
 end
 
 function set_default_topic(state)

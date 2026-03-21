@@ -2,7 +2,7 @@ module ImGuiHelpers
 
 import ..Util
 
-export MenuItem, EditableComboBox, Spinner, SafeInputText, BoxedText, @guiasync, @Disabled, IsItemDisabled, InfoMarker
+export MenuItem, EditableComboBox, Spinner, SafeInputText, BoxedText, BorderedText, @guiasync, @Disabled, IsItemDisabled, InfoMarker
 
 import CImGui as ig
 import CImGui: IM_COL32, ImVec2
@@ -93,6 +93,16 @@ function SafeInputText(label; max_len=63, hint="", current_text="", password=fal
     end
 
     return ret, unsafe_string(pointer(state.buffer))
+end
+
+function BorderedText(text; color=IM_COL32(255, 0, 0, 255), thickness=2.0, padding=ImVec2(4, 4))
+    draw_list = ig.GetWindowDrawList()
+    cursor = ig.GetCursorScreenPos()
+    text_size = ig.CalcTextSize(text)
+    p_min = ImVec2(cursor.x - padding.x, cursor.y - padding.y)
+    p_max = ImVec2(cursor.x + text_size.x + padding.x, cursor.y + text_size.y + padding.y)
+    ig.AddRect(draw_list, p_min, p_max, color, 0.0, 0, thickness)
+    ig.Text(text)
 end
 
 function BoxedText(label, text)

@@ -1,10 +1,11 @@
 module Protocol
 
 export AbstractMessage, Ping, Shutdown,
-    GetDevices, LoadContext, ReviseCode,
+    GetDevices, GetTrainmatchers, LoadContext, ReviseCode,
     ChangeParameter, SetDefaultTopic, Start, Stop,
     SetDebugMode, SetRemoteRepl,
-    Pong, AvailableTopics, Started, Stopped, Devices,
+    Pong, AvailableTopics, AvailableTrainmatchers,
+    Started, Stopped, Devices,
     ContextInfo, ParameterChanged, TrainData, RemoteReplState
 
 import Serialization: serialize, deserialize
@@ -49,11 +50,17 @@ struct SetRemoteRepl <: AbstractMessage
     enable::Bool
 end
 
+struct GetTrainmatchers <: AbstractMessage end
+
 # Messages that the server can send
 struct Pong <: AbstractMessage end
 
 struct AvailableTopics <: AbstractMessage
     topics::Vector{String}
+end
+
+struct AvailableTrainmatchers <: AbstractMessage
+    topic_trainmatchers::Dict{String, Vector{String}}
 end
 
 struct Started <: AbstractMessage end

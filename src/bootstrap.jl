@@ -37,8 +37,8 @@ if isfile(toml_path)
     headnode_pid = worker_info["1"]["pid"]
 
     # If it does but its old and the process does not exist anymore, delete it
-    pid_alive = @ccall kill(headnode_pid::Cint, 0::Cint)::Cint
-    if pid_alive != 0
+    pid_alive = @ccall(kill(headnode_pid::Cint, 0::Cint)::Cint) == 0
+    if !pid_alive
         rm(toml_path)
     end
 end
