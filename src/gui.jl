@@ -207,6 +207,17 @@ function draw_dag()
         Spinner()
     end
 
+    ig.SameLine()
+    ig.SetCursorPosX(ig.GetCursorPos().x + ig.GetContentRegionAvail().x - 100)
+    if ig.Button("Add variable")
+        ig.OpenPopup("add_variable_popup")
+    end
+    if ig.BeginPopup("add_variable_popup")
+        if ig.Selectable("Karabo source")
+        end
+        ig.EndPopup()
+    end
+
     ig.Dummy(0, 10)
 
     ImNodes.BeginNodeEditor()
@@ -222,6 +233,22 @@ function draw_dag()
         ImNodes.BeginNode(node_id)
         ImNodes.BeginNodeTitleBar()
         ig.Text(name)
+        rename_reset = false
+        if ig.IsItemClicked(ig.ImGuiMouseButton_Right)
+            ig.OpenPopup("rename_node_popup")
+            rename_reset = true
+        end
+        ig.PushStyleVar(ig.ImGuiStyleVar_WindowPadding, ImVec2(10, 10))
+        if ig.BeginPopup("rename_node_popup")
+            ig.Text("Rename variable: ")
+            ig.SameLine()
+            edited, new_name = SafeInputText("##rename"; current_text=name, reset=rename_reset)
+            if edited || ig.IsKeyPressed(ig.ImGuiKey_Escape)
+                ig.CloseCurrentPopup()
+            end
+            ig.EndPopup()
+        end
+        ig.PopStyleVar()
         ImNodes.EndNodeTitleBar()
 
         # Draw parameters
@@ -541,7 +568,7 @@ end
 
 ## Main GUI function
 
-default(value, default="") = isnothing(value) ? default : value
+default(value, default="") = something(value, default)
 
 function draw_gui()
     # Dock the main window by default
@@ -563,7 +590,7 @@ function draw_gui()
         draw_main_menubar()
 
         if Threads.threadid() == 1
-            BorderedText("Warning: GUI is running on thread 1, this may cause performance issues")
+            BorderedText("Warning: GUI is running on thread 1, this may cause performance issues. Start Julia with e.g. `julia -t auto,2` instead.")
         end
 
         ig.BeginTabBar("main-tab-bar")
