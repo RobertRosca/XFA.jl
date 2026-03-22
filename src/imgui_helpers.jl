@@ -2,7 +2,7 @@ module ImGuiHelpers
 
 import ..Util
 
-export MenuItem, EditableComboBox, Spinner, SafeInputText, BoxedText, BorderedText, @guiasync, @Disabled, IsItemDisabled, InfoMarker
+export MenuItem, EditableComboBox, Spinner, SafeInputText, BoxedText, BorderedText, EditableText, @guiasync, @Disabled, IsItemDisabled, InfoMarker
 
 import CImGui as ig
 import CImGui: IM_COL32, ImVec2
@@ -18,7 +18,7 @@ function SafeInputTextState(max_len::Int, reference_text::String)
     SafeInputTextState(buffer, reference_text)
 end
 
-safe_input_text_cache = Dict{UInt32, SafeInputTextState}()
+const safe_input_text_cache = Dict{UInt32, SafeInputTextState}()
 
 
 function MenuItem(label::String, selected::Ref{Bool}, enabled::Bool=true)
@@ -68,9 +68,9 @@ function EditableComboBox(label, text, completions;
     return edited, unsafe_string(pointer(input))
 end
 
-function SafeInputText(label; max_len=63, hint="", current_text="", password=false)
+function SafeInputText(label; max_len=63, hint="", current_text="", password=false, reset=false)
     id = ig.GetID(label)
-    if !haskey(safe_input_text_cache, id)
+    if !haskey(safe_input_text_cache, id) || reset
         safe_input_text_cache[id] = SafeInputTextState(max_len, current_text)
         Util.strcpy!(safe_input_text_cache[id].buffer, current_text)
     end
