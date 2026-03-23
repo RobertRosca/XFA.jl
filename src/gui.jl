@@ -229,23 +229,28 @@ function draw_dag()
         # Draw titlebar
         ImNodes.BeginNode(node_id)
         ImNodes.BeginNodeTitleBar()
-        ig.Text(name)
-        rename_reset = false
-        if ig.IsItemClicked(ig.ImGuiMouseButton_Right)
-            ig.OpenPopup("rename_node_popup")
-            rename_reset = true
+
+        rename_clicked = ig.SmallButton("\uf044##rename-$(name)")
+        if rename_clicked
+            var_data["renaming"] = true
         end
-        ig.PushStyleVar(ig.ImGuiStyleVar_WindowPadding, ImVec2(10, 10))
-        if ig.BeginPopup("rename_node_popup")
-            ig.Text("Rename variable: ")
-            ig.SameLine()
-            edited, new_name = SafeInputText("##rename"; current_text=name, reset=rename_reset)
-            if edited || ig.IsKeyPressed(ig.ImGuiKey_Escape)
-                ig.CloseCurrentPopup()
+
+        ig.SameLine()
+        if var_data["renaming"]
+            if rename_clicked
+                ig.SetKeyboardFocusHere()
             end
-            ig.EndPopup()
+            ig.SetNextItemWidth(min_node_width)
+            ig.PushStyleColor(ig.ImGuiCol_TextSelectedBg, ig.IM_COL32(60, 60, 120, 200))
+            edited, new_name = SafeInputText("##rename-$(name)"; current_text=name, reset=rename_clicked)
+            ig.PopStyleColor()
+            lost_focus = ig.IsItemDeactivated() && !ig.IsItemActive()
+            if edited || ig.IsKeyPressed(ig.ImGuiKey_Escape) || lost_focus
+                var_data["renaming"] = false
+            end
+        else
+            ig.Text(name)
         end
-        ig.PopStyleVar()
         ImNodes.EndNodeTitleBar()
 
         # Draw parameters
@@ -812,6 +817,8 @@ function main(; test_engine=nothing)
     style.FrameBorderSize = 1
 
     # Load fonts
+    font_config = ig.ImFontConfig()
+    font_config.MergeMode = true
     font_atlas = unsafe_load(ig.GetIO().Fonts)
     font_dir = joinpath(@__DIR__, "fonts")
     fonts=[
@@ -822,6 +829,7 @@ function main(; test_engine=nothing)
     ]
     for (font, font_size) in fonts
         ig.AddFontFromFileTTF(font_atlas, font, font_size)
+        ig.AddFontFromFileTTF(font_atlas, joinpath(font_dir, "fa-regular-400.otf"), 20, font_config)
     end
 
     # Setup ImPlot context

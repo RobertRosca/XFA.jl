@@ -411,6 +411,10 @@ function build_context_state(state, ctx_info)
 
     state.client.context.node_positions = merge(new_positions, state.client.context.node_positions)
 
+    for var_data in values(ctx_state)
+        var_data["renaming"] = false
+    end
+
     return ctx_state
 end
 
