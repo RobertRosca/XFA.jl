@@ -1,6 +1,16 @@
 const BASTION = "bastion.desy.de"
 const GATEWAY = "exflgateway.desy.de"
 
+function send(client::ClientState, msg::AbstractMessage)
+    id = Protocol.client_send(client.websocket, msg)
+    client.pending_requests[id] = PendingRequest(typeof(msg), time())
+    return id
+end
+
+function is_pending(client::ClientState, id::Union{MessageId, Nothing})
+    !isnothing(id) && haskey(client.pending_requests, id)
+end
+
 function peekall(buffer::IOBuffer)
     return String(take!(copy(buffer)))
 end
@@ -152,7 +162,6 @@ function sync_files()
         end
 
         changed_files = split(git_diff, "\n")
-        @info "Syncing files" changed_files
 
         for path in changed_files
             local_path = joinpath(engine_dir, basename(path))
@@ -288,7 +297,7 @@ function disconnect_engine(state, shutdown_engine)
 
     if shutdown_engine && !isnothing(client.websocket)
         if !WebSockets.isclosed(client.websocket)
-            send(client.websocket, Shutdown())
+            send(client, Shutdown())
         end
 
         # Wait for the websocket to be closed before killing the connection
@@ -498,6 +507,10 @@ function handle_msg(state, msg)
     elseif msg isa RemoteReplState
         client.remoterepl_mode[] = msg.enabled
         client.remoterepl_status = msg.enabled ? RemoteReplStatus_Running : RemoteReplStatus_Stopped
+    elseif msg isa Ack
+        if !isnothing(msg.error)
+            @error "Server reported an error" exception=msg.error
+        end
     else
         @warn "Received unsupported message of type '$(typeof(msg))'"
     end
@@ -528,10 +541,14 @@ function handle_server(state)
 
                 for msg_bytes in ws
                     buffer = IOBuffer(msg_bytes)
-                    msg::AbstractMessage = deserialize(buffer)
+                    envelope::Envelope = deserialize(buffer)
+
+                    if !isnothing(envelope.reply_to)
+                        delete!(client.pending_requests, envelope.reply_to)
+                    end
 
                     try
-                        @invokelatest handle_msg(state, msg)
+                        @invokelatest handle_msg(state, envelope.msg)
                     catch ex
                         @error "Error handling message!" exception=(ex, catch_backtrace())
                     end
@@ -577,7 +594,7 @@ end
 
 function get_devices(state)
     client = state.client
-    send(client.websocket, GetDevices())
+    send(client, GetDevices())
     client.webproxy_status = RequestStatus_Waiting
     empty!(client.karabo_devices)
     empty!(client.trainmatchers)
@@ -585,25 +602,25 @@ function get_devices(state)
 end
 
 function get_trainmatchers(client)
-    send(client.websocket, GetTrainmatchers())
+    send(client, GetTrainmatchers())
     client.trainmatchers_request_status = RequestStatus_Waiting
 end
 
 function load_context(state)
     client = state.client
-    send(client.websocket, LoadContext(client.context_path))
+    send(client, LoadContext(client.context_path))
     client.context.pipeline_status = PipelineStatus_LoadingContext
 end
 
 function revise_engine(state)
     client = state.client
     if client.status == RemoteStatus_Connected && !isnothing(client.websocket)
-        send(client.websocket, ReviseCode())
+        send(client, ReviseCode())
     end
 end
 
 function change_parameter(param::Parameter)
-    send(state[].client.websocket, ChangeParameter(param))
+    send(state[].client, ChangeParameter(param))
 end
 
 function start(state)
@@ -612,12 +629,12 @@ function start(state)
         store.update_rate = 0
     end
 
-    send(state.client.websocket, Start())
+    send(state.client, Start())
     state.client.context.pipeline_status = PipelineStatus_Starting
 end
 
 function stop(state)
-    send(state.client.websocket, Stop())
+    send(state.client, Stop())
     state.client.context.pipeline_status = PipelineStatus_Stopping
 end
 
@@ -625,16 +642,16 @@ function set_default_topic(state)
     client = state.client
     idx = client.default_topic_idx[] + 1 # Add 1 to go from a C index to a Julia index
     topic = client.available_topics[idx]
-    send(client.websocket, SetDefaultTopic(topic))
+    send(client, SetDefaultTopic(topic))
 end
 
 function set_debug_mode(state)
     client = state.client
-    send(client.websocket, SetDebugMode(client.debug_mode[]))
+    client.debug_mode_request = send(client, SetDebugMode(client.debug_mode[]))
 end
 
 function set_remoterepl(state)
     client = state.client
     client.remoterepl_status = RemoteReplStatus_Changing
-    send(client.websocket, SetRemoteRepl(client.remoterepl_mode[]))
+    send(client, SetRemoteRepl(client.remoterepl_mode[]))
 end

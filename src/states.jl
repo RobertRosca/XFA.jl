@@ -157,11 +157,17 @@ function Base.setproperty!(ctx::ContextState, sym::Symbol, x)
     @lock ctx setfield!(ctx, sym, x)
 end
 
+struct PendingRequest
+    msg_type::Type
+    sent_at::Float64
+end
+
 @kwdef mutable struct ClientState
     client_id::String = ""
     worker_info::Dict = Dict()
 
     debug_mode::Ref{Bool} = Ref(false)
+    debug_mode_request::Maybe{Int} = nothing
     syncing::Bool = false
     status::RemoteStatus = RemoteStatus_Unconnected
     websocket::Maybe{WebSockets.WebSocket} = nothing
@@ -197,6 +203,9 @@ end
     variable_data::Dict{String, VariableStore} = Dict()
     plot_counter::Int = 0
     plots::Vector{Union{Plot, CorrelationPlot}} = Union{Plot, CorrelationPlot}[]
+
+    # Message tracking
+    pending_requests::Dict{Int, PendingRequest} = Dict()
 
     lock::ReentrantLock = ReentrantLock()
 end

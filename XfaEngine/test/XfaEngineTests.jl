@@ -115,46 +115,49 @@ end
             @test length(id) > 5
 
             # The next message should be the available topics
-            @test Protocol.receive(ws) isa Protocol.AvailableTopics
-            Protocol.send(ws, Protocol.SetDefaultTopic("localhost"))
+            @test Protocol.receive(ws).msg isa Protocol.AvailableTopics
+            Protocol.client_send(ws, Protocol.SetDefaultTopic("localhost"))
+            @test Protocol.receive(ws).msg isa Protocol.Ack
 
             # Test Ping
-            Protocol.send(ws, Protocol.Ping())
-            @test Protocol.receive(ws) isa Protocol.Pong
+            Protocol.client_send(ws, Protocol.Ping())
+            @test Protocol.receive(ws).msg isa Protocol.Pong
 
             # Test GetDevices
             webproxy_port = XfaEngine.getavailableport(8484)
             mock_webproxy(webproxy_port) do
-                Protocol.send(ws, Protocol.GetDevices())
-                @test Protocol.receive(ws) isa Protocol.Devices
+                Protocol.client_send(ws, Protocol.GetDevices())
+                @test Protocol.receive(ws).msg isa Protocol.Devices
             end
 
             # Test LoadContext
             mktemp() do path, io
                 # Test loading an invalid context
                 # write(path, "@Variable x -> foo")
-                # Protocol.send(ws, Protocol.LoadContext(path))
-                # msg = Protocol.receive(ws)
+                # Protocol.client_send(ws, Protocol.LoadContext(path))
+                # msg = Protocol.receive(ws).msg
                 # @test msg isa Protocol.ContextInfo
                 # @test msg.info isa Exception
 
                 # Test loading a valid context
                 write(path, """
                             p = Parameter(0)
-                            @Variable x -> karabo"foo.bar" 
+                            @Variable x -> karabo"foo.bar"
                             """)
-                Protocol.send(ws, Protocol.LoadContext(path))
-                msg = Protocol.receive(ws)
+                Protocol.client_send(ws, Protocol.LoadContext(path))
+                msg = Protocol.receive(ws).msg
                 @test msg isa Protocol.ContextInfo
                 @test msg.info isa Dict
                 @test haskey(msg.info["dag"], "x")
             end
 
             # Test ChangeParameter
-            Protocol.send(ws, Protocol.ChangeParameter(Parameter("p", 1)))
+            Protocol.client_send(ws, Protocol.ChangeParameter(Parameter("p", 1)))
+            @test Protocol.receive(ws).msg isa Protocol.Ack
 
             # Test ReviseCode
-            Protocol.send(ws, Protocol.ReviseCode())
+            Protocol.client_send(ws, Protocol.ReviseCode())
+            @test Protocol.receive(ws).msg isa Protocol.Ack
         end
     end
 
@@ -170,6 +173,37 @@ end
     #         run(`$(executable) --project=$(environment) --startup-file=no --color=no $(launcher_script)`)
     #     end
     # end
+end
+
+@testset "Message tracking" begin
+    log = TestLogger()
+    temp_engine(; log) do address, stop_event, info_path
+        WebSockets.open(address) do ws
+            # Consume the client ID and initial AvailableTopics
+            WebSockets.receive(ws)
+            Protocol.receive(ws)
+
+            # Test that send always assigns an ID and the server
+            # echoes it back as reply_to
+            id = Protocol.client_send(ws, Protocol.Ping())
+            @test id > 0
+            envelope = Protocol.receive(ws)
+            @test envelope isa Protocol.Envelope
+            @test envelope.id < 0
+            @test envelope.reply_to == id
+            @test envelope.msg isa Protocol.Pong
+
+            # Test that Ack messages carry reply_to for fire-and-forget
+            # messages
+            id1 = Protocol.client_send(ws, Protocol.SetDefaultTopic("localhost"))
+            id2 = Protocol.client_send(ws, Protocol.SetDefaultTopic("localhost"))
+            env1 = Protocol.receive(ws)
+            env2 = Protocol.receive(ws)
+            @test env1.msg isa Protocol.Ack
+            @test env2.msg isa Protocol.Ack
+            @test Set([env1.reply_to, env2.reply_to]) == Set([id1, id2])
+        end
+    end
 end
 
 function getavailableport(port_hint; interface=ip"127.0.0.1")

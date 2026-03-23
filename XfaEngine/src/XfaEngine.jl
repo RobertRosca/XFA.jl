@@ -76,7 +76,7 @@ current_engine_state::Union{EngineState, Nothing} = nothing
 function forward_output(state::EngineState, stream_output)
     for data in stream_output
         for client in values(state.clients)
-            Protocol.send(client.websocket, TrainData([data]))
+            Protocol.server_send(client.websocket, TrainData([data]))
         end
     end
 end
@@ -92,13 +92,14 @@ function shutdown(state::EngineState, ws_server=nothing)
     end
 end
 
-function handle_message(msg::AbstractMessage, state::EngineState, id)
+function handle_message(msg::AbstractMessage, state::EngineState, id, request_id::Union{MessageId, Nothing})
     client_state = state.clients[id]
     ws = client_state.websocket
+    reply_to = request_id
 
     if msg isa Ping
         client_state.last_heartbeat = time()
-        Protocol.send(ws, Pong())
+        Protocol.server_send(ws, Pong(); reply_to)
     elseif msg isa Shutdown
         @info "Received shutdown request from client $(id)"
         shutdown(state)
@@ -106,19 +107,20 @@ function handle_message(msg::AbstractMessage, state::EngineState, id)
     elseif msg isa SetDefaultTopic
         state.default_topic = msg.topic
         @info "Set default topic to: $(state.default_topic)"
+        Protocol.server_send(ws, Ack(); reply_to)
     elseif msg isa GetDevices
         try
             wp = state.webproxies[state.default_topic]
             devices = get_devices(wp)
-            Protocol.send(ws, Devices(devices))
+            Protocol.server_send(ws, Devices(devices); reply_to)
             @info "Responded to 'GetDevices' from $(id)"
         catch ex
             @error "Error in 'GetDevices', requested by $(id)" exception=(ex, catch_backtrace())
-            Protocol.send(ws, Devices(ex))
+            Protocol.server_send(ws, Devices(ex); reply_to)
         end
     elseif msg isa GetTrainmatchers
         trainmatchers = get_all_trainmatchers(state.webproxies)
-        Protocol.send(ws, AvailableTrainmatchers(trainmatchers))
+        Protocol.server_send(ws, AvailableTrainmatchers(trainmatchers); reply_to)
     elseif msg isa LoadContext
         path = abspath(expanduser(msg.path))
 
@@ -142,27 +144,29 @@ function handle_message(msg::AbstractMessage, state::EngineState, id)
             end
 
             @info "Loaded context file $(path): $(state.ctx)"
-            Protocol.send(ws, ContextInfo(state.ctx))
+            Protocol.server_send(ws, ContextInfo(state.ctx); reply_to)
         else
             @error "Loading context file at $(path) failed" exception=new_ctx_or_ex
-            Protocol.send(ws, ContextInfo(new_ctx_or_ex, state.ctx.is_running[]))
+            Protocol.server_send(ws, ContextInfo(new_ctx_or_ex, state.ctx.is_running[]); reply_to)
         end
     elseif msg isa ReviseCode
         @everywhere Revise.revise()
         @info "Revised source code"
+        Protocol.server_send(ws, Ack(); reply_to)
     elseif msg isa ChangeParameter
         param = msg.parameter
         Context.change_parameter(param)
         @info "ChangeParameter of $(param.name) to $(param.value)"
+        Protocol.server_send(ws, Ack(); reply_to)
     elseif msg isa Start
         @info "Starting pipeline..."
         Context.start_pipeline(state.ctx)
-        Protocol.send(ws, Started())
+        Protocol.server_send(ws, Started(); reply_to)
         @info "Started"
     elseif msg isa Stop
         @info "Stopping pipeline..."
         Context.stop_pipeline(state.ctx)
-        Protocol.send(ws, Stopped())
+        Protocol.server_send(ws, Stopped(); reply_to)
         @info "Stopped"
     elseif msg isa SetDebugMode
         @info "Setting debug mode: $(msg.enable)"
@@ -171,17 +175,19 @@ function handle_message(msg::AbstractMessage, state::EngineState, id)
         else
             delete!(ENV, "JULIA_DEBUG")
         end
+
+        Protocol.server_send(ws, Ack(); reply_to)
     elseif msg isa SetRemoteRepl
         if msg.enable
             @info "Starting RemoteREPL"
             port, state.remoterepl_server = Sockets.listenany(27754)
             state.remoterepl_task = Threads.@spawn RemoteREPL.serve_repl(state.remoterepl_server)
-            Protocol.send(ws, RemoteReplState(true, Int(port)))
+            Protocol.server_send(ws, RemoteReplState(true, Int(port)); reply_to)
         else
             @info "Stopping RemoteREPL"
             close(state.remoterepl_server)
             wait(state.remoterepl_task)
-            Protocol.send(ws, RemoteReplState(false, -1))
+            Protocol.server_send(ws, RemoteReplState(false, -1); reply_to)
         end
     else
         @error "Received unsupported message: $(typeof(msg))"
@@ -198,14 +204,14 @@ function handle_client(state::EngineState, id)
     @info "Connected to new client: $(id) 🙋"
 
     # And the available topics
-    Protocol.send(ws, AvailableTopics(collect(keys(state.webproxies))))
+    Protocol.server_send(ws, AvailableTopics(collect(keys(state.webproxies))))
 
     for msg_bytes in ws
         buffer = IOBuffer(msg_bytes)
-        msg = deserialize(buffer)
+        envelope = deserialize(buffer)::Envelope
 
         try
-            @invokelatest handle_message(msg, state, id)
+            @invokelatest handle_message(envelope.msg, state, id, envelope.id)
         catch ex
             @error "Caught exception when handling message from $(id)" exception=(ex, catch_backtrace())
         end

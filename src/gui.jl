@@ -1,10 +1,9 @@
 import Base.ScopedValues: ScopedValue, @with
 
-import CImGui as ig
-import CImGui: ImVec2, ImVec4
-import CImGui.CSyntax: @c
-import ImPlot
-import GLFW
+using CImGui: CImGui as ig, ImVec2, ImVec4
+using CImGui.CSyntax: @c
+using ImPlot: ImPlot
+using GLFW: GLFW
 using ModernGL
 
 include("imnodes.jl")
@@ -14,21 +13,19 @@ using NaNStatistics: nanmean, nanmaximum, nanminimum
 using DimensionalData: DimensionalData as DD, DimVector, DimMatrix, DimArray, At, lookup
 include("plotting.jl")
 
-import LibSSH as ssh
-import HTTP: WebSockets
-import XfaEngine: EngineState, getavailableport
+using LibSSH: LibSSH as ssh
+using HTTP: HTTP, WebSockets
+using XfaEngine: EngineState, getavailableport
 include("states.jl")
 
 using Printf: @sprintf
-import TOML
-import Sockets
-import CRC32c: crc32c
+using TOML: TOML
+using Sockets: Sockets
+using CRC32c: crc32c
 using Serialization
-import HTTP
-import XfaEngine
-import XfaEngine.Context: KaraboDependency, Dependency, Parameter
 using XfaEngine.Protocol
-import XfaEngine.Protocol: send
+using XfaEngine: XfaEngine, Protocol
+using XfaEngine.Context: KaraboDependency, Dependency, Parameter
 using .ImGuiHelpers
 include("state_inspector.jl")
 include("client.jl")
@@ -690,10 +687,17 @@ function draw_gui()
                 ig.Separator()
                 ig.Dummy(0, 2)
 
-                ig.Text("Debug mode")
-                ig.SameLine()
-                if ig.Checkbox("##debug-mode", client.debug_mode)
-                    set_debug_mode(state[])
+                @Disabled is_pending(client, client.debug_mode_request) begin
+                    ig.Text("Debug mode")
+                    ig.SameLine()
+                    if ig.Checkbox("##debug-mode", client.debug_mode)
+                        set_debug_mode(state[])
+                    end
+
+                    if is_pending(client, client.debug_mode_request)
+                        ig.SameLine()
+                        Spinner()
+                    end
                 end
 
                 @Disabled client.remoterepl_status == RemoteReplStatus_Changing begin
@@ -890,3 +894,6 @@ function main(; test_engine=nothing)
 
     return t, gui_state
 end
+
+precompile(main, ())
+precompile(draw_gui, ())

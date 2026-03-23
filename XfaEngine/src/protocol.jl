@@ -6,7 +6,8 @@ export AbstractMessage, Ping, Shutdown,
     SetDebugMode, SetRemoteRepl,
     Pong, AvailableTopics, AvailableTrainmatchers,
     Started, Stopped, Devices,
-    ContextInfo, ParameterChanged, TrainData, RemoteReplState
+    ContextInfo, ParameterChanged, TrainData, RemoteReplState,
+    Ack, Envelope, MessageId, client_send, server_send
 
 import Serialization: serialize, deserialize
 
@@ -90,13 +91,44 @@ struct RemoteReplState <: AbstractMessage
     port::Int
 end
 
-function send(ws::WebSockets.WebSocket, msg::AbstractMessage)
-    buffer = IOBuffer()
-    serialize(buffer, msg)
-    WebSockets.send(ws, take!(buffer))
+struct Ack <: AbstractMessage
+    error::Union{Exception, Nothing}
+end
+Ack() = Ack(nothing)
+
+const MessageId = Int
+
+struct Envelope
+    id::MessageId
+    reply_to::Union{MessageId, Nothing}
+    msg::AbstractMessage
 end
 
-function receive(ws::WebSockets.WebSocket)::AbstractMessage
+const _client_counter = Threads.Atomic{Int}(1)
+const _server_counter = Threads.Atomic{Int}(-1)
+next_client_id() = Threads.atomic_add!(_client_counter, 1)
+next_server_id() = Threads.atomic_add!(_server_counter, -1)
+
+function _send(ws::WebSockets.WebSocket, id::MessageId, msg::AbstractMessage;
+               reply_to::Union{MessageId, Nothing}=nothing)
+    envelope = Envelope(id, reply_to, msg)
+    buffer = IOBuffer()
+    serialize(buffer, envelope)
+    WebSockets.send(ws, take!(buffer))
+    return envelope.id
+end
+
+function client_send(ws::WebSockets.WebSocket, msg::AbstractMessage;
+                     reply_to::Union{MessageId, Nothing}=nothing)
+    _send(ws, next_client_id(), msg; reply_to)
+end
+
+function server_send(ws::WebSockets.WebSocket, msg::AbstractMessage;
+                     reply_to::Union{MessageId, Nothing}=nothing)
+    _send(ws, next_server_id(), msg; reply_to)
+end
+
+function receive(ws::WebSockets.WebSocket)::Envelope
     buffer = IOBuffer(WebSockets.receive(ws))
     return deserialize(buffer)
 end
