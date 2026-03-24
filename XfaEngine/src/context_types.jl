@@ -190,8 +190,8 @@ function _variable(ctx_module, expr, side_effects)
             end
 
             if $side_effects
-                Context.registered_variables[$func_name] = $dependencies_expr
-                Context.registered_subvariables[$func_name] = $subvariables_expr
+                Context.variable_dependencies(::typeof($func_name)) = $dependencies_expr
+                Context.variable_subvariables(::typeof($func_name)) = $subvariables_expr
             end
         end
 
@@ -273,7 +273,7 @@ function _input(ctx_module, expr, side_effects)
             end
 
             if $side_effects
-                Context.registered_inputs[$name] = $dependencies_expr
+                Context.input_dependencies(::typeof($name)) = $dependencies_expr
             end
         end
 
@@ -331,7 +331,7 @@ function _group(ctx_module, expr, side_effects)
             $(expr)
 
             if $side_effects
-                Context.registered_groups[$name] = []
+                Context.group_fields(::Type{$name}) = []
             end
 
             $name

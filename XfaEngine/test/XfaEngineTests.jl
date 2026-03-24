@@ -976,7 +976,8 @@ end
                                                             "bridge.hostname" => Parameter("bridge.hostname", ""),
                                                             "bridge.port" => Parameter("bridge.port", 45000),
                                                             "bridge.trainmatcher" => Parameter("bridge.trainmatcher", ""),
-                                                            "bridge.manual_configuration" => Parameter("bridge.manual_configuration", false)))
+                                                            "bridge.manual_configuration" => Parameter("bridge.manual_configuration", false)),
+                                       "path" => "")
 end
 
 end

@@ -12,10 +12,13 @@ import OrderedCollections: OrderedDict
 import DimensionalData as DD
 import ..XfaEngine
 
-const registered_variables = Dict{Function, Vector{Any}}()
-const registered_subvariables = Dict{Function, Vector{String}}()
-const registered_inputs = Dict{Function, Any}()
-const registered_groups = Dict{DataType, Any}()
+# Trait functions for dispatch-based metadata registration.
+# Overloaded by @Variable, @Input, and @Group macros for each
+# function/type they define, enabling Revise compatibility.
+function variable_dependencies end
+function input_dependencies end
+function group_fields end
+variable_subvariables(_) = String[]
 
 struct Neighbour
     name::String
@@ -651,18 +654,39 @@ function run(f::Function, ctx::XfaContext; timeout=10, kwargs...)
     end
 end
 
-function load_from_string(ctx_str::AbstractString)
-    # Clean up all the registered things from previous evaluations of the
-    # context file. This isn't strictly necessary but it makes debugging
-    # simpler.
-    for item_cache in (registered_variables, registered_subvariables, registered_inputs, registered_groups)
-        for key in keys(item_cache)
-            parent_modules = string.(fullname(parentmodule(key)))
-            if any(startswith.(parent_modules, "XfaContext"))
-                pop!(item_cache, key)
+function _is_context_method(m::Method)
+    # Check if the method's type parameter belongs to an XfaContext module.
+    # For variable/input traits: signature is Tuple{typeof(f), typeof(func)}
+    #   where parentmodule(func) is the context module
+    # For group traits: signature is Tuple{typeof(f), Type{T}}
+    #   where parentmodule(T) is the context module
+    length(m.sig.parameters) >= 2 || return false
+    T = m.sig.parameters[2]
+
+    owner = if T <: Type
+        T.parameters[1]  # extract T from Type{T}
+    elseif isdefined(T, :instance)
+        T.instance        # extract func from typeof(func)
+    else
+        return false      # not a concrete singleton (e.g. the default method)
+    end
+
+    mod_names = string.(fullname(parentmodule(owner)))
+    return any(startswith.(mod_names, "XfaContext"))
+end
+
+function _cleanup_context_methods()
+    for f in (variable_dependencies, variable_subvariables, input_dependencies, group_fields)
+        for m in methods(f)
+            if _is_context_method(m)
+                Base.delete_method(m)
             end
         end
     end
+end
+
+function load_from_string(ctx_str::AbstractString)
+    _cleanup_context_methods()
 
     ctx_module = Module(Symbol(:XfaContext, gensym()))
     init_expr = quote
@@ -693,34 +717,57 @@ end
 function load_from_module(ctx_module::Module, exprs::Vector{Expr})
     parameters = Dict{String, Parameter}()
 
-    # Find top-level parameters
+    # Discover all variables, inputs, group types, and parameters defined
+    # in ctx_module by scanning its names and checking for trait methods.
+    ctx_variables = Dict{Function, Vector{Any}}()
+    ctx_inputs = Dict{Function, Vector{Any}}()
+    group_types = Dict{DataType, Group}()
+
+    # Scan ctx_module for variables and parameters
     for name in names(ctx_module; all=true)
-        object = getproperty(ctx_module, name)
-        if object isa Parameter
-            object.name = string(name)
-            parameters[string(name)] = object
+        isdefined(ctx_module, name) || continue
+        obj = getfield(ctx_module, name)
+
+        if obj isa Parameter
+            obj.name = string(name)
+            parameters[string(name)] = obj
+        elseif obj isa Function && parentmodule(obj) === ctx_module &&
+               hasmethod(variable_dependencies, Tuple{typeof(obj)})
+            ctx_variables[obj] = variable_dependencies(obj)
         end
     end
 
-    # Load the group types
-    group_types = Dict{DataType, Group}()
-    for (group_struct, param_fields) in registered_groups
-        group_types[group_struct] = Group(group_struct, Function[])
+    # Discover all registered variables, inputs, and group types from trait
+    # methods. This includes builtins and variables from included modules.
+    all_variables = copy(ctx_variables)
+    for m in methods(variable_dependencies)
+        F = m.sig.parameters[2]
+        isdefined(F, :instance) || continue
+        func = F.instance
+        haskey(all_variables, func) || (all_variables[func] = variable_dependencies(func))
+    end
 
-        for (func, deps) in registered_variables
-            if isempty(deps)
-                continue
-            end
+    for m in methods(group_fields)
+        T = m.sig.parameters[2].parameters[1]
+        group_types[T] = Group(T, Function[])
+    end
 
-            first_arg_type = deps[1][2]
-            if first_arg_type isa GroupDependency && first_arg_type.type == group_struct
-                push!(group_types[group_struct].variables, func)
+    for m in methods(input_dependencies)
+        F = m.sig.parameters[2]
+        func = F.instance
+        ctx_inputs[func] = input_dependencies(func)
+    end
+
+    # Associate variables with their group types
+    for (group_struct, group) in group_types
+        for (func, deps) in merge(all_variables, ctx_inputs)
+            if !isempty(deps) && deps[1][2] isa GroupDependency && deps[1][2].type == group_struct
+                push!(group.variables, func)
             end
         end
     end
 
     # Check if there are any parameters with the same name as a variable
-    ctx_variables = filter(pair -> parentmodule(pair.first) === ctx_module, registered_variables)
     ctx_variable_names = string.(nameof.(keys(ctx_variables)))
     common_var_param_names = intersect(ctx_variable_names,
                                        keys(parameters))
@@ -734,9 +781,6 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr})
     for func in keys(ctx_variables)
         functions[string(nameof(func))] = func
     end
-
-    # Find all the inputs defined in the context file itself
-    ctx_inputs = filter(pair -> parentmodule(pair.first) == ctx_module, registered_inputs)
 
     # Check for duplicate variable/input names
     ctx_variable_names = Set(nameof.(keys(ctx_variables)))
@@ -775,7 +819,7 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr})
         # If so, then add all their variables to the DAG
         for variable_func in group_types[group_type].variables
             # If it's an input, handle it later
-            if haskey(registered_inputs, variable_func)
+            if haskey(ctx_inputs, variable_func)
                 continue
             end
 
@@ -821,7 +865,7 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr})
         end
 
         # And all the inputs
-        for (input_func, deps) in registered_inputs
+        for (input_func, deps) in ctx_inputs
             input_name = string(nameof(input_func))
 
             if length(deps) == 1
@@ -851,12 +895,8 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr})
     topological_sort(dag)
 
     ctx_subvariables = Dict{String, Vector{String}}()
-    for (func, subvars) in registered_subvariables
-        if parentmodule(func) !== ctx_module
-            continue
-        end
-
-        ctx_subvariables[string(nameof(func))] = subvars
+    for func in keys(ctx_variables)
+        ctx_subvariables[string(nameof(func))] = variable_subvariables(func)
     end
 
     global worker_state = WorkerState(; dag_functions=functions, current_ctx_module=ctx_module, parameters)
@@ -896,7 +936,7 @@ end
 function _get_deps(func, parameters)
     final_deps = OrderedDict()
 
-    for (arg_name, dep) in registered_variables[func]
+    for (arg_name, dep) in variable_dependencies(func)
         if !(dep isa AbstractDependency)
             throw(ArgumentError("Dependency of type '$(typeof(dep))' is not allowed"))
         end
