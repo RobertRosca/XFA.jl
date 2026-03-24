@@ -466,6 +466,8 @@ function handle_msg(state, msg)
     elseif msg isa ContextInfo
         if msg.info isa Dict
             client.context.context_state = build_context_state(state, msg.info)
+            client.context.source = msg.source
+            client.context_path = msg.info["path"]
         else
             @error "Context failed to load"
         end

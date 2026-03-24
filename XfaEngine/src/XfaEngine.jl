@@ -144,10 +144,11 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
             end
 
             @info "Loaded context file $(path): $(state.ctx)"
-            Protocol.server_send(ws, ContextInfo(state.ctx); reply_to)
+            source = read(path, String)
+            Protocol.server_send(ws, ContextInfo(state.ctx, source); reply_to)
         else
             @error "Loading context file at $(path) failed" exception=new_ctx_or_ex
-            Protocol.server_send(ws, ContextInfo(new_ctx_or_ex, state.ctx.is_running[]); reply_to)
+            Protocol.server_send(ws, ContextInfo(new_ctx_or_ex, state.ctx.is_running[], ""); reply_to)
         end
     elseif msg isa ReviseCode
         @everywhere Revise.revise()

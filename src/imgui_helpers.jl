@@ -77,6 +77,11 @@ function SafeInputText(label; max_len=63, hint="", current_text="", password=fal
 
     state = safe_input_text_cache[id]
 
+    if state.reference_text != current_text
+        state.reference_text = current_text
+        Util.strcpy!(state.buffer, current_text)
+    end
+
     flags = ig.ImGuiInputTextFlags_EnterReturnsTrue
     if password
         flags |= ig.ImGuiInputTextFlags_Password

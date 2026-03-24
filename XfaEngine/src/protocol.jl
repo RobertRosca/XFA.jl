@@ -74,9 +74,10 @@ end
 struct ContextInfo <: AbstractMessage
     info::Union{Dict, Exception}
     is_running::Bool
+    source::String
 end
 
-ContextInfo(ctx::XfaContext) = ContextInfo(Context.to_dict(ctx), ctx.is_running[])
+ContextInfo(ctx::XfaContext, source::String) = ContextInfo(Context.to_dict(ctx), ctx.is_running[], source)
 
 struct ParameterChanged <: AbstractMessage
     parameter::Parameter

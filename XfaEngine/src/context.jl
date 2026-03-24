@@ -79,6 +79,8 @@ end
     forwarder::Function = Returns(nothing)
     output_forwarder_task::Union{Task, Nothing} = nothing
 
+    path::String = ""
+
     is_running::Threads.Atomic{Bool} = Threads.Atomic{Bool}(false)
     events_channel::Union{RemoteChannel, Nothing} = nothing
     watcher_task::Task = Task(Returns(nothing))
@@ -138,7 +140,8 @@ function to_dict(ctx::XfaContext)
                 "subvariables" => ctx.subvariables,
                 "parameters" => ctx.parameters,
                 "inputs" => inputs,
-                "groups" => groups)
+                "groups" => groups,
+                "path" => ctx.path)
 end
 
 """
@@ -871,7 +874,9 @@ function load_from_file(ctx_path::AbstractString)
         throw(ArgumentError("$(ctx_path) is not a file!"))
     end
 
-    return load_from_string(read(ctx_path, String))
+    ctx = load_from_string(read(ctx_path, String))
+    ctx.path = ctx_path
+    return ctx
 end
 
 function _get_group_objects(ctx_module, group_types)

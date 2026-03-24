@@ -29,6 +29,7 @@ using XfaEngine.Context: KaraboDependency, Dependency, Parameter
 using .ImGuiHelpers
 include("state_inspector.jl")
 include("client.jl")
+include("context_edit.jl")
 
 import Revise
 
@@ -245,7 +246,12 @@ function draw_dag()
             edited, new_name = SafeInputText("##rename-$(name)"; current_text=name, reset=rename_clicked)
             ig.PopStyleColor()
             lost_focus = ig.IsItemDeactivated() && !ig.IsItemActive()
-            if edited || ig.IsKeyPressed(ig.ImGuiKey_Escape) || lost_focus
+            if edited
+                var_data["renaming"] = false
+                if new_name != name && !isempty(new_name)
+                    @guiasync rename_variable(state[], name, new_name)
+                end
+            elseif ig.IsKeyPressed(ig.ImGuiKey_Escape) || lost_focus
                 var_data["renaming"] = false
             end
         else
