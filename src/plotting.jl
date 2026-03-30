@@ -597,10 +597,18 @@ function draw_plot(plot::Plot, data, was_updated)
 
         if data isa AbstractVector
             if ImPlot.BeginPlot(plot.id, xlabel, "", plot_size)
-                if is_dimarray
-                    ImPlot.PlotLine(label, parent(lookup(data)[1]), parent(data))
+                if length(data) == 1
+                    if is_dimarray
+                        ImPlot.PlotScatter(label, parent(lookup(data)[1]), parent(data))
+                    else
+                        ImPlot.PlotScatter(label, data)
+                    end
                 else
-                    ImPlot.PlotLine(label, data)
+                    if is_dimarray
+                        ImPlot.PlotLine(label, parent(lookup(data)[1]), parent(data))
+                    else
+                        ImPlot.PlotLine(label, data)
+                    end
                 end
                 check_plot_interaction!(plot)
                 ImPlot.EndPlot()
