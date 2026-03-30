@@ -709,7 +709,6 @@ function draw_gui()
                                                          current_text=default(client.context_path))
                 if edited
                     client.context_path = new_context_path
-                    client.context_path_valid = true
                 end
 
                 if !client.context_path_valid

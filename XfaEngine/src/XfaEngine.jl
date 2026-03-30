@@ -211,6 +211,11 @@ function handle_client(state::EngineState, id)
     # And the available topics
     Protocol.server_send(ws, AvailableTopics(collect(keys(state.webproxies))))
 
+    # If a context is already loaded, send it to the new client
+    if !isempty(state.ctx.path)
+        Protocol.server_send(ws, ContextInfo(state.ctx, read(state.ctx.path, String)))
+    end
+
     for msg_bytes in ws
         buffer = IOBuffer(msg_bytes)
         envelope = deserialize(buffer)::Envelope

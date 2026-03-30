@@ -191,7 +191,7 @@ end
 
     # Context file and pipeline
     context_path::String = ""
-    context_path_valid::Bool = false
+    context_path_valid::Bool = true
     context::ContextState = ContextState()
 
     # Karabo status
