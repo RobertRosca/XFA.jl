@@ -437,7 +437,7 @@ function coffman_graham(dag; W=3)
     return levels
 end
 
-function handle_msg(state, msg)
+function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothing)
     client = state.client
 
     if msg isa Pong
@@ -449,8 +449,6 @@ function handle_msg(state, msg)
         if !isempty(client.available_topics)
             set_default_topic(state)
         end
-    elseif msg isa Started
-        client.context.pipeline_status = PipelineStatus_Started
     elseif msg isa Stopped
         client.context.pipeline_status = PipelineStatus_Stopped
     elseif msg isa Devices
@@ -471,6 +469,7 @@ function handle_msg(state, msg)
             client.context.context_state = build_context_state(state, msg.info)
             client.context.source = msg.source
             client.context_path = msg.info["path"]
+            filter!(kv -> haskey(client.context.context_state, kv.first), client.variable_data)
         else
             @error "Context failed to load"
         end
@@ -520,6 +519,14 @@ function handle_msg(state, msg)
         if !isnothing(msg.error)
             @error "Server reported an error" exception=msg.error
         end
+
+        if !isnothing(replied_to) && replied_to.msg_type == Start
+            if isnothing(msg.error)
+                client.context.pipeline_status = PipelineStatus_Started
+            else
+                client.context.pipeline_status = PipelineStatus_Stopped
+            end
+        end
     else
         @warn "Received unsupported message of type '$(typeof(msg))'"
     end
@@ -552,12 +559,14 @@ function handle_server(state)
                     buffer = IOBuffer(msg_bytes)
                     envelope::Envelope = deserialize(buffer)
 
-                    if !isnothing(envelope.reply_to)
-                        delete!(client.pending_requests, envelope.reply_to)
+                    replied_to = if !isnothing(envelope.reply_to)
+                        pop!(client.pending_requests, envelope.reply_to, nothing)
+                    else
+                        nothing
                     end
 
                     try
-                        @invokelatest handle_msg(state, envelope.msg)
+                        @invokelatest handle_msg(state, envelope.msg, replied_to)
                     catch ex
                         @error "Error handling message!" exception=(ex, catch_backtrace())
                     end

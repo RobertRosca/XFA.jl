@@ -161,8 +161,12 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
         Protocol.server_send(ws, Ack(); reply_to)
     elseif msg isa Start
         @info "Starting pipeline..."
-        Context.start_pipeline(state.ctx)
-        Protocol.server_send(ws, Started(); reply_to)
+        try
+            Context.start_pipeline(state.ctx)
+            Protocol.server_send(ws, Ack(); reply_to)
+        catch ex
+            Protocol.server_send(ws, Ack(ex); reply_to)
+        end
         @info "Started"
     elseif msg isa Stop
         @info "Stopping pipeline..."
