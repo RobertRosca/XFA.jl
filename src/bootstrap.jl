@@ -1,6 +1,6 @@
 import Pkg
 import TOML
-using Printf
+using Printf: @sprintf
 
 environment = ENV["XFA_ENVIRONMENT"]
 engine_dir = ENV["XFA_ENGINE_DIR"]

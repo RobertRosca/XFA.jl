@@ -202,9 +202,8 @@ function initialize_engine(state)
     client.remote_engine_dir = if is_local
         pkgdir(XfaEngine)
     else
-        cmd_str = "$(julia_module_prefix); julia --project=@xfa-default -E 'import XfaEngine; pkgdir(XfaEngine)'"
+        cmd_str = "$(julia_module_prefix); julia -O0 --compile=min --project=@xfa-default -E 'import XfaEngine; pkgdir(XfaEngine)'"
         cmd = `bash -c $(cmd_str)`
-        @show cmd
         proc = run(ignorestatus(cmd),
                    client.ssh_hops[end].session; print_out=false)
         string(chomp(String(proc.out))[2:end - 1])
@@ -234,7 +233,7 @@ function initialize_engine(state)
                                  "XFA_WORKING_DIR" => working_dir,
                                  "XFA_JULIA_BINARY" => julia_binary)
             bootstrap_env_str = join(["$(key)=$(value)" for (key, value) in bootstrap_env], " ")
-            bootstrap_cmd = "$(bootstrap_env_str) bash -c '$(julia_module_prefix); julia --color=no $(bootstrap_jl)'"
+            bootstrap_cmd = "$(bootstrap_env_str) bash -c '$(julia_module_prefix); julia -O0 --compile=min --color=no $(bootstrap_jl)'"
             bootstrap_process = run(bootstrap_cmd, session; wait=false)
 
             while !process_exited(bootstrap_process)
@@ -302,6 +301,10 @@ function disconnect_engine(state, shutdown_engine)
 
         # Wait for the websocket to be closed before killing the connection
         timedwait(() -> WebSockets.isclosed(client.websocket), 10)
+    end
+
+    if client.embedded_engine
+        rm("worker-info.toml"; force=true)
     end
 
     close(state.client)
