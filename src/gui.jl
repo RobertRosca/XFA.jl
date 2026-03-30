@@ -1,6 +1,6 @@
 import Base.ScopedValues: ScopedValue, @with
 
-using CImGui: CImGui as ig, ImVec2, ImVec4
+using CImGui: CImGui as ig, ImVec2, ImVec4, IM_COL32
 using CImGui.CSyntax: @c
 using ImPlot: ImPlot
 using GLFW: GLFW
@@ -26,7 +26,6 @@ using Serialization
 using XfaEngine.Protocol
 using XfaEngine: XfaEngine, Protocol
 using XfaEngine.Context: KaraboDependency, Dependency, Parameter
-using .ImGuiHelpers
 include("state_inspector.jl")
 include("client.jl")
 include("context_edit.jl")
@@ -227,35 +226,13 @@ function draw_dag()
         node_id = var_data["id"]
         variable_store = get(client.variable_data, name, nothing)
 
-        # Draw titlebar
         ImNodes.BeginNode(node_id)
+
+        # Draw titlebar
         ImNodes.BeginNodeTitleBar()
-
-        rename_clicked = ig.SmallButton("\uf044##rename-$(name)")
-        if rename_clicked
-            var_data["renaming"] = true
-        end
-
-        ig.SameLine()
-        if var_data["renaming"]
-            if rename_clicked
-                ig.SetKeyboardFocusHere()
-            end
-            ig.SetNextItemWidth(min_node_width)
-            ig.PushStyleColor(ig.ImGuiCol_TextSelectedBg, ig.IM_COL32(60, 60, 120, 200))
-            edited, new_name = SafeInputText("##rename-$(name)"; current_text=name, reset=rename_clicked)
-            ig.PopStyleColor()
-            lost_focus = ig.IsItemDeactivated() && !ig.IsItemActive()
-            if edited
-                var_data["renaming"] = false
-                if new_name != name && !isempty(new_name)
-                    @guiasync rename_variable(state[], name, new_name)
-                end
-            elseif ig.IsKeyPressed(ig.ImGuiKey_Escape) || lost_focus
-                var_data["renaming"] = false
-            end
-        else
-            ig.Text(name)
+        edited, new_name = ElidedText("var-name-$(name)", name; editable=true)
+        if edited
+            @guiasync rename_variable(state[], name, new_name)
         end
         ImNodes.EndNodeTitleBar()
 
@@ -285,10 +262,15 @@ function draw_dag()
             pin_shape = dep isa KaraboDependency ? ImNodes.ImNodesPinShape_TriangleFilled : ImNodes.ImNodesPinShape_CircleFilled
 
             ImNodes.BeginInputAttribute(dep_id, pin_shape)
-            ig.Text(arg_name)
             if dep isa KaraboDependency
+                ig.TextDisabled("Karabo")
                 ig.SameLine()
-                InfoMarker(string(dep), "Karabo")
+                edited, new_dep = ElidedText("dep-$(dep_id)", string(dep); editable=true)
+                if edited
+                    @guiasync rename_karabo_dep(state[], name, dep, new_dep)
+                end
+            else
+                ig.Text(arg_name)
             end
             ImNodes.EndInputAttribute()
         end
@@ -876,7 +858,7 @@ function main(; test_engine=nothing)
 
         ImPlot.DestroyContext(implot_ctx)
         ImNodes.DestroyContext(imnodes_ctx)
-        empty!(ImGuiHelpers.safe_input_text_cache)
+        empty!(safe_input_text_cache)
         close(gui_state)
     end
     t = ig.render(imgui_ctx; on_exit, window_title="XFA", wait=false, spawn=true, engine=test_engine) do

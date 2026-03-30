@@ -1,13 +1,3 @@
-module ImGuiHelpers
-
-import ..Util
-
-export MenuItem, EditableComboBox, Spinner, SafeInputText, BoxedText, BorderedText, EditableText, @guiasync, @Disabled, IsItemDisabled, InfoMarker
-
-import CImGui as ig
-import CImGui: IM_COL32, ImVec2
-import CImGui.CSyntax: @c
-
 mutable struct SafeInputTextState
     buffer::Vector{UInt8}
     reference_text::String
@@ -153,6 +143,76 @@ function IsItemDisabled()
     imgui_ctx = unsafe_load(ig.GetCurrentContext())
     return (imgui_ctx.LastItemData.ItemFlags & ig.ImGuiItemFlags_Disabled) != 0
 end
+
+@enum ElidedEditState begin
+    ElidedEditState_NoEdit
+    ElidedEditState_WantEdit
+    ElidedEditState_Edit
+end
+
+const elided_text_editing = Dict{UInt32, ElidedEditState}()
+
+function ElidedText(label::AbstractString, text::AbstractString; max_chars::Int=30, editable::Bool=false)
+    id = ig.GetID(label)
+    state = get(elided_text_editing, id, ElidedEditState_NoEdit)
+
+    if editable && state != ElidedEditState_NoEdit
+        just_started = state == ElidedEditState_WantEdit
+        if just_started
+            ig.SetKeyboardFocusHere()
+            elided_text_editing[id] = ElidedEditState_Edit
+        end
+        ig.SetNextItemWidth(ig.CalcTextSize(text).x + 40)
+        edited, new_text = SafeInputText("##elided-$(label)"; current_text=text, reset=just_started)
+        lost_focus = ig.IsItemDeactivated() && !ig.IsItemActive()
+        if edited
+            elided_text_editing[id] = ElidedEditState_NoEdit
+            if new_text != text && !isempty(new_text)
+                return true, new_text
+            end
+        elseif ig.IsKeyPressed(ig.ImGuiKey_Escape) || lost_focus
+            elided_text_editing[id] = ElidedEditState_NoEdit
+        end
+    else
+        elide = length(text) > max_chars
+        display_text = elide ? text[1:max_chars] * "…" : text
+
+        if editable
+            text_size = ig.CalcTextSize(display_text)
+            padding = ImVec2(2, 2)
+            cursor = ig.GetCursorPos()
+            ig.SetCursorPos(ImVec2(cursor.x, cursor.y - padding.y))
+            ig.InvisibleButton("##elided-btn-$(label)", ImVec2(text_size.x + 2 * padding.x, text_size.y + 2 * padding.y))
+            hovered = ig.IsItemHovered()
+            clicked = ig.IsItemClicked()
+
+            draw_list = ig.GetWindowDrawList()
+            p_min = ig.GetItemRectMin()
+            p_max = ig.GetItemRectMax()
+            if hovered
+                ig.AddRectFilled(draw_list, p_min, p_max, ig.IM_COL32(60, 60, 80, 255))
+            end
+            text_pos = ImVec2(p_min.x + padding.x, p_min.y + padding.y)
+            ig.AddText(draw_list, text_pos, ig.GetColorU32(ig.ImGuiCol_Text), display_text)
+
+            if hovered && elide
+                ig.SetTooltip(text)
+            end
+            if clicked
+                elided_text_editing[id] = ElidedEditState_WantEdit
+            end
+        else
+            ig.Text(display_text)
+            if ig.IsItemHovered() && elide
+                ig.SetTooltip(text)
+            end
+        end
+    end
+
+    return false, text
+end
+
+ElidedText(text::AbstractString; max_chars::Int=30) = ElidedText("", text; max_chars)
 
 function InfoMarker(message::AbstractString, marker::AbstractString="?")
     ig.TextDisabled("[$(marker)]")

@@ -262,7 +262,7 @@ function Base.close(client::ClientState)
     end
 
     # Delete any cached values
-    empty!(ImGuiHelpers.safe_input_text_cache)
+    empty!(safe_input_text_cache)
     empty!(client.variable_data)
 end
 
