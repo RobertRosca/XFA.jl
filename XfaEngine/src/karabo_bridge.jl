@@ -406,6 +406,12 @@ function deserialize(msgs::Vector{ZMQ.Message})
 
         if content == "msgpack"
             data[source] = MsgPack.unpack(payload)
+            for (name, value) in data[source]
+                if value isa Vector{Any} && !isempty(value)
+                    T = typeof(value[1])
+                    data[source][name] = Vector{T}(value)
+                end
+            end
             meta[source] = get(header, "metadata", Dict())
         elseif content == "array"
             shape = tuple(Int.(header["shape"])...)
@@ -414,7 +420,7 @@ function deserialize(msgs::Vector{ZMQ.Message})
             array = let rank = length(shape)
                 if rank == 1
                     reinterpret(dtype, payload)
-                elseif rank >= 2
+                else
                     # The data coming over the wire is row-major, so at first we
                     # load it into an array with reversed dimensions.
                     reshape(reinterpret(dtype, payload), reverse(shape))
