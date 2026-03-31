@@ -21,8 +21,8 @@ KaraboBridge(trainmatcher) = KaraboBridge(Parameter(false), Parameter(trainmatch
                                           Parameter(""), Parameter(-1), String[])
 
 
-function get_sources(::KaraboBridge)
-    wp = XfaEngine.get_webproxy()
+function get_sources(bridge::KaraboBridge)
+    wp = XfaEngine.get_webproxy(bridge.trainmatcher[])
     devices = XfaEngine.get_devices(wp)
     return collect(keys(devices))
 end
@@ -33,20 +33,20 @@ function update_sources(bridge::KaraboBridge, sources)
         return
     end
 
-    wp = XfaEngine.get_webproxy()
+    wp = XfaEngine.get_webproxy(bridge.trainmatcher[])
     params = Dict("sources" => sources)
     XfaEngine.call_slot(wp, bridge.trainmatcher[], "set_sources", params)
 end
 
 @Input function stream(bridge::KaraboBridge, output)
-    declare_sources(Meta.name[], get_sources(bridge))
-
     address = ""
     if bridge.manual_configuration[]
         address = "tcp://$(bridge.hostname[]):$(bridge.port[])"
     else
+        declare_sources(Meta.name[], get_sources(bridge))
+
         # Get the output list
-        wp = XfaEngine.get_webproxy()
+        wp = XfaEngine.get_webproxy(bridge.trainmatcher[])
         config = XfaEngine.get_config(wp, bridge.trainmatcher[])
         address = config["zmqOutputs"][1]["address"]
     end

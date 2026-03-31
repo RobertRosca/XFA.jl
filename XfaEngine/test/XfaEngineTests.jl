@@ -109,15 +109,11 @@ end
     log = TestLogger()
     temp_engine(; log) do address, stop_event, info_path
         WebSockets.open(address) do ws
-            # Test that we get a valid ID
+            # Test that we get a valid ID and initial trainmatchers
             id = WebSockets.receive(ws)
             @test id isa String
             @test length(id) > 5
-
-            # The next message should be the available topics
-            @test Protocol.receive(ws).msg isa Protocol.AvailableTopics
-            Protocol.client_send(ws, Protocol.SetDefaultTopic("localhost"))
-            @test Protocol.receive(ws).msg isa Protocol.Ack
+            @test Protocol.receive(ws).msg isa Protocol.AvailableTrainmatchers
 
             # Test Ping
             Protocol.client_send(ws, Protocol.Ping())
@@ -179,7 +175,7 @@ end
     log = TestLogger()
     temp_engine(; log) do address, stop_event, info_path
         WebSockets.open(address) do ws
-            # Consume the client ID and initial AvailableTopics
+            # Consume the client ID and initial trainmatchers
             WebSockets.receive(ws)
             Protocol.receive(ws)
 
@@ -195,8 +191,8 @@ end
 
             # Test that Ack messages carry reply_to for fire-and-forget
             # messages
-            id1 = Protocol.client_send(ws, Protocol.SetDefaultTopic("localhost"))
-            id2 = Protocol.client_send(ws, Protocol.SetDefaultTopic("localhost"))
+            id1 = Protocol.client_send(ws, Protocol.SetTopicTrainmatcher("localhost", "tm1"))
+            id2 = Protocol.client_send(ws, Protocol.SetTopicTrainmatcher("localhost", "tm2"))
             env1 = Protocol.receive(ws)
             env2 = Protocol.receive(ws)
             @test env1.msg isa Protocol.Ack
@@ -908,13 +904,14 @@ end
 
         ctx = Context.load_from_string("""
         bridge = KaraboBridge("localhost", $(port), ["foo.x"])
+        bridge.manual_configuration[] = true
 
         @Variable foo -> karabo"foo.x"
         """)
 
         # Make a mock engine so we can use the mock webproxy
         webproxies = Dict("localhost" => XfaEngine.WebProxy("localhost:8484"))
-        XfaEngine.current_engine_state = XfaEngine.EngineState(; webproxies, default_topic="localhost")
+        XfaEngine.current_engine_state = XfaEngine.EngineState(; webproxies)
 
         # Simple example with two trains of data
         put!(bridge_server, Dict("foo" => Dict("x" => 42.0)))

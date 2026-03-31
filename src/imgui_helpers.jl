@@ -221,5 +221,3 @@ function InfoMarker(message::AbstractString, marker::AbstractString="?")
         ig.EndTooltip()
     end
 end
-
-end

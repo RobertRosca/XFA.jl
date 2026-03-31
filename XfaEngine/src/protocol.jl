@@ -1,10 +1,10 @@
 module Protocol
 
 export AbstractMessage, Ping, Shutdown,
-    GetDevices, GetTrainmatchers, LoadContext, ReviseCode,
-    ChangeParameter, SetDefaultTopic, Start, Stop,
+    GetDevices, GetTrainmatchers, SetTopicTrainmatcher, LoadContext, ReviseCode,
+    ChangeParameter, Start, Stop,
     SetDebugMode, SetRemoteRepl,
-    Pong, AvailableTopics, AvailableTrainmatchers,
+    Pong, AvailableTrainmatchers,
     Started, Stopped, Devices,
     ContextInfo, ParameterChanged, TrainData, RemoteReplState,
     Ack, Envelope, MessageId, client_send, server_send
@@ -24,7 +24,9 @@ struct Ping <: AbstractMessage end
 struct Shutdown <: AbstractMessage end
 
 struct GetDevices <: AbstractMessage
+    topic::Union{String, Nothing}
 end
+GetDevices() = GetDevices(nothing)
 
 struct LoadContext <: AbstractMessage
     path::String
@@ -36,8 +38,9 @@ struct ChangeParameter <: AbstractMessage
     parameter::Parameter
 end
 
-struct SetDefaultTopic <: AbstractMessage
+struct SetTopicTrainmatcher <: AbstractMessage
     topic::String
+    trainmatcher::String
 end
 
 struct Start <: AbstractMessage end
@@ -56,19 +59,16 @@ struct GetTrainmatchers <: AbstractMessage end
 # Messages that the server can send
 struct Pong <: AbstractMessage end
 
-struct AvailableTopics <: AbstractMessage
-    topics::Vector{String}
-end
-
 struct AvailableTrainmatchers <: AbstractMessage
     topic_trainmatchers::Dict{String, Vector{String}}
+    defaults::Dict{String, String}
 end
 
 struct Started <: AbstractMessage end
 struct Stopped <: AbstractMessage end
 
 struct Devices <: AbstractMessage
-    device_names::Union{Dict{String, Any}, Exception}
+    device_names::Union{Dict{String, Dict{String, Any}}, Exception}
 end
 
 struct ContextInfo <: AbstractMessage

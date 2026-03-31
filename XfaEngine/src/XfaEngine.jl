@@ -60,7 +60,7 @@ end
     clients::Dict{String, ClientState} = Dict()
 
     webproxies::Dict{String, WebProxy} = Dict()
-    default_topic::String = ""
+    default_trainmatchers::Dict{String, String} = Dict()
 
     remoterepl_server::TCPServer = TCPServer()
     remoterepl_task::Union{Task, Nothing} = nothing
@@ -104,14 +104,17 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
         @info "Received shutdown request from client $(id)"
         shutdown(state)
         notify(state.stop_event)
-    elseif msg isa SetDefaultTopic
-        state.default_topic = msg.topic
-        @info "Set default topic to: $(state.default_topic)"
+    elseif msg isa SetTopicTrainmatcher
+        state.default_trainmatchers[msg.topic] = msg.trainmatcher
+        @info "Set default trainmatcher for topic '$(msg.topic)' to: $(msg.trainmatcher)"
         Protocol.server_send(ws, Ack(); reply_to)
     elseif msg isa GetDevices
         try
-            wp = state.webproxies[state.default_topic]
-            devices = get_devices(wp)
+            devices = if isnothing(msg.topic)
+                get_all_devices(state.webproxies)
+            else
+                Dict(msg.topic => get_devices(state.webproxies[msg.topic]))
+            end
             Protocol.server_send(ws, Devices(devices); reply_to)
             @info "Responded to 'GetDevices' from $(id)"
         catch ex
@@ -120,7 +123,7 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
         end
     elseif msg isa GetTrainmatchers
         trainmatchers = get_all_trainmatchers(state.webproxies)
-        Protocol.server_send(ws, AvailableTrainmatchers(trainmatchers); reply_to)
+        Protocol.server_send(ws, AvailableTrainmatchers(trainmatchers, state.default_trainmatchers); reply_to)
     elseif msg isa LoadContext
         path = abspath(expanduser(msg.path))
 
@@ -208,8 +211,18 @@ function handle_client(state::EngineState, id)
     WebSockets.send(ws, id)
     @info "Connected to new client: $(id) 🙋"
 
-    # And the available topics
-    Protocol.server_send(ws, AvailableTopics(collect(keys(state.webproxies))))
+    # Send available trainmatchers with defaults
+    trainmatchers = if !isempty(state.webproxies)
+        try
+            get_all_trainmatchers(state.webproxies)
+        catch ex
+            @warn "Failed to query trainmatchers for client $(id)" exception=(ex, catch_backtrace())
+            Dict{String, Vector{String}}()
+        end
+    else
+        Dict{String, Vector{String}}()
+    end
+    Protocol.server_send(ws, AvailableTrainmatchers(trainmatchers, state.default_trainmatchers))
 
     # If a context is already loaded, send it to the new client
     if !isempty(state.ctx.path)
@@ -246,6 +259,21 @@ function main(stop_event=Base.Event(); info_path=nothing, wait=true)
                                       for (instrument, address) in DEFAULT_WEBPROXY_ADDRESSES))
     elseif !endswith(gethostname(), ".desy.de")
         state.webproxies["localhost"] = WebProxy("localhost:8484")
+    end
+
+    # Query trainmatchers and assign defaults
+    if !isempty(state.webproxies)
+        try
+            all_trainmatchers = get_all_trainmatchers(state.webproxies)
+            for (topic, matchers) in all_trainmatchers
+                if !isempty(matchers)
+                    state.default_trainmatchers[topic] = first(matchers)
+                end
+            end
+            @info "Initialized default trainmatchers" defaults=state.default_trainmatchers
+        catch ex
+            @warn "Failed to query trainmatchers on startup" exception=(ex, catch_backtrace())
+        end
     end
 
     ws_server = WebSockets.listen!("0.0.0.0", state.websocket_port) do ws

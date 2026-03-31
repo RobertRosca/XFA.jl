@@ -717,36 +717,47 @@ function draw_gui()
 
                 ig.Dummy(0, 10)
 
-                if ig.Button("Update trainmatchers")
-                    get_trainmatchers(client)
-                end
-
-                # Show trainmatchers as a table
-                if client.trainmatchers_request_status == RequestStatus_Waiting
-                    Spinner("Waiting for trainmatcher list")
-                else ig.BeginTable("##trainmatchers", 2, ig.ImGuiTableFlags_Borders | ig.ImGuiTableFlags_RowBg)
-                    ig.TableSetupColumn("Topic")
-                    ig.TableSetupColumn("Default trainmatcher")
-                    ig.TableHeadersRow()
-
-                    for topic in sort(collect(keys(client.trainmatchers)))
-                        matchers = client.trainmatchers[topic]
-                        ig.TableNextRow()
-                        ig.TableNextColumn()
-                        ig.Text(topic)
-                        ig.TableNextColumn()
-
-                        if length(matchers) == 1
-                            ig.Text(matchers[1])
-                        elseif length(matchers) > 1
-                            if !haskey(client.trainmatcher_selected_idx, topic)
-                                client.trainmatcher_selected_idx[topic] = Ref(Cint(0))
-                            end
-                            ig.Combo("##matcher-$topic", client.trainmatcher_selected_idx[topic], matchers)
-                        end
+                trainmatcher_request_pending = is_pending(client, client.trainmatcher_set_request)
+                @Disabled trainmatcher_request_pending begin
+                    if ig.Button("Update trainmatchers")
+                        get_trainmatchers(client)
+                    end
+                    if trainmatcher_request_pending
+                        ig.SameLine()
+                        Spinner()
                     end
 
-                    ig.EndTable()
+                    # Show trainmatchers as a table
+                    if client.trainmatchers_request_status == RequestStatus_Waiting
+                        Spinner("Waiting for trainmatcher list")
+                    else
+                        ig.BeginTable("##trainmatchers", 2, ig.ImGuiTableFlags_Borders | ig.ImGuiTableFlags_RowBg)
+                        ig.TableSetupColumn("Topic")
+                        ig.TableSetupColumn("Default trainmatcher")
+                        ig.TableHeadersRow()
+
+                        for topic in sort(collect(keys(client.trainmatchers)))
+                            matchers = client.trainmatchers[topic]
+                            ig.TableNextRow()
+                            ig.TableNextColumn()
+                            ig.Text(topic)
+                            ig.TableNextColumn()
+
+                            if length(matchers) == 1
+                                ig.Text(matchers[1])
+                            elseif length(matchers) > 1
+                                if !haskey(client.trainmatcher_selected_idx, topic)
+                                    client.trainmatcher_selected_idx[topic] = Ref(Cint(0))
+                                end
+                                if ig.Combo("##matcher-$topic", client.trainmatcher_selected_idx[topic], matchers)
+                                    idx = client.trainmatcher_selected_idx[topic][] + 1
+                                    set_topic_trainmatcher(client, topic, matchers[idx])
+                                end
+                            end
+                        end
+
+                        ig.EndTable()
+                    end
                 end
             end
         end

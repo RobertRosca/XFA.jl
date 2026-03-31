@@ -442,13 +442,6 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
 
     if msg isa Pong
         nothing
-    elseif msg isa AvailableTopics
-        client.available_topics = msg.topics
-        sort!(client.available_topics)
-
-        if !isempty(client.available_topics)
-            set_default_topic(state)
-        end
     elseif msg isa Stopped
         client.context.pipeline_status = PipelineStatus_Stopped
     elseif msg isa Devices
@@ -458,12 +451,19 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
         else
             client.karabo_devices = msg.device_names
             client.webproxy_status = RequestStatus_Idle
-            client.trainmatchers = filter(x -> occursin("Matcher", x.second["classId"]),
-                                          client.karabo_devices)
         end
     elseif msg isa AvailableTrainmatchers
         client.trainmatchers = msg.topic_trainmatchers
         client.trainmatchers_request_status = RequestStatus_Idle
+
+        # Apply defaults to combo selection indices
+        for (topic, default_tm) in msg.defaults
+            matchers = client.trainmatchers[topic]
+            idx = findfirst(==(default_tm), matchers)
+            if !isnothing(idx)
+                client.trainmatcher_selected_idx[topic] = Ref(Cint(idx - 1))
+            end
+        end
     elseif msg isa ContextInfo
         if msg.info isa Dict
             client.context.context_state = build_context_state(state, msg.info)
@@ -554,6 +554,11 @@ function handle_server(state)
                 client.client_id = id
 
                 client.status = RemoteStatus_Connected
+
+                # Request the trainmatchers
+                # if !client.embedded_engine
+                #     get_trainmatchers(client)
+                # end
 
                 for msg_bytes in ws
                     buffer = IOBuffer(msg_bytes)
@@ -656,11 +661,8 @@ function stop(state)
     state.client.context.pipeline_status = PipelineStatus_Stopping
 end
 
-function set_default_topic(state)
-    client = state.client
-    idx = client.default_topic_idx[] + 1 # Add 1 to go from a C index to a Julia index
-    topic = client.available_topics[idx]
-    send(client, SetDefaultTopic(topic))
+function set_topic_trainmatcher(client, topic, trainmatcher)
+    client.trainmatcher_set_request = send(client, SetTopicTrainmatcher(topic, trainmatcher))
 end
 
 function set_debug_mode(state)

@@ -183,8 +183,6 @@ end
     embedded_engine::Bool = false
     engine::Maybe{EngineState} = nothing
 
-    default_topic_idx::Ref{Cint} = Ref(Cint(0))
-    available_topics::Vector{String} = String[]
     webproxy_status::RequestStatus = RequestStatus_Idle
     remoterepl_mode::Ref{Bool} = Ref(false)
     remoterepl_status::RemoteReplStatus = RemoteReplStatus_Stopped
@@ -198,7 +196,8 @@ end
     trainmatchers::Dict{String, Vector{String}} = Dict()
     trainmatchers_request_status::RequestStatus = RequestStatus_Idle
     trainmatcher_selected_idx::Dict{String, Ref{Cint}} = Dict{String, Ref{Cint}}()
-    karabo_devices::Dict{String, Any} = Dict()
+    trainmatcher_set_request::Maybe{Int} = nothing
+    karabo_devices::Dict{String, Dict{String, Any}} = Dict()
 
     # Variables and plots
     variable_data::Dict{String, VariableStore} = Dict()

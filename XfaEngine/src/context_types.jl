@@ -246,6 +246,7 @@ function tryset(param::Parameter, value; force=false)
 end
 
 Base.getindex(param::Parameter) = param.value
+Base.setindex!(param::Parameter, value) = param.value = value
 
 function set_parameter(name::String, value, requestor::String)
     @info "Setting parameter '$(name)' to $(value) as requested by '$(requestor)'"

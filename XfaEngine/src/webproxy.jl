@@ -45,14 +45,27 @@ function WebProxy(address)
     return WebProxy(address, default_cache, default_cache)
 end
 
-function get_webproxy()
+"""
+    get_webproxy(device::AbstractString)
+
+Get the webproxy for a device by extracting the topic from its name.
+Device names are expected to start with the topic, e.g. `MID_FOO_BAR/...`
+uses the `MID` topic webproxy.
+"""
+function get_webproxy(device::AbstractString)
     if isnothing(current_engine_state)
         error("Engine is not initialized, cannot get a WebProxy")
     elseif isempty(current_engine_state.webproxies)
         error("No WebProxy's are available to connect to")
     end
 
-    return current_engine_state.webproxies[current_engine_state.default_topic]
+    for topic in keys(current_engine_state.webproxies)
+        if startswith(device, topic)
+            return current_engine_state.webproxies[topic]
+        end
+    end
+
+    error("No webproxy found for device '$device'")
 end
 
 # Flatten the returned dict a bit by removing timestamp and tid entries for each
@@ -93,6 +106,15 @@ function get_devices(wp; timeout=5, max_age=10, classId=nothing)
     devices = wp.devices_cache.value
     if !isnothing(classId)
         devices = filter(p -> p.second["classId"] == classId, devices)
+    end
+
+    return devices
+end
+
+function get_all_devices(webproxies; classId=nothing)
+    devices = Dict{String, Dict{String, Any}}()
+    for (topic, wp) in webproxies
+        devices[topic] = get_devices(wp; classId)
     end
 
     return devices
