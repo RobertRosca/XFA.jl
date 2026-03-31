@@ -122,12 +122,18 @@ end
 
 # This takes in a dict from topic to webproxy
 function get_all_trainmatchers(webproxies::Dict)
-    trainmatchers = Dict{String, Vector{String}}()
+    trainmatchers = Dict{String, Vector{Tuple{String, Bool}}}()
 
     for (topic, wp) in webproxies
         devices = get_devices(wp; classId="TrainMatcher")
-        trainmatchers[topic] = collect(keys(devices))
-        sort!(trainmatchers[topic])
+        whitelisted = try
+            get_property(wp, "karabo/WebProxy/device", "devices")
+        catch ex
+            @warn "Failed to query webproxy whitelist for $topic" exception=(ex, catch_backtrace())
+            String[]
+        end
+        names = sort!(collect(keys(devices)))
+        trainmatchers[topic] = [(name, name in whitelisted) for name in names]
     end
 
     return trainmatchers
@@ -137,6 +143,11 @@ function get_config(wp, device; timeout=5)
     config = get_json(wp, "/devices/$(device)/config.json"; timeout)
     strip_metadata!(config)
     return config
+end
+
+function get_property(wp, device, property; timeout=5)
+    config = get_json(wp, "/devices/$(device).$(property)/config.json"; timeout)
+    return config["value"]
 end
 
 function call_slot(wp, device, slot, params=HTTP.nobody; timeout=5)

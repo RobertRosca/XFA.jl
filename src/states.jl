@@ -193,7 +193,7 @@ end
     context::ContextState = ContextState()
 
     # Karabo status
-    trainmatchers::Dict{String, Vector{String}} = Dict()
+    trainmatchers::Dict{String, Vector{Tuple{String, Bool}}} = Dict()
     trainmatchers_request_status::RequestStatus = RequestStatus_Idle
     trainmatcher_selected_idx::Dict{String, Ref{Cint}} = Dict{String, Ref{Cint}}()
     trainmatcher_set_request::Maybe{Int} = nothing

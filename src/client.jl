@@ -459,7 +459,7 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
         # Apply defaults to combo selection indices
         for (topic, default_tm) in msg.defaults
             matchers = client.trainmatchers[topic]
-            idx = findfirst(==(default_tm), matchers)
+            idx = findfirst(m -> m[1] == default_tm, matchers)
             if !isnothing(idx)
                 client.trainmatcher_selected_idx[topic] = Ref(Cint(idx - 1))
             end

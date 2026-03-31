@@ -60,7 +60,7 @@ struct GetTrainmatchers <: AbstractMessage end
 struct Pong <: AbstractMessage end
 
 struct AvailableTrainmatchers <: AbstractMessage
-    topic_trainmatchers::Dict{String, Vector{String}}
+    topic_trainmatchers::Dict{String, Vector{Tuple{String, Bool}}}
     defaults::Dict{String, String}
 end
 

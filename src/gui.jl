@@ -738,20 +738,27 @@ function draw_gui()
 
                         for topic in sort(collect(keys(client.trainmatchers)))
                             matchers = client.trainmatchers[topic]
+                            names = [m[1] for m in matchers]
                             ig.TableNextRow()
                             ig.TableNextColumn()
                             ig.Text(topic)
                             ig.TableNextColumn()
 
-                            if length(matchers) == 1
-                                ig.Text(matchers[1])
-                            elseif length(matchers) > 1
+                            if !isempty(matchers)
                                 if !haskey(client.trainmatcher_selected_idx, topic)
                                     client.trainmatcher_selected_idx[topic] = Ref(Cint(0))
                                 end
-                                if ig.Combo("##matcher-$topic", client.trainmatcher_selected_idx[topic], matchers)
+
+                                if CopyableCombo("matcher-$topic", names, client.trainmatcher_selected_idx[topic])
                                     idx = client.trainmatcher_selected_idx[topic][] + 1
-                                    set_topic_trainmatcher(client, topic, matchers[idx])
+                                    set_topic_trainmatcher(client, topic, names[idx])
+                                end
+
+                                # Warn if the selected trainmatcher is not configurable
+                                sel_idx = client.trainmatcher_selected_idx[topic][] + 1
+                                if 1 <= sel_idx <= length(matchers) && !matchers[sel_idx][2]
+                                    ig.SameLine()
+                                    ig.TextColored(ImVec4(1.0, 0.6, 0.0, 1.0), "(not in webproxy whitelist)")
                                 end
                             end
                         end

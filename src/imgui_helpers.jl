@@ -221,3 +221,88 @@ function InfoMarker(message::AbstractString, marker::AbstractString="?")
         ig.EndTooltip()
     end
 end
+
+function CopyButton(label, text)
+    ig.PushStyleVar(ig.ImGuiStyleVar_FramePadding, ImVec2(1, 1))
+    ig.PushStyleVar(ig.ImGuiStyleVar_FrameBorderSize, 0)
+    ig.PushStyleColor(ig.ImGuiCol_Button, ImVec4(0, 0, 0, 0))
+    ig.PushStyleColor(ig.ImGuiCol_ButtonActive, ImVec4(0, 0, 0, 0))
+    if ig.Button("\uf0c5##$(label)")
+        ig.SetClipboardText(text)
+    end
+    ig.PopStyleColor(2)
+    ig.PopStyleVar(2)
+end
+
+# A combo box where each item has a copy-to-clipboard button. Also shows a copy
+# button on the combo preview when hovered. Returns true if the selection
+# changed.
+function CopyableCombo(label, items, selected_idx::Ref{Cint})
+    changed = false
+    sel = selected_idx[] + 1
+    preview = 1 <= sel <= length(items) ? items[sel] : ""
+
+    copy_btn_w = ig.CalcTextSize("\uf0c5").x + unsafe_load(ig.GetStyle().FramePadding.x) * 2
+    btn_h = ig.GetFontSize() + 2  # font size + CopyButton FramePadding.y * 2
+
+    # AllowOverlap so the copy button overlaid on the preview can receive clicks
+    ig.SetNextItemAllowOverlap()
+    if ig.BeginCombo("##$label", preview)
+        popup_w = ig.GetWindowSize().x
+        for (i, name) in enumerate(items)
+            # Each row is: [Selectable (full width)] [Text (overlaid)] [CopyButton (right-aligned)]
+            # AllowOverlap lets the copy button receive clicks over the selectable
+            ig.SetNextItemAllowOverlap()
+            if ig.Selectable("##$label-$i")
+                new_idx = i - 1
+                if new_idx != selected_idx[]
+                    selected_idx[] = new_idx
+                    changed = true
+                end
+            end
+
+            row_min = ig.GetItemRectMin()
+            row_max = ig.GetItemRectMax()
+            ig.SameLine(0, 0)
+            ig.Text(name)
+
+            # Right-align the copy button, accounting for window padding on both sides
+            ig.SameLine(popup_w - copy_btn_w - unsafe_load(ig.GetStyle().WindowPadding.x) * 2)
+
+            # Only show the copy button when hovering the row. Use IsMouseHoveringRect
+            # over the selectable's rect so the button stays visible as the mouse
+            # moves from the row text to the button (unlike IsItemHovered which flickers).
+            if ig.IsMouseHoveringRect(row_min, ImVec2(row_max.x, row_max.y))
+                CopyButton("$label-$i", name)
+            else
+                # Always reserve space to keep row height consistent
+                ig.Dummy(ImVec2(copy_btn_w, btn_h))
+            end
+        end
+        ig.EndCombo()
+    end
+
+    # Overlay a copy button inside the combo preview, just left of the dropdown arrow.
+    # We move the cursor back into the combo's rect to position the button.
+    combo_rect_min = ig.GetItemRectMin()
+    combo_rect_max = ig.GetItemRectMax()
+    combo_w = combo_rect_max.x - combo_rect_min.x
+    combo_h = combo_rect_max.y - combo_rect_min.y
+    arrow_w = ig.GetFrameHeight()
+    save_cursor = ig.GetCursorPos()
+    ig.SameLine(0, 0)
+    ig.SetCursorPosX(ig.GetCursorPosX() - arrow_w - copy_btn_w - 4)
+    ig.SetCursorPosY(ig.GetCursorPosY() + (combo_h - btn_h) / 2)
+    if ig.IsMouseHoveringRect(combo_rect_min, combo_rect_max)
+        CopyButton("$label-preview", preview)
+    end
+
+    # Restore the cursor and register the combo's right edge as the line position,
+    # so the caller's SameLine() places content after the combo, not the overlay button.
+    ig.SetCursorPos(save_cursor)
+    ig.SameLine(0, 0)
+    ig.SetCursorPosX(combo_rect_min.x - ig.GetWindowPos().x + combo_w)
+    ig.NewLine()
+
+    return changed
+end

@@ -267,7 +267,7 @@ function main(stop_event=Base.Event(); info_path=nothing, wait=true)
             all_trainmatchers = get_all_trainmatchers(state.webproxies)
             for (topic, matchers) in all_trainmatchers
                 if !isempty(matchers)
-                    state.default_trainmatchers[topic] = first(matchers)
+                    state.default_trainmatchers[topic] = first(matchers)[1]
                 end
             end
             @info "Initialized default trainmatchers" defaults=state.default_trainmatchers
