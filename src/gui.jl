@@ -265,7 +265,14 @@ function draw_dag()
             if dep isa KaraboDependency
                 ig.TextDisabled("Karabo")
                 ig.SameLine()
-                edited, new_dep = ElidedText("dep-$(dep_id)", string(dep); editable=true)
+                dep_state = get!(client.karabo_dep_states, dep_id, KaraboDepTextState())
+                prop_completions = if isnothing(dep_state.device)
+                    String[]
+                else
+                    get_device_properties(client, dep_state.device)
+                end
+                edited, new_dep = KaraboDepText("dep-$(dep_id)", string(dep), dep_state,
+                                                client.device_list, prop_completions)
                 if edited
                     @guiasync rename_karabo_dep(state[], name, dep, new_dep)
                 end

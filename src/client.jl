@@ -431,6 +431,12 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
             client.webproxy_status = RequestStatus_Error
         else
             client.karabo_devices = msg.device_names
+            client.device_tree = sort(
+                [(topic, sort([(name, sort(collect(info); by=first))
+                               for (name, info) in devices]; by=first))
+                 for (topic, devices) in msg.device_names]; by=first)
+            client.device_list = [(name, topic) for (topic, devices) in client.device_tree
+                                                for (name, _) in devices]
             client.webproxy_status = RequestStatus_Idle
         end
     elseif msg isa AvailableTrainmatchers
@@ -536,11 +542,7 @@ function handle_server(state)
                 client.remote_engine_dir = WebSockets.receive(ws)
 
                 client.status = RemoteStatus_Connected
-
-                # Request the trainmatchers
-                # if !client.embedded_engine
-                #     get_trainmatchers(client)
-                # end
+                get_devices(client)
 
                 for msg_bytes in ws
                     buffer = IOBuffer(msg_bytes)
@@ -597,13 +599,8 @@ function handle_server(state)
     end
 end
 
-function get_devices(state)
-    client = state.client
-    send(client, GetDevices())
-    client.webproxy_status = RequestStatus_Waiting
-    empty!(client.karabo_devices)
-    empty!(client.trainmatchers)
-    empty!(client.trainmatcher_selected_idx)
+function get_devices(client)
+    client.devices_request = send(client, GetDevices())
 end
 
 function get_trainmatchers(client)

@@ -198,6 +198,14 @@ end
     trainmatcher_selected_idx::Dict{String, Ref{Cint}} = Dict{String, Ref{Cint}}()
     trainmatcher_set_request::Maybe{Int} = nothing
     karabo_devices::Dict{String, Dict{String, Any}} = Dict()
+    devices_request::Maybe{Int} = nothing
+    # Pre-sorted for display: [(topic, [(device_name, sorted_info_pairs), ...]), ...]
+    device_tree::Vector{Tuple{String, Vector{Tuple{String, Vector{Pair{String, Any}}}}}} = []
+    # Flat list of (device_name, topic) for autocompletion
+    device_list::Vector{Tuple{String, String}} = Tuple{String, String}[]
+
+    # KaraboDepText widget state, keyed by dependency ID
+    karabo_dep_states::Dict{Int, KaraboDepTextState} = Dict{Int, KaraboDepTextState}()
 
     # Variables and plots
     variable_data::Dict{String, VariableStore} = Dict()

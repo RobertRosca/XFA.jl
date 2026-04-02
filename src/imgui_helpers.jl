@@ -58,7 +58,8 @@ function EditableComboBox(label, text, completions;
     return edited, unsafe_string(pointer(input))
 end
 
-function SafeInputText(label; max_len=63, hint="", current_text="", password=false, reset=false)
+function SafeInputText(label; max_len=63, hint="", current_text="", password=false, reset=false,
+                       callback=C_NULL, user_data=C_NULL)
     id = ig.GetID(label)
     if !haskey(safe_input_text_cache, id) || reset
         safe_input_text_cache[id] = SafeInputTextState(max_len, current_text)
@@ -76,13 +77,17 @@ function SafeInputText(label; max_len=63, hint="", current_text="", password=fal
     if password
         flags |= ig.ImGuiInputTextFlags_Password
     end
+    if callback !== C_NULL
+        flags |= ig.ImGuiInputTextFlags_CallbackAlways
+    end
 
     modified = unsafe_string(pointer(state.buffer)) != current_text
 
     if modified
         ig.PushStyleColor(ig.ImGuiCol_FrameBg, ig.IM_COL32(143, 98, 0, 255))
     end
-    ret = ig.InputTextWithHint(label, hint, pointer(state.buffer), length(state.buffer), flags)
+    ret = ig.InputTextWithHint(label, hint, pointer(state.buffer), length(state.buffer),
+                               flags, callback, user_data)
     if modified
         ig.PopStyleColor()
     end
@@ -152,7 +157,143 @@ end
 
 const elided_text_editing = Dict{UInt32, ElidedEditState}()
 
-function ElidedText(label::AbstractString, text::AbstractString; max_chars::Int=30, editable::Bool=false)
+"""
+    fuzzy_match(query, text) -> (matches::Bool, score::Int)
+
+Simple fuzzy match: checks if all characters in `query` appear in `text` in
+order (case-insensitive). Score is based on consecutive matches and early
+positions.
+"""
+function fuzzy_match(query::AbstractString, text::AbstractString)
+    q = lowercase(query)
+    t = lowercase(text)
+    qi = 1
+    score = 0
+    prev_match_pos = 0
+
+    for (ti, tc) in enumerate(t)
+        qi > length(q) && break
+        if tc == q[qi]
+            # Bonus for consecutive matches and early positions
+            score += (ti == prev_match_pos + 1) ? 10 : 1
+            score += max(0, length(t) - ti)
+            prev_match_pos = ti
+            qi += 1
+        end
+    end
+
+    return qi > length(q), score
+end
+
+"""
+    fuzzy_match(query, completions, completion_text; n=20)
+
+Fuzzy-match `query` against `completions`, returning the top `n` results sorted
+by score (descending). Uses a partial sort to avoid scoring more than necessary.
+"""
+function fuzzy_match(query::AbstractString, completions::AbstractVector, completion_text::Base.Callable; n=40)
+    scored = Tuple{Int, Any}[]
+    for item in completions
+        matched, score = fuzzy_match(query, completion_text(item))
+        matched || continue
+        if length(scored) < n
+            push!(scored, (score, item))
+        elseif score > first(scored[1])
+            scored[1] = (score, item)
+            sort!(scored; by=first)  # keep min at front for cheap replacement
+        end
+    end
+
+    return scored
+end
+
+"""
+Default completion renderer: just renders the text of the completion as a
+Selectable.
+"""
+function default_completion_renderer(completion, idx, is_selected)
+    ig.Selectable(completion, is_selected)
+end
+
+const _autocomplete_selected_idx = Dict{UInt32, Int}()
+
+"""
+    draw_autocomplete_popup(label, query, completions, completion_text,
+                            completion_renderer) -> Union{Nothing, String}
+
+Draw the autocomplete popup below the current item. Returns the selected
+completion text if one was chosen, `nothing` otherwise.
+
+- `completions`: iterable of completion items (any type)
+- `completion_text(item) -> String`: extracts the text to match against and to
+  return on selection
+- `completion_renderer(item, index, is_selected)`: draws a single completion row
+"""
+function draw_autocomplete_popup(label, query, completions, completion_text,
+                                 completion_renderer)
+    popup_label = "##autocomplete-$(label)"
+    id = ig.GetID(label)
+
+    scored = fuzzy_match(query, completions, completion_text)
+
+    selected_idx = get(_autocomplete_selected_idx, id, 1)
+    result = nothing
+    popup_hovered = false
+
+    if !isempty(scored)
+        # Position popup below the input
+        input_min = ig.GetItemRectMin()
+        input_max = ig.GetItemRectMax()
+        row_height = ig.GetTextLineHeightWithSpacing()
+        max_rows = 8
+        popup_height = min(length(scored), max_rows) * row_height + 2 * unsafe_load(ig.GetStyle().WindowPadding.y)
+        popup_width = 600
+
+        ig.SetNextWindowPos(ImVec2(input_min.x, input_max.y))
+        ig.SetNextWindowSize(ImVec2(popup_width, popup_height))
+
+        flags = ig.ImGuiWindowFlags_NoTitleBar | ig.ImGuiWindowFlags_NoResize |
+                ig.ImGuiWindowFlags_NoMove | ig.ImGuiWindowFlags_NoFocusOnAppearing |
+                ig.ImGuiWindowFlags_NoSavedSettings | ig.ImGuiWindowFlags_Tooltip
+
+        if ig.Begin(popup_label, C_NULL, flags)
+            popup_hovered = ig.IsWindowHovered() || ig.IsWindowFocused()
+
+            # Keyboard navigation
+            if ig.IsKeyPressed(ig.ImGuiKey_DownArrow)
+                selected_idx = min(selected_idx + 1, length(scored))
+            elseif ig.IsKeyPressed(ig.ImGuiKey_UpArrow)
+                selected_idx = max(selected_idx - 1, 1)
+            end
+
+            for (i, (_, item)) in enumerate(scored)
+                is_selected = (i == selected_idx)
+                ig.PushID(i)
+                if completion_renderer(item, i, is_selected)
+                    result = completion_text(item)
+                end
+                if is_selected && (ig.IsKeyPressed(ig.ImGuiKey_Tab) || ig.IsKeyPressed(ig.ImGuiKey_Enter))
+                    result = completion_text(item)
+                end
+                ig.PopID()
+            end
+
+            ig.End()
+        end
+    end
+
+    selected_idx = clamp(selected_idx, 1, max(length(scored), 1))
+    _autocomplete_selected_idx[id] = selected_idx
+
+    return result, popup_hovered
+end
+
+function ElidedText(label::AbstractString, text::AbstractString;
+                    max_chars::Int=30, editable::Bool=false,
+                    completions=nothing,
+                    completion_text::Function=string,
+                    completion_renderer::Function=default_completion_renderer,
+                    callback=C_NULL, user_data=C_NULL)
     id = ig.GetID(label)
     state = get(elided_text_editing, id, ElidedEditState_NoEdit)
 
@@ -161,17 +302,43 @@ function ElidedText(label::AbstractString, text::AbstractString; max_chars::Int=
         if just_started
             ig.SetKeyboardFocusHere()
             elided_text_editing[id] = ElidedEditState_Edit
+            _autocomplete_selected_idx[id] = 1
         end
         ig.SetNextItemWidth(ig.CalcTextSize(text).x + 40)
-        edited, new_text = SafeInputText("##elided-$(label)"; current_text=text, reset=just_started)
+        edited, new_text = SafeInputText("##elided-$(label)"; current_text=text, reset=just_started,
+                                         callback, user_data)
         lost_focus = ig.IsItemDeactivated() && !ig.IsItemActive()
-        if edited
+
+        # Draw autocomplete popup if completions are provided
+        ac_result = nothing
+        ac_hovered = false
+        if !isnothing(completions)
+            ac_completions, ac_text_fn, ac_renderer, ac_query = if completions isa Base.Callable
+                completions(new_text)
+            else
+                (completions, completion_text, completion_renderer, new_text)
+            end
+            ac_result, ac_hovered = draw_autocomplete_popup(label, ac_query, ac_completions,
+                                                            ac_text_fn, ac_renderer)
+        end
+
+        if !isnothing(ac_result)
+            # Autocomplete selection takes priority
             elided_text_editing[id] = ElidedEditState_NoEdit
+            delete!(_autocomplete_selected_idx, id)
+            return true, ac_result
+        elseif edited
+            elided_text_editing[id] = ElidedEditState_NoEdit
+            delete!(_autocomplete_selected_idx, id)
             if new_text != text && !isempty(new_text)
                 return true, new_text
             end
-        elseif ig.IsKeyPressed(ig.ImGuiKey_Escape) || lost_focus
+        elseif ig.IsKeyPressed(ig.ImGuiKey_Escape)
             elided_text_editing[id] = ElidedEditState_NoEdit
+            delete!(_autocomplete_selected_idx, id)
+        elseif lost_focus && !ac_hovered
+            elided_text_editing[id] = ElidedEditState_NoEdit
+            delete!(_autocomplete_selected_idx, id)
         end
     else
         elide = length(text) > max_chars
@@ -305,4 +472,131 @@ function CopyableCombo(label, items, selected_idx::Ref{Cint})
     ig.NewLine()
 
     return changed
+end
+
+mutable struct KaraboDepTextState
+    override_text::String
+    cursor_pos::Cint
+    device::Maybe{String}
+    # If >= 0, the callback will move the cursor to this position and clear the
+    # selection on the next frame, then reset to -1.
+    wanted_cursor_pos::Cint
+end
+
+KaraboDepTextState() = KaraboDepTextState("", -1, nothing, -1)
+
+
+function dep_text_callback(callback_data::Ptr{ig.ImGuiInputTextCallbackData})::Cint
+    user_data_ptr = unsafe_load(callback_data.UserData)
+    state::KaraboDepTextState = unsafe_pointer_to_objref(user_data_ptr)
+
+    state.cursor_pos = unsafe_load(callback_data.CursorPos)
+
+    if state.wanted_cursor_pos >= 0
+        pos = state.wanted_cursor_pos
+        state.wanted_cursor_pos = -1
+        callback_data.CursorPos = pos
+        callback_data.SelectionStart = pos
+        callback_data.SelectionEnd = pos
+    end
+
+    return 0
+end
+
+function device_completion_renderer(item, i, selected)
+    name, topic = item
+    clicked = ig.Selectable("##device-$i", selected)
+    ig.SameLine(0, 0)
+    ig.Text(name)
+    ig.SameLine()
+    ig.TextDisabled("($topic)")
+    return clicked
+end
+
+function property_completion_renderer(item, i, selected)
+    clicked = ig.Selectable("##prop-$i", selected)
+    ig.SameLine(0, 0)
+    ig.Text(item)
+    return clicked
+end
+
+"""
+    KaraboDepText(label, text, dep_state, device_list, property_completions)
+        -> (edited::Bool, new_text::String)
+
+Editable text for KaraboDependency fields with autocompletion. Completions
+switch automatically based on cursor position: if the cursor is before the dot,
+device name completions are shown; if after, property completions are shown.
+When a device is selected from completions (no dot in the result), a dot is
+appended and the widget stays in edit mode for property entry.
+
+The caller manages the `KaraboDepTextState` and should check `dep_state.device`
+after each call to determine which device property completions are needed for,
+passing them via `property_completions` on the next frame.
+"""
+function KaraboDepText(label, text, dep_state::KaraboDepTextState,
+                       device_list, property_completions)
+    id = ig.GetID(label)
+    current_text = isempty(dep_state.override_text) ? text : dep_state.override_text
+
+    cb = @cfunction(dep_text_callback, Cint, (Ptr{ig.ImGuiInputTextCallbackData},))
+
+    edited, new_text = ElidedText(label, current_text;
+        editable=true,
+        callback=cb,
+        user_data=pointer_from_objref(dep_state),
+        completions=input -> begin
+            di = findfirst('.', input)
+            cursor = dep_state.cursor_pos
+            cursor_after_dot = !isnothing(di) && cursor >= 0 && cursor > di - 1
+
+            if isnothing(di) || !cursor_after_dot
+                query = isnothing(di) ? input : input[1:di-1]
+                (device_list, first, device_completion_renderer, query)
+            else
+                dev = @view input[1:di-1]
+                query = @view input[di+1:end]
+                (property_completions, prop -> "$(dev).$(prop)", property_completion_renderer, query)
+            end
+        end)
+
+    # Update the device field based on current text and cursor position
+    dot_idx = findfirst('.', isempty(dep_state.override_text) ? (edited ? new_text : current_text) : dep_state.override_text)
+    cur = dep_state.cursor_pos
+    if !isnothing(dot_idx) && cur >= 0 && cur > dot_idx - 1
+        dep_state.device = current_text[1:dot_idx-1]
+    else
+        dep_state.device = nothing
+    end
+
+    if edited
+        if isnothing(findfirst('.', new_text))
+            # Device selected — append dot and stay in edit mode for property
+            dot_idx = findfirst('.', current_text)
+            property_suffix = if !isnothing(dot_idx)
+                current_text[dot_idx:end]
+            else
+                "."
+            end
+            dep_state.override_text = new_text * property_suffix
+            dep_state.device = new_text
+            dep_state.wanted_cursor_pos = ncodeunits(dep_state.override_text)
+            elided_text_editing[id] = ElidedEditState_WantEdit
+            return false, text
+        else
+            dep_state.override_text = ""
+            dep_state.cursor_pos = -1
+            dep_state.device = nothing
+            return true, new_text
+        end
+    end
+
+    # Clean up state when editing is dismissed
+    if get(elided_text_editing, id, ElidedEditState_NoEdit) == ElidedEditState_NoEdit
+        dep_state.override_text = ""
+        dep_state.cursor_pos = -1
+        dep_state.device = nothing
+    end
+
+    return false, text
 end
