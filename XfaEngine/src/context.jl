@@ -1,6 +1,6 @@
 module Context
 
-export @karabo_str, @Variable, @Input, @Group, Parameter, tryset
+export @karabo_str, @Variable, @Input, @Group, Parameter, tryset, KaraboDevice
 
 import Base.ScopedValues: @with
 

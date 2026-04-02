@@ -68,6 +68,8 @@ function get_webproxy(device::AbstractString)
     error("No webproxy found for device '$device'")
 end
 
+get_webproxy(device::KaraboDevice) = current_engine_state.webproxies[device.topic]
+
 # Flatten the returned dict a bit by removing timestamp and tid entries for each
 # node.
 function strip_metadata!(x)
@@ -84,6 +86,14 @@ end
 
 function get_json(wp, path; timeout=5)
     res = HTTP.get(wp.address * path;
+                   connect_timeout=timeout, readtimeout=timeout)
+    return JSON3.read(res.body, Dict{String, Any})
+end
+
+function put_json(wp, path, body; timeout=5)
+    res = HTTP.put(wp.address * path,
+                   ["Content-Type" => "application/json"],
+                   JSON3.write(body);
                    connect_timeout=timeout, readtimeout=timeout)
     return JSON3.read(res.body, Dict{String, Any})
 end
@@ -139,8 +149,9 @@ function get_all_trainmatchers(webproxies::Dict)
     return trainmatchers
 end
 
-function get_config(wp, device; timeout=5)
-    config = get_json(wp, "/devices/$(device)/config.json"; timeout)
+function get_config(device::KaraboDevice; timeout=5)
+    wp = get_webproxy(device)
+    config = get_json(wp, "/devices/$(device.name)/config.json"; timeout)
     strip_metadata!(config)
     return config
 end
@@ -148,6 +159,16 @@ end
 function get_property(wp, device, property; timeout=5)
     config = get_json(wp, "/devices/$(device).$(property)/config.json"; timeout)
     return config["value"]
+end
+
+function put_property(device::KaraboDevice, property, value; timeout=5)
+    wp = get_webproxy(device)
+    put_json(wp, "/devices/$(device.name).$(property)/config.json", value; timeout)
+end
+
+function get_schema(device::KaraboDevice; timeout=5)
+    wp = get_webproxy(device)
+    return get_json(wp, "/devices/$(device.name)/schema.json"; timeout)
 end
 
 function call_slot(wp, device, slot, params=HTTP.nobody; timeout=5)

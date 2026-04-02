@@ -14,7 +14,7 @@ using OrderedCollections: OrderedDict as OD
 
 using XfaEngine: XfaEngine, Context, KaraboBridge, Protocol
 using XfaEngine.Context: @Variable, @karabo_str, VariableData, Dependency, KaraboDependency,
-    GroupDependency, SubvariableDependency, XfaContextException, Parameter, FunctionArgument
+    GroupDependency, SubvariableDependency, XfaContextException, Parameter, FunctionArgument, KaraboDevice
 using XfaEngine.KaraboBridge: KaraboBridgeClient, KaraboBridgeServer, ThreadsafeSocket
 
 
@@ -26,6 +26,7 @@ function test_connect(port=1331)
 
         id = WebSockets.receive(ws)
         client.client_id = id
+        WebSockets.receive(ws) # engine directory
 
         for msg_bytes in ws
             buffer = IOBuffer(msg_bytes)
@@ -113,6 +114,9 @@ end
             id = WebSockets.receive(ws)
             @test id isa String
             @test length(id) > 5
+            engine_dir = WebSockets.receive(ws)
+            @test engine_dir isa String
+            @test engine_dir == pkgdir(XfaEngine)
             @test Protocol.receive(ws).msg isa Protocol.AvailableTrainmatchers
 
             # Test Ping
@@ -175,7 +179,8 @@ end
     log = TestLogger()
     temp_engine(; log) do address, stop_event, info_path
         WebSockets.open(address) do ws
-            # Consume the client ID and initial trainmatchers
+            # Consume the client ID, engine dir, and initial trainmatchers
+            WebSockets.receive(ws)
             WebSockets.receive(ws)
             Protocol.receive(ws)
 
@@ -972,7 +977,7 @@ end
                                        "parameters" => Dict("period" => Parameter("period", 2π),
                                                             "bridge.hostname" => Parameter("bridge.hostname", ""),
                                                             "bridge.port" => Parameter("bridge.port", 45000),
-                                                            "bridge.trainmatcher" => Parameter("bridge.trainmatcher", ""),
+                                                            "bridge.trainmatcher" => Parameter("bridge.trainmatcher", KaraboDevice("", "")),
                                                             "bridge.manual_configuration" => Parameter("bridge.manual_configuration", false)),
                                        "path" => "")
 end

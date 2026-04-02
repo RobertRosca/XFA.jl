@@ -3,6 +3,8 @@ module XfaEngine
 include("karabo_bridge.jl")
 include("context.jl")
 include("protocol.jl")
+
+using .Context: KaraboDevice
 include("webproxy.jl")
 
 import TOML

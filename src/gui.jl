@@ -25,7 +25,7 @@ using CRC32c: crc32c
 using Serialization
 using XfaEngine.Protocol
 using XfaEngine: XfaEngine, Protocol
-using XfaEngine.Context: KaraboDependency, Dependency, Parameter
+using XfaEngine.Context: KaraboDependency, Dependency, Parameter, KaraboDevice
 include("state_inspector.jl")
 include("client.jl")
 include("context_edit.jl")
@@ -120,6 +120,13 @@ end
 
 function draw_parameter(name, param::Parameter{Vector{String}})
     ig.Text("Vector{String}")
+
+    return false, nothing
+end
+
+function draw_parameter(name, param::Parameter{KaraboDevice})
+    device = param.value
+    ig.Text("$(device.name) ($(device.topic))")
 
     return false, nothing
 end

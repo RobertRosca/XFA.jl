@@ -38,10 +38,10 @@ struct FunctionArgument
     type::Union{Nothing, Type}
 end
 
-function KaraboDependency(str::AbstractString)
-    slow_data_re = r"^(\S+?)\.([\w|\.]+)$"
-    fast_data_re = r"^(\S+):(\S+)\[(\S+)\]$"
+const slow_data_re = r"^(\S+?)\.([\w|\.]+)$"
+const fast_data_re = r"^(\S+):(\S+)\[(\S+)\]$"
 
+function KaraboDependency(str::AbstractString)
     m = match(slow_data_re, str)
     if m != nothing
         return KaraboDependency(m.captures[1], m.captures[2])
