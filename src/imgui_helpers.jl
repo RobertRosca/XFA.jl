@@ -307,7 +307,7 @@ function ElidedText(label::AbstractString, text::AbstractString;
         ig.SetNextItemWidth(ig.CalcTextSize(text).x + 40)
         edited, new_text = SafeInputText("##elided-$(label)"; current_text=text, reset=just_started,
                                          callback, user_data)
-        lost_focus = ig.IsItemDeactivated() && !ig.IsItemActive()
+        lost_focus = !just_started && ig.IsItemDeactivated() && !ig.IsItemActive()
 
         # Draw autocomplete popup if completions are provided
         ac_result = nothing

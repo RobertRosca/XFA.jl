@@ -123,6 +123,10 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
             @error "Error in 'GetDevices', requested by $(id)" exception=(ex, catch_backtrace())
             Protocol.server_send(ws, Devices(ex); reply_to)
         end
+    elseif msg isa GetDeviceSchema
+        schema = get_schema(KaraboDevice(msg.topic, msg.name))
+        Protocol.server_send(ws, DeviceSchema(msg.topic, msg.name, schema); reply_to)
+        @info "Responded to 'GetDeviceSchema' from $(id)"
     elseif msg isa GetTrainmatchers
         trainmatchers = get_all_trainmatchers(state.webproxies)
         Protocol.server_send(ws, AvailableTrainmatchers(trainmatchers, state.default_trainmatchers); reply_to)

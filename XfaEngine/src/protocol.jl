@@ -2,6 +2,7 @@ module Protocol
 
 export AbstractMessage, Ping, Shutdown,
     GetDevices, GetTrainmatchers, SetTopicTrainmatcher, LoadContext, ReviseCode,
+    GetDeviceSchema, DeviceSchema,
     ChangeParameter, Start, Stop,
     SetDebugMode, SetRemoteRepl,
     Pong, AvailableTrainmatchers,
@@ -27,6 +28,11 @@ struct GetDevices <: AbstractMessage
     topic::Union{String, Nothing}
 end
 GetDevices() = GetDevices(nothing)
+
+struct GetDeviceSchema <: AbstractMessage
+    topic::String
+    name::String
+end
 
 struct LoadContext <: AbstractMessage
     path::String
@@ -69,6 +75,12 @@ struct Stopped <: AbstractMessage end
 
 struct Devices <: AbstractMessage
     device_names::Union{Dict{String, Dict{String, Any}}, Exception}
+end
+
+struct DeviceSchema <: AbstractMessage
+    topic::String
+    name::String
+    schema::Dict{String, Dict}
 end
 
 struct ContextInfo <: AbstractMessage

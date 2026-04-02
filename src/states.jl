@@ -28,6 +28,20 @@ end
     PipelineStatus_Stopped
 end
 
+struct PropertyList
+    names::Vector{String}
+    displayed_names::Vector{String}
+    descriptions::Vector{String}
+    value_types::Vector{String}
+end
+PropertyList() = PropertyList(String[], String[], String[], String[])
+
+struct DeviceProperties
+    slow::PropertyList
+    fast::PropertyList
+end
+DeviceProperties() = DeviceProperties(PropertyList(), PropertyList())
+
 @enum RemoteReplStatus begin
     RemoteReplStatus_Running
     RemoteReplStatus_Changing
@@ -206,6 +220,8 @@ end
 
     # KaraboDepText widget state, keyed by dependency ID
     karabo_dep_states::Dict{Int, KaraboDepTextState} = Dict{Int, KaraboDepTextState}()
+    device_properties::Dict{Tuple{String, String}, DeviceProperties} = Dict{Tuple{String, String}, DeviceProperties}()
+    device_schema_requests::Dict{Tuple{String, String}, Int} = Dict{Tuple{String, String}, Int}()
 
     # Variables and plots
     variable_data::Dict{String, VariableStore} = Dict()

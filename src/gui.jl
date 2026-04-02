@@ -194,16 +194,17 @@ function draw_device_tree(device_tree)
 end
 
 function get_device_properties(client, device_name)
-    get!(client.device_properties, device_name) do
-        # Find the topic for this device and request its schema
-        idx = findfirst(d -> d[1] == device_name, client.device_list)
-        if !isnothing(idx)
-            topic = client.device_list[idx][2]
-            id = send(client, GetDeviceSchema(topic, device_name))
-            client.device_schema_requests[(topic, device_name)] = id
-        end
-        String[]
+    idx = findfirst(d -> d[1] == device_name, client.device_list)
+    isnothing(idx) && return String[]
+
+    topic = client.device_list[idx][2]
+    key = (topic, device_name)
+    props = get!(client.device_properties, key) do
+        id = send(client, GetDeviceSchema(topic, device_name))
+        client.device_schema_requests[key] = id
+        DeviceProperties()
     end
+    return props.slow.names
 end
 
 function draw_dag()

@@ -418,6 +418,37 @@ function coffman_graham(dag; W=3)
     return levels
 end
 
+function schema_property_names(schema::Dict)
+    props = DeviceProperties()
+    collect_properties!(props, "", schema)
+    slow_order = sortperm(props.slow.names)
+    fast_order = sortperm(props.fast.names)
+    return DeviceProperties(
+        PropertyList(props.slow.names[slow_order], props.slow.displayed_names[slow_order],
+                     props.slow.descriptions[slow_order], props.slow.value_types[slow_order]),
+        PropertyList(props.fast.names[fast_order], props.fast.displayed_names[fast_order],
+                     props.fast.descriptions[fast_order], props.fast.value_types[fast_order])
+    )
+end
+
+function collect_properties!(props, prefix, node::Dict, target::PropertyList=props.slow)
+    for (key, value) in node
+        path = isempty(prefix) ? key : "$(prefix).$(key)"
+        if value isa Dict
+            if get(value, "nodeType", "") == "Leaf"
+                push!(target.names, path)
+                push!(target.displayed_names, get(value, "displayedName", ""))
+                push!(target.descriptions, get(value, "description", ""))
+                push!(target.value_types, get(value, "valueType", ""))
+            elseif haskey(value, "noInputShared") && haskey(value, "schema")
+                collect_properties!(props, path, value["schema"], props.fast)
+            else
+                collect_properties!(props, path, value, target)
+            end
+        end
+    end
+end
+
 function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothing)
     client = state.client
 
@@ -451,6 +482,9 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
                 client.trainmatcher_selected_idx[topic] = Ref(Cint(idx - 1))
             end
         end
+    elseif msg isa DeviceSchema
+        client.device_properties[(msg.topic, msg.name)] = schema_property_names(msg.schema)
+        delete!(client.device_schema_requests, (msg.topic, msg.name))
     elseif msg isa ContextInfo
         if msg.info isa Dict
             client.context.context_state = build_context_state(state, msg.info)
