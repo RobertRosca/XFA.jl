@@ -168,6 +168,7 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
             Context.start_pipeline(state.ctx)
             Protocol.server_send(ws, Ack(); reply_to)
         catch ex
+                @error "Failed to start pipeline" exception=(ex, catch_backtrace())
             Protocol.server_send(ws, Ack(ex); reply_to)
         end
         @info "Started"
@@ -207,8 +208,9 @@ function handle_client(state::EngineState, id)
     client_state = state.clients[id]
     ws = client_state.websocket
 
-    # Start by sending their identifier
+    # Start by sending their identifier and engine directory
     WebSockets.send(ws, id)
+    WebSockets.send(ws, pkgdir(XfaEngine))
     @info "Connected to new client: $(id) 🙋"
 
     # Send available trainmatchers with defaults

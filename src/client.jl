@@ -192,23 +192,6 @@ function initialize_engine(state)
         "source /etc/profile.d/modules.sh; SASE=0 module load exfel julia/202502 > /dev/null 2>&1"
     end
 
-    julia_binary = if is_local
-        "julia"
-    else
-        out = readchomp("$(julia_module_prefix); which julia", client.ssh_hops[end].session)
-        split(out, "\n")[end]
-    end
-
-    client.remote_engine_dir = if is_local
-        pkgdir(XfaEngine)
-    else
-        cmd_str = "$(julia_module_prefix); julia -O0 --compile=min --project=@xfa-default -E 'import XfaEngine; pkgdir(XfaEngine)'"
-        cmd = `bash -c $(cmd_str)`
-        proc = run(ignorestatus(cmd),
-                   client.ssh_hops[end].session; print_out=false)
-        string(chomp(String(proc.out))[2:end - 1])
-    end
-
     bootstrap_process = nothing
 
     try
@@ -229,11 +212,9 @@ function initialize_engine(state)
             end
 
             bootstrap_env = Dict("XFA_ENVIRONMENT" => state.engine_environment,
-                                 "XFA_ENGINE_DIR" => client.remote_engine_dir,
-                                 "XFA_WORKING_DIR" => working_dir,
-                                 "XFA_JULIA_BINARY" => julia_binary)
+                                 "XFA_WORKING_DIR" => working_dir)
             bootstrap_env_str = join(["$(key)=$(value)" for (key, value) in bootstrap_env], " ")
-            bootstrap_cmd = "$(bootstrap_env_str) bash -c '$(julia_module_prefix); julia -O0 --compile=min --color=no $(bootstrap_jl)'"
+            bootstrap_cmd = "$(bootstrap_env_str) bash -c '$(julia_module_prefix); julia --project=$(state.engine_environment) --color=no $(bootstrap_jl)'"
             bootstrap_process = run(bootstrap_cmd, session; wait=false)
 
             while !process_exited(bootstrap_process)
@@ -549,9 +530,10 @@ function handle_server(state)
             WebSockets.open("ws://localhost:$(port)") do ws
                 client.websocket = ws
 
-                # The first message we receive is our client ID
+                # The first messages we receive are our client ID and engine directory
                 id = WebSockets.receive(ws)
                 client.client_id = id
+                client.remote_engine_dir = WebSockets.receive(ws)
 
                 client.status = RemoteStatus_Connected
 
