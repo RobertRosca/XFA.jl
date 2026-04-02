@@ -162,6 +162,50 @@ function clear_variables()
     end
 end
 
+function draw_device_tree(device_tree)
+    if isempty(device_tree)
+        ig.TextDisabled("No devices loaded")
+        return
+    end
+
+    n_devices = sum(length(devs) for (_, devs) in device_tree)
+    n_topics = length(device_tree)
+    if ig.TreeNode("Devices ($n_devices across $n_topics topics)##device-tree")
+        for (topic, devices) in device_tree
+            if ig.TreeNode("$topic ($(length(devices)))##topic-$topic")
+                for (name, info_pairs) in devices
+                    class_id_pair = findfirst(p -> p.first == "classId", info_pairs)
+                    class_id = isnothing(class_id_pair) ? "" : info_pairs[class_id_pair].second
+                    if ig.TreeNode("$name##dev-$name")
+                        for (key, value) in info_pairs
+                            ig.Text("$key: $value")
+                        end
+                        ig.TreePop()
+                    else
+                        ig.SameLine()
+                        ig.TextDisabled(class_id)
+                    end
+                end
+                ig.TreePop()
+            end
+        end
+        ig.TreePop()
+    end
+end
+
+function get_device_properties(client, device_name)
+    get!(client.device_properties, device_name) do
+        # Find the topic for this device and request its schema
+        idx = findfirst(d -> d[1] == device_name, client.device_list)
+        if !isnothing(idx)
+            topic = client.device_list[idx][2]
+            id = send(client, GetDeviceSchema(topic, device_name))
+            client.device_schema_requests[(topic, device_name)] = id
+        end
+        String[]
+    end
+end
+
 function draw_dag()
     client = state[].client
     context = client.context
@@ -779,6 +823,16 @@ function draw_gui()
 
                         ig.EndTable()
                     end
+                end
+
+                ig.Dummy(0, 10)
+
+                @Disabled is_pending(client, client.devices_request) begin
+                    if ig.Button("Get devices")
+                        get_devices(client)
+                    end
+
+                    draw_device_tree(client.device_tree)
                 end
             end
         end
