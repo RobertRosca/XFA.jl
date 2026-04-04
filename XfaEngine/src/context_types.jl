@@ -29,9 +29,12 @@ end
 GroupDependency(type::DataType) = GroupDependency(nothing, type)
 
 struct KaraboDependency <: AbstractDependency
+    topic::Union{String, Nothing}
     source::String
     property::String
 end
+
+KaraboDependency(source::AbstractString, property::AbstractString) = KaraboDependency(nothing, source, property)
 
 struct FunctionArgument
     name::String
@@ -40,26 +43,40 @@ end
 
 const slow_data_re = r"^(\S+?)\.([\w|\.]+)$"
 const fast_data_re = r"^(\S+):(\S+)\[(\S+)\]$"
+const topic_prefix_re = r"^(\w+)//(.+)$"
 
 function KaraboDependency(str::AbstractString)
+    topic = nothing
+    m = match(topic_prefix_re, str)
+    if !isnothing(m)
+        topic = m.captures[1]
+        str = m.captures[2]
+    end
+
     m = match(slow_data_re, str)
-    if m != nothing
-        return KaraboDependency(m.captures[1], m.captures[2])
+    if !isnothing(m)
+        return KaraboDependency(topic, m.captures[1], m.captures[2])
     end
 
     m = match(fast_data_re, str)
-    if m != nothing
-        return KaraboDependency("$(m.captures[1]):$(m.captures[2])", m.captures[3])
+    if !isnothing(m)
+        return KaraboDependency(topic, "$(m.captures[1]):$(m.captures[2])", m.captures[3])
     end
 
     throw(ArgumentError("'$(str)' is not a valid Karabo device property"))
 end
 
 function Base.string(kp::KaraboDependency)
-    if occursin(':', kp.source)
-        return "$(kp.source)[$(kp.property)]"
+    device_str = if occursin(':', kp.source)
+        "$(kp.source)[$(kp.property)]"
     else
-        return "$(kp.source).$(kp.property)"
+        "$(kp.source).$(kp.property)"
+    end
+
+    if isnothing(kp.topic)
+        return device_str
+    else
+        return "$(kp.topic)//$(device_str)"
     end
 end
 

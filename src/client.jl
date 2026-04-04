@@ -422,13 +422,15 @@ function schema_property_names(schema::Dict)
     props = DeviceProperties()
     collect_properties!(props, "", schema)
     slow_order = sortperm(props.slow.names)
-    fast_order = sortperm(props.fast.names)
-    return DeviceProperties(
-        PropertyList(props.slow.names[slow_order], props.slow.displayed_names[slow_order],
-                     props.slow.descriptions[slow_order], props.slow.value_types[slow_order]),
-        PropertyList(props.fast.names[fast_order], props.fast.displayed_names[fast_order],
-                     props.fast.descriptions[fast_order], props.fast.value_types[fast_order])
-    )
+    sorted_slow = PropertyList(props.slow.names[slow_order], props.slow.displayed_names[slow_order],
+                               props.slow.descriptions[slow_order], props.slow.value_types[slow_order])
+    sorted_fast = Dict{String, PropertyList}()
+    for (pipeline, plist) in props.fast
+        order = sortperm(plist.names)
+        sorted_fast[pipeline] = PropertyList(plist.names[order], plist.displayed_names[order],
+                                             plist.descriptions[order], plist.value_types[order])
+    end
+    return DeviceProperties(sorted_slow, sorted_fast)
 end
 
 function collect_properties!(props, prefix, node::Dict, target::PropertyList=props.slow)
@@ -441,7 +443,8 @@ function collect_properties!(props, prefix, node::Dict, target::PropertyList=pro
                 push!(target.descriptions, get(value, "description", ""))
                 push!(target.value_types, get(value, "valueType", ""))
             elseif haskey(value, "noInputShared") && haskey(value, "schema")
-                collect_properties!(props, path, value["schema"], props.fast)
+                pipeline_props = get!(props.fast, path, PropertyList())
+                collect_properties!(props, "", value["schema"], pipeline_props)
             else
                 collect_properties!(props, path, value, target)
             end
@@ -466,8 +469,19 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
                 [(topic, sort([(name, sort(collect(info); by=first))
                                for (name, info) in devices]; by=first))
                  for (topic, devices) in msg.device_names]; by=first)
-            client.device_list = [(name, topic) for (topic, devices) in client.device_tree
-                                                for (name, _) in devices]
+            all_names = [name for (_, devices) in client.device_tree for (name, _) in devices]
+            seen = Set{String}()
+            ambiguous = Set{String}()
+            for name in all_names
+                if name in seen
+                    push!(ambiguous, name)
+                else
+                    push!(seen, name)
+                end
+            end
+            client.source_list = [SourceInfo((topic, name, name in ambiguous))
+                                  for (topic, devices) in client.device_tree
+                                  for (name, _) in devices]
             client.webproxy_status = RequestStatus_Idle
         end
     elseif msg isa AvailableTrainmatchers
@@ -483,7 +497,7 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
             end
         end
     elseif msg isa DeviceSchema
-        client.device_properties[(msg.topic, msg.name)] = schema_property_names(msg.schema)
+        client.source_properties[(msg.topic, msg.name)] = schema_property_names(msg.schema)
         delete!(client.device_schema_requests, (msg.topic, msg.name))
     elseif msg isa ContextInfo
         if msg.info isa Dict

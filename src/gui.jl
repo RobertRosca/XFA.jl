@@ -7,7 +7,6 @@ using GLFW: GLFW
 using ModernGL
 
 include("imnodes.jl")
-include("imgui_helpers.jl")
 
 using NaNStatistics: nanmean, nanmaximum, nanminimum
 using DimensionalData: DimensionalData as DD, DimVector, DimMatrix, DimArray, At, lookup
@@ -17,6 +16,7 @@ using LibSSH: LibSSH as ssh
 using HTTP: HTTP, WebSockets
 using XfaEngine: EngineState, getavailableport
 include("states.jl")
+include("imgui_helpers.jl")
 
 using Printf: @sprintf
 using TOML: TOML
@@ -193,18 +193,17 @@ function draw_device_tree(device_tree)
     end
 end
 
-function get_device_properties(client, device_name)
-    idx = findfirst(d -> d[1] == device_name, client.device_list)
-    isnothing(idx) && return String[]
+function get_source_properties(client, device_name)
+    idx = findfirst(s -> s.name == device_name, client.source_list)
+    isnothing(idx) && return DeviceProperties()
 
-    topic = client.device_list[idx][2]
+    topic = client.source_list[idx].topic
     key = (topic, device_name)
-    props = get!(client.device_properties, key) do
+    return get!(client.source_properties, key) do
         id = send(client, GetDeviceSchema(topic, device_name))
         client.device_schema_requests[key] = id
         DeviceProperties()
     end
-    return props.slow.names
 end
 
 function draw_dag()
@@ -318,15 +317,15 @@ function draw_dag()
                 ig.TextDisabled("Karabo")
                 ig.SameLine()
                 dep_state = get!(client.karabo_dep_states, dep_id, KaraboDepTextState())
-                prop_completions = if isnothing(dep_state.device)
-                    String[]
+                device_props = if isnothing(dep_state.device)
+                    DeviceProperties()
                 else
-                    get_device_properties(client, dep_state.device)
+                    get_source_properties(client, dep_state.device)
                 end
-                edited, new_dep = KaraboDepText("dep-$(dep_id)", string(dep), dep_state,
-                                                client.device_list, prop_completions)
+                edited, new_text = KaraboDepText("dep-$(dep_id)", string(dep), dep_state,
+                                                client.source_list, device_props)
                 if edited
-                    @guiasync rename_karabo_dep(state[], name, dep, new_dep)
+                    @guiasync rename_karabo_dep(state[], name, arg_name, KaraboDependency(new_text))
                 end
             else
                 ig.Text(arg_name)

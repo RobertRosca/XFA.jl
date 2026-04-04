@@ -360,6 +360,18 @@ end
     @test_throws ArgumentError KaraboDependency("foo")
     @test_throws ArgumentError KaraboDependency("foo.bar[]")
     @test_throws ArgumentError KaraboDependency("foo:[bar]")
+
+    # Topic macros
+    @test karabo"MID//foo.bar" == KaraboDependency("MID", "foo", "bar")
+    @test karabo"SA2//foo:output[bar]" == KaraboDependency("SA2", "foo:output", "bar")
+
+    # Parsing from string with topic
+    @test KaraboDependency("MID//foo.bar") == KaraboDependency("MID", "foo", "bar")
+    @test KaraboDependency("SA2//foo:output[bar]") == KaraboDependency("SA2", "foo:output", "bar")
+
+    # Round trip
+    @test KaraboDependency(string(karabo"MID//foo.bar")) == karabo"MID//foo.bar"
+    @test KaraboDependency(string(karabo"SA2//foo:output[bar]")) == karabo"SA2//foo:output[bar]"
 end
 
 @testset "@Variable" begin

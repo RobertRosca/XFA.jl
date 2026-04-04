@@ -28,6 +28,8 @@ end
     PipelineStatus_Stopped
 end
 
+const SourceInfo = @NamedTuple{topic::String, name::String, ambiguous::Bool}
+
 struct PropertyList
     names::Vector{String}
     displayed_names::Vector{String}
@@ -38,15 +40,25 @@ PropertyList() = PropertyList(String[], String[], String[], String[])
 
 struct DeviceProperties
     slow::PropertyList
-    fast::PropertyList
+    fast::Dict{String, PropertyList}
 end
-DeviceProperties() = DeviceProperties(PropertyList(), PropertyList())
+DeviceProperties() = DeviceProperties(PropertyList(), Dict{String, PropertyList}())
 
 @enum RemoteReplStatus begin
     RemoteReplStatus_Running
     RemoteReplStatus_Changing
     RemoteReplStatus_Stopped
 end
+
+mutable struct KaraboDepTextState
+    cursor_pos::Cint
+    device::Maybe{String}
+    # If set, the callback will replace the buffer contents with this text,
+    # move the cursor to the end, and then clear it.
+    wanted_text::Maybe{String}
+end
+
+KaraboDepTextState() = KaraboDepTextState(-1, nothing, nothing)
 
 mutable struct KbdintPromptState
     msg::String
@@ -215,12 +227,14 @@ end
     devices_request::Maybe{Int} = nothing
     # Pre-sorted for display: [(topic, [(device_name, sorted_info_pairs), ...]), ...]
     device_tree::Vector{Tuple{String, Vector{Tuple{String, Vector{Pair{String, Any}}}}}} = []
-    # Flat list of (device_name, topic) for autocompletion
-    device_list::Vector{Tuple{String, String}} = Tuple{String, String}[]
+    # Flat list of sources for autocompletion. Sources include both devices and
+    # their pipeline outputs (e.g. "foo" and "foo:output"). The ambiguous flag
+    # indicates that the source name appears in more than one topic.
+    source_list::Vector{SourceInfo} = SourceInfo[]
 
     # KaraboDepText widget state, keyed by dependency ID
     karabo_dep_states::Dict{Int, KaraboDepTextState} = Dict{Int, KaraboDepTextState}()
-    device_properties::Dict{Tuple{String, String}, DeviceProperties} = Dict{Tuple{String, String}, DeviceProperties}()
+    source_properties::Dict{Tuple{String, String}, DeviceProperties} = Dict{Tuple{String, String}, DeviceProperties}()
     device_schema_requests::Dict{Tuple{String, String}, Int} = Dict{Tuple{String, String}, Int}()
 
     # Variables and plots
