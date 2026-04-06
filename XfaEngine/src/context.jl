@@ -1,6 +1,6 @@
 module Context
 
-export @karabo_str, @Variable, @Input, @Group, Parameter, tryset, KaraboDevice
+export @karabo_str, @Variable, @Input, @Group, @add_subvariable, Parameter, tryset, KaraboDevice
 
 import Base.ScopedValues: @with
 
@@ -39,6 +39,7 @@ const proposal = ScopedValue{Int}()
 const name = ScopedValue{String}()
 
 const scratch = ScopedValue(Dict{String, Any}())
+const subvariables = ScopedValue(Dict{String, Any}())
 
 end
 
@@ -118,11 +119,17 @@ function external_dependencies(ctx::XfaContext; per_variable=false)
     return per_variable ? deps_per_variable : unique(all_deps)
 end
 
+# Returns the name used to match a dependency against a variable name.
+# For most dependencies this is the full string, but for SubvariableDependency
+# it's the parent name since subvariables share their parent's channel.
+dep_variable_name(x) = string(x)
+dep_variable_name(x::SubvariableDependency) = x.parent
+
 function find_downstream_neighbours(ctx::XfaContext, dep_name, T::DataType)
     neighbours = Set{String}()
     for (var_name, deps) in ctx.dag
         for (_, dep) in deps
-            if dep isa T && string(dep) == dep_name
+            if dep isa T && dep_variable_name(dep) == dep_name
                 push!(neighbours, var_name)
             end
         end
@@ -352,13 +359,13 @@ function stream_external_dependency(name, input_neighbour, downstream_neighbours
     end
 end
 
-function stream_variable(name, stream_output, upstream, downstream)
+function stream_variable(name, stream_output, upstream, downstream, deps)
     # Initialize the scratch space
     scratch = Dict{String, Any}()
 
     matcher = Trainmatcher(k for (k, v) in upstream if v isa RemoteChannel)
     matched_trains = Dict{Int, Any}()
-    args = Vector{Any}(undef, length(upstream))
+    args = Vector{Any}(undef, length(deps))
     try
         while true
             while isempty(matched_trains)
@@ -373,33 +380,37 @@ function stream_variable(name, stream_output, upstream, downstream)
                 end
             end
 
-            tid, variable_args = only(matched_trains)
+            tid, matched_data = only(matched_trains)
             empty!(matched_trains)
-            for (i, (arg_name, arg)) in enumerate(upstream)
-                if arg isa RemoteChannel
-                    args[i] = pop!(variable_args, arg_name)
+
+            # Build args from deps, extracting subvariable values as needed
+            for (i, (arg_name, dep)) in enumerate(deps)
+                if dep isa GroupDependency
+                    args[i] = upstream[dep.name]
+                elseif dep isa SubvariableDependency
+                    args[i] = matched_data[dep.parent].subvariables[string(dep)]
                 else
-                    # e.g. a Group object
-                    args[i] = arg
+                    args[i] = matched_data[string(dep)].data
                 end
             end
 
             # Don't execute the variable if any inputs are `nothing`
             empty_result = VariableData(tid, name, nothing)
-            unwrapped_args = [arg isa VariableData ? arg.data : arg for arg in args]
-            if any(isnothing.(unwrapped_args))
+            if any(isnothing, args)
                 putall!(values(downstream), empty_result)
                 continue
             end
 
             # Execute the variable
             f = worker_state.dag_functions[name]
+            subvar_values = Dict{String, Any}()
             @debug "Executing variable '$(name)'..."
             @lock worker_state.task_locks[name] try
                 out = @with(Meta.tid => tid,
                             Meta.name => name,
                             Meta.scratch => scratch,
-                            f(unwrapped_args...))
+                            Meta.subvariables => subvar_values,
+                            f(args...))
             catch ex
                 @error "Execution of variable '$(name)' failed" exception=(ex, catch_backtrace())
                 putall!(values(downstream), empty_result)
@@ -407,7 +418,7 @@ function stream_variable(name, stream_output, upstream, downstream)
             end
 
             # Send output
-            out = VariableData(tid, name, out)
+            out = VariableData(tid, name, out, subvar_values)
             maybe_send_output(stream_output, out)
             putall!(values(downstream), out)
             @debug "Pushed output from '$(name)' to: $(keys(downstream))"
@@ -540,30 +551,41 @@ function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50)
     # Start the variables themselves
     execution_order = topological_sort(ctx)
     for name in execution_order
-        # Build up the argument list
+        # Build up the upstream channel list, deduplicating channels for
+        # SubvariableDependency's that share their parent's channel.
         args = OrderedDict{String, Any}()
         for dep in values(ctx.dag[name])
             dep_name = string(dep)
 
             if dep isa KaraboDependency
                 args[dep_name] = ctx.external_dependency_channels[dep_name][name]
+            elseif dep isa SubvariableDependency
+                if !haskey(args, dep.parent)
+                    args[dep.parent] = ctx.variable_channels[dep.parent][name]
+                end
             elseif dep isa Dependency
                 args[dep_name] = ctx.variable_channels[dep_name][name]
             elseif dep isa GroupDependency
-                args[dep_name] = ctx.groups[dep.name]
+                args[dep.name] = ctx.groups[dep.name]
             else
                 throw(XfaContextException("Unrecognized dependency type: $(typeof(dep))"))
             end
         end
 
-        # Find downstream variables
+        # Find downstream variables, including those that depend on our
+        # subvariables.
         downstream = Dict{String, RemoteChannel}()
         for neighbour in find_downstream_neighbours(ctx, name, Dependency)
             downstream[neighbour] = RemoteChannel()
         end
+        for neighbour in find_downstream_neighbours(ctx, name, SubvariableDependency)
+            if !haskey(downstream, neighbour)
+                downstream[neighbour] = RemoteChannel()
+            end
+        end
         ctx.variable_channels[name] = downstream
 
-        ctx.variable_tasks[name] = Threads.@spawn stream_variable(name, ctx.stream_output, args, downstream)
+        ctx.variable_tasks[name] = Threads.@spawn stream_variable(name, ctx.stream_output, args, downstream, ctx.dag[name])
         errormonitor(ctx.variable_tasks[name])
     end
 

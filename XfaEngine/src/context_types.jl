@@ -172,26 +172,22 @@ function _variable(ctx_module, expr, side_effects)
         # Extract dependency information
         dependencies, new_args = _parse_function_args(args)
 
-        # Look through the body for subvariables, and replace all the toplevel
-        # ones.
+        # Look through the body for @add_subvariable calls to register them.
+        # Only toplevel calls are allowed. Note that we capture the macro name
+        # and check it explicitly because MacroTools doesn't handle the
+        # underscore in the name properly.
         subvariables = String[]
-        new_body = []
         for body_expr in body.args
-            if @capture(body_expr, subvar_name_ = @Variable subvar_expr_)
+            if @capture(body_expr, @macroname_(subvar_name_, _)) && macroname == Symbol("@add_subvariable")
                 push!(subvariables, "$(func_name).$(subvar_name)")
-                body_expr = :($subvar_name = $subvar_expr)
             end
-
-            push!(new_body, body_expr)
         end
-        new_body = Expr(:block, new_body...)
 
-        # Once all the toplevel subvariables have been replaced, recurse
-        # through all the expressions and throw an error if we find a
-        # non-toplevel subvariable.
-        postwalk(new_body) do body_expr
-            if @capture(body_expr, subvar_name_ = @Variable _)
-                throw(ArgumentError("Subvariable '$(func_name).$(subvar_name)' must be defined at the toplevel of the function"))
+        postwalk(body) do body_expr
+            if @capture(body_expr, @macroname_(subvar_name_, _)) && macroname == Symbol("@add_subvariable")
+                if "$(func_name).$(subvar_name)" ∉ subvariables
+                    throw(ArgumentError("Subvariable '$(func_name).$(subvar_name)' must be defined at the toplevel of the function"))
+                end
             end
 
             body_expr
@@ -203,7 +199,7 @@ function _variable(ctx_module, expr, side_effects)
         subvariables_expr = Expr(:vect, subvariables...)
         new_function = quote
             function $func_name($(new_args...))
-                $new_body
+                $body
             end
 
             if $side_effects
@@ -216,6 +212,19 @@ function _variable(ctx_module, expr, side_effects)
     end
 
     throw(ArgumentError("Could not construct variable from expression: $(prettify(expr))"))
+end
+
+# Register a subvariable value in the current execution context. This is
+# emitted by the @Variable macro when it encounters inner subvariable
+# declarations, and should not be called directly.
+macro add_subvariable(name, value)
+    esc(quote
+        let _val = $value
+            _key = "$(Context.Meta.name[]).$($name)"
+            Context.Meta.subvariables[][_key] = _val
+            _val
+        end
+    end)
 end
 
 """

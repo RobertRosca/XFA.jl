@@ -444,7 +444,7 @@ end
     @test_throws "defined at the toplevel" Context._variable(@__MODULE__, quote
                                                                  function foo()
                                                                      if true
-                                                                         data = @Variable(42)
+                                                                         @add_subvariable("data", 42)
                                                                      end
                                                                  end
                                                              end,
@@ -453,9 +453,9 @@ end
     # Test creating a subvariable
     ctx = Context.load_from_string(raw"""
     @Variable function foo(data -> karabo"device.property")
-        bar = @Variable(mean(data))
+        @add_subvariable("bar", mean(data))
 
-        return data, bar
+        return data
     end
 
     @Variable function quux(data -> foo.bar)
@@ -843,6 +843,34 @@ end
         @test isready(ctx.stream_output)
         @test take!(ctx.stream_output) == VariableData(0, "foo.bar", 2)
 
+        # Test subvariable execution
+        ctx = Context.load_from_string(raw"""
+        @Input function input(::Context.MockInput, output)
+            put!(output, (0, Dict("motor1" => Dict("pos" => 10))))
+        end
+        x = Context.MockInput()
+
+        @Variable function foo(data -> karabo"motor1.pos")
+            @add_subvariable("half", data / 2)
+            return data
+        end
+
+        @Variable function bar(data -> foo.half)
+            return data + 1
+        end
+        """)
+        Context.run(ctx) do
+            @test timedwait(() -> !isopen(ctx.stream_output), 5) == :ok
+        end
+
+        results = VariableData[]
+        while isready(ctx.stream_output)
+            push!(results, take!(ctx.stream_output))
+        end
+        @test length(results) == 2
+        @test results[1] == VariableData(0, "foo", 10, Dict{String, Any}("foo.half" => 5.0))
+        @test results[2] == VariableData(0, "bar", 6.0)
+
         # Test input groups
         ctx = Context.load_from_string(raw"""
         @Group struct Foo
@@ -973,7 +1001,7 @@ end
     @Variable function foo() 42 end
 
     @Variable function bar(data -> xgm)
-        max_data = @Variable(max(data))
+        @add_subvariable("max_data", max(data))
         mean(data)
     end
     """)
