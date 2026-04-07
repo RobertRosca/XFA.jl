@@ -15,6 +15,7 @@ include("plotting.jl")
 using LibSSH: LibSSH as ssh
 using HTTP: HTTP, WebSockets
 using XfaEngine: EngineState, getavailableport
+using Dates: Dates, unix2datetime, @dateformat_str
 include("states.jl")
 include("imgui_helpers.jl")
 
@@ -92,6 +93,9 @@ function draw_main_menubar()
             @c MenuItem("Stack tool", &state[].show_stacktool)
             @c MenuItem("Debug log", &state[].show_debug_log)
             @c MenuItem("State inspector", &state[].show_state_inspector)
+            if @c MenuItem("Engine logs", &state[].show_engine_logs)
+                state[].select_engine_logs = true
+            end
 
             ig.EndMenu()
         end
@@ -614,6 +618,37 @@ function draw_plots()
     end
 end
 
+function draw_engine_logs()
+    client = state[].client
+
+    ig.Dummy(0, 5)
+    if ig.Button("Clear all logs")
+        empty!(client.engine_logs)
+    end
+
+    ig.Dummy(0, 5)
+    ig.Separator()
+
+    for (i, log) in enumerate(client.engine_logs)
+        ig.PushID(i)
+
+        timestamp = Dates.format(unix2datetime(log.timestamp), client.log_dateformat)
+        ig.Text(timestamp)
+        ig.SameLine(ig.CalcTextSize("0000-00-00 00:00:00  ").x)
+
+        if !isnothing(log.extra_details)
+            if ig.TreeNode(log.message)
+                ig.TextUnformatted(log.extra_details)
+                ig.TreePop()
+            end
+        else
+            ig.BulletText(log.message)
+        end
+
+        ig.PopID()
+    end
+end
+
 ## Main GUI function
 
 default(value, default="") = something(value, default)
@@ -840,6 +875,18 @@ function draw_gui()
         @Disabled client.status != RemoteStatus_Connected || isempty(client.context_path) begin
             if ig.BeginTabItem("Analysis pipeline")
                 draw_dag()
+                ig.EndTabItem()
+            end
+        end
+
+        if state[].show_engine_logs
+            engine_log_flags = ig.ImGuiTabItemFlags_None
+            if state[].select_engine_logs
+                engine_log_flags |= ig.ImGuiTabItemFlags_SetSelected
+                state[].select_engine_logs = false
+            end
+            if @c ig.BeginTabItem("Engine logs", &state[].show_engine_logs, engine_log_flags)
+                draw_engine_logs()
                 ig.EndTabItem()
             end
         end

@@ -189,6 +189,14 @@ struct PendingRequest
     sent_at::Float64
 end
 
+struct EngineLog
+    timestamp::Float64
+    message::String
+    extra_details::Maybe{String}
+end
+
+EngineLog(message::String, extra_details::Maybe{String}=nothing) = EngineLog(time(), message, extra_details)
+
 @kwdef mutable struct ClientState
     client_id::String = ""
     worker_info::Dict = Dict()
@@ -241,6 +249,10 @@ end
     variable_data::Dict{String, VariableStore} = Dict()
     plot_counter::Int = 0
     plots::Vector{Union{Plot, CorrelationPlot}} = Union{Plot, CorrelationPlot}[]
+
+    # Engine log messages
+    engine_logs::Vector{EngineLog} = EngineLog[]
+    log_dateformat::Dates.DateFormat = dateformat"yyyy-mm-dd HH:MM:SS"
 
     # Message tracking
     pending_requests::Dict{Int, PendingRequest} = Dict()
@@ -314,6 +326,8 @@ end
     show_stacktool::Bool = false
     show_debug_log::Bool = false
     show_state_inspector::Bool = false
+    show_engine_logs::Bool = false
+    select_engine_logs::Bool = false
 
     # Connections to remote things
     address::String = "wrigleyj@exflonc202.desy.de"

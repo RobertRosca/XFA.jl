@@ -1,6 +1,12 @@
 const BASTION = "bastion.desy.de"
 const GATEWAY = "exflgateway.desy.de"
 
+function log_engine_error(state::GuiState, message::String, extra_details::Maybe{String}=nothing)
+    push!(state.client.engine_logs, EngineLog(message, extra_details))
+    state.show_engine_logs = true
+    state.select_engine_logs = true
+end
+
 function send(client::ClientState, msg::AbstractMessage)
     id = Protocol.client_send(client.websocket, msg)
     client.pending_requests[id] = PendingRequest(typeof(msg), time())
@@ -462,6 +468,7 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
     elseif msg isa Devices
         if msg.device_names isa Exception
             @error "Error from server with DEVICES" exception=msg
+            log_engine_error(state, "Failed to get devices", sprint(showerror, msg.device_names))
             client.webproxy_status = RequestStatus_Error
         else
             client.karabo_devices = msg.device_names
@@ -507,6 +514,7 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
             filter!(kv -> haskey(client.context.context_state, kv.first), client.variable_data)
         else
             @error "Context failed to load"
+            log_engine_error(state, "Context failed to load", sprint(showerror, msg.info))
         end
 
         client.context.pipeline_status = msg.is_running ? PipelineStatus_Started : PipelineStatus_Stopped
@@ -553,6 +561,7 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
     elseif msg isa Ack
         if !isnothing(msg.error)
             @error "Server reported an error" exception=msg.error
+            log_engine_error(state, "Server reported an error", sprint(showerror, msg.error))
         end
 
         if !isnothing(replied_to) && replied_to.msg_type == Start
