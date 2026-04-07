@@ -107,11 +107,12 @@ function _parse_function_args(args; is_input=false)
                             # subvariable and we convert it to a string so it's
                             # not evaluated.
                             value = :(Context.SubvariableDependency($("$head"), $("$tail")))
-                        elseif !(value isa AbstractDependency || @capture(value, @karabo_str _))
-                            # Otherwise, we convert all non-Karabo
-                            # dependencies (i.e. variable and maybe future
-                            # parameter dependencies) into Dependency's.
+                        elseif value isa AbstractDependency || @capture(value, @karabo_str _)
+                            # Keep as-is
+                        elseif value isa Symbol
                             value = :(Context.Dependency($("$value")))
+                        else
+                            throw(ArgumentError("Unrecognized dependency expression: $(value)"))
                         end
                         push!(dependencies, :(($("$arg_name"), $value)))
 
@@ -141,18 +142,91 @@ function _parse_function_args(args; is_input=false)
     return dependencies, new_args
 end
 
+# Helper functions for detecting variable references. A reference can be a
+# module-qualified name (MyLib.func), a bare symbol (func), or a call on
+# either of those with dependency overrides (MyLib.func(data -> ...)).
+_is_qualified_name(expr) = expr isa Expr && expr.head == :.
+_is_ref_name(expr) = expr isa Symbol || _is_qualified_name(expr)
+_is_variable_ref(expr) = _is_ref_name(expr) || (expr isa Expr && expr.head == :call && _is_ref_name(expr.args[1]))
+
+function _ref_basename(expr)
+    if expr isa Expr && expr.head == :call
+        return _ref_basename(expr.args[1])
+    elseif _is_qualified_name(expr)
+        return expr.args[2].value
+    elseif expr isa Symbol
+        return expr
+    end
+end
+
+function _split_ref(expr)
+    if expr isa Expr && expr.head == :call
+        return expr.args[1], expr.args[2:end]
+    else
+        return expr, []
+    end
+end
+
+# Generates code for a variable that references an existing variable from
+# another module. Creates a wrapper function and registers trait methods
+# that delegate to the original, with optional dependency overrides.
+function _variable_reference(new_name, ref_expr, side_effects)
+    orig_func_expr, override_args = _split_ref(ref_expr)
+
+    # Build dependency registration code
+    if !isempty(override_args)
+        overrides, _ = _parse_function_args(override_args)
+        overrides_expr = Expr(:vect, overrides...)
+        deps_code = quote
+            let orig_deps = Context.variable_dependencies($orig_func_expr),
+                overrides = Dict{String, Any}($overrides_expr)
+                Context.variable_dependencies(::typeof($new_name)) = [(name, get(overrides, name, dep)) for (name, dep) in orig_deps]
+            end
+        end
+    else
+        deps_code = :(Context.variable_dependencies(::typeof($new_name)) = Context.variable_dependencies($orig_func_expr))
+    end
+
+    # Build subvariable registration code, remapping names if renamed.
+    # When names match the replace is a no-op.
+    orig_name_str = string(_ref_basename(ref_expr))
+    new_name_str = string(new_name)
+    subvars_code = quote
+        Context.variable_subvariables(::typeof($new_name)) = [replace(s, $orig_name_str => $new_name_str, count=1)
+                                                              for s in Context.variable_subvariables($orig_func_expr)]
+    end
+
+    return esc(quote
+        function $new_name(args...)
+            $orig_func_expr(args...)
+        end
+
+        if $side_effects
+            Context.variable_origin(::typeof($new_name)) = $orig_func_expr
+            $deps_code
+            $subvars_code
+        end
+    end)
+end
+
 function _variable(ctx_module, expr, side_effects)
     if !(expr isa Expr)
         throw(ArgumentError("Must pass an Expr to @Variable"))
     end
 
-    # Handle declarations of the form `@Variable name -> karabo"..."`
+    # Handle the `->` shorthand form. The right-hand side can be:
+    # - A Karabo dependency: @Variable cam -> karabo"camera.pixels"
+    # - A variable reference (qualified or bare symbol), optionally with
+    #   dependency overrides:
+    #     @Variable my_norm -> MyLib.normalize
+    #     @Variable my_norm -> normalize
+    #     @Variable my_norm -> MyLib.normalize(data -> karabo"other.source")
+    #   Bare symbols are only allowed here (not without ->), because without
+    #   a rename the new wrapper function would conflict with the imported name.
     if @capture(expr, name_ -> value_)
         # Strip quote nodes etc
         value = MacroTools.unblock(value)
 
-        # For this shorthand-form we only allow proper dependencies, not
-        # arbitrary expressions.
         if value isa KaraboDependency || (value isa Expr && @capture(value, @karabo_str _))
             function_expr = quote
                 function $name(data -> $value)
@@ -162,6 +236,8 @@ function _variable(ctx_module, expr, side_effects)
 
             # Recurse with the generated function
             return _variable(ctx_module, function_expr, side_effects)
+        elseif _is_variable_ref(value)
+            return _variable_reference(name, value, side_effects)
         else
             throw(ArgumentError("Unrecognized dependency: $(value)"))
         end
@@ -209,6 +285,15 @@ function _variable(ctx_module, expr, side_effects)
         end
 
         return esc(new_function)
+
+    elseif _is_qualified_name(expr) || (expr isa Expr && expr.head == :call && _is_qualified_name(expr.args[1]))
+        # Handle module-qualified references without rename:
+        #   @Variable MyLib.func
+        #   @Variable MyLib.func(data -> karabo"other.source")
+        # Requires a qualified name (not a bare symbol) to avoid conflicting
+        # with the imported binding.
+        new_name = _ref_basename(expr)
+        return _variable_reference(new_name, expr, side_effects)
     end
 
     throw(ArgumentError("Could not construct variable from expression: $(prettify(expr))"))

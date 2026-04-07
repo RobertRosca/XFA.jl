@@ -18,6 +18,8 @@ using XfaEngine.Context: @Variable, @karabo_str, VariableData, Dependency, Karab
 using XfaEngine.KaraboBridge: KaraboBridgeClient, KaraboBridgeServer, ThreadsafeSocket
 
 
+keyset(dict) = Set(keys(dict))
+
 function test_connect(port=1331)
     client = Client()
 
@@ -374,6 +376,20 @@ end
     @test KaraboDependency(string(karabo"SA2//foo:output[bar]")) == karabo"SA2//foo:output[bar]"
 end
 
+# Helper module that defines variables for reference tests, defined in
+# Main so that load_from_string's context modules can access it.
+@eval Main module VariableLibrary
+    using XfaEngine.Context
+    @Variable function normalize(data -> karabo"camera.pixels")
+        return data ./ maximum(data)
+    end
+
+    @Variable function with_subvar(data -> karabo"device.property")
+        @add_subvariable("half", data / 2)
+        return data
+    end
+end
+
 @testset "@Variable" begin
     # Smoke test for basic functionality
     ctx = Context.load_from_string("""
@@ -439,6 +455,9 @@ end
     @test_throws ArgumentError Context._variable(@__MODULE__, :(foo -> 42), false)
     @test_throws ArgumentError Context._variable(@__MODULE__, :(foo -> "foo.bar"), false)
 
+    # Using an unrecognized macro as a dependency should fail
+    @test_throws ArgumentError Context._variable(@__MODULE__, :(function foo(data -> bar"baz") data end), false)
+
     # We should not be able to create a subvariable that isn't defined at the
     # top level of a function.
     @test_throws "defined at the toplevel" Context._variable(@__MODULE__, quote
@@ -475,6 +494,66 @@ end
     write(io, ctx_code)
     close(io)
     @test Context.load_from_file(path).dag == ctx_from_str.dag
+
+    @testset "@Variable references" begin
+        # Test bare reference: @Variable VariableLibrary.normalize
+        ctx = Context.load_from_string("""
+        using Main: VariableLibrary
+        @Variable VariableLibrary.normalize
+        """)
+        @test keyset(ctx.functions) == Set(["normalize"])
+        @test ctx.dag["normalize"] == OD("data" => karabo"camera.pixels")
+
+        # Test renamed reference: @Variable my_norm -> VariableLibrary.normalize
+        ctx = Context.load_from_string("""
+        using Main: VariableLibrary
+        using .VariableLibrary: normalize
+        @Variable my_norm -> normalize
+        """)
+        @test keyset(ctx.functions) == Set(["my_norm"])
+        @test ctx.dag["my_norm"] == OD("data" => karabo"camera.pixels")
+
+        # Test reference with dependency override
+        ctx = Context.load_from_string("""
+        using Main: VariableLibrary
+        @Variable VariableLibrary.normalize(data -> karabo"other_camera.data")
+        """)
+        @test ctx.dag["normalize"] == OD("data" => karabo"other_camera.data")
+
+        # Test renamed reference with dependency override
+        ctx = Context.load_from_string("""
+        using Main: VariableLibrary
+        @Variable my_norm -> VariableLibrary.normalize(data -> karabo"other_camera.data")
+        """)
+        @test keyset(ctx.functions) == Set(["my_norm"])
+        @test ctx.dag["my_norm"] == OD("data" => karabo"other_camera.data")
+
+        # Test that the wrapper function delegates to the original
+        invokelatest() do
+            @test ctx.functions["my_norm"]([2, 4, 6]) == Main.VariableLibrary.normalize([2, 4, 6])
+        end
+
+        # Test that variable_origin points to the original
+        invokelatest() do
+            my_norm_func = ctx.functions["my_norm"]
+            @test Context.variable_origin(my_norm_func) === Main.VariableLibrary.normalize
+        end
+
+        # Test subvariable remapping on rename
+        ctx = Context.load_from_string("""
+        using Main: VariableLibrary
+        @Variable renamed -> VariableLibrary.with_subvar
+        """)
+        @test ctx.subvariables["renamed"] == ["renamed.half"]
+
+        # Test that the original variable is excluded from the context when referenced
+        ctx = Context.load_from_string("""
+        using Main: VariableLibrary
+        @Variable my_norm -> VariableLibrary.normalize
+        @Variable foo -> karabo"foo.bar"
+        """)
+        @test Set(keys(ctx.functions)) == Set(["my_norm", "foo"])
+    end
 end
 
 @testset "Parameter" begin

@@ -19,6 +19,10 @@ function variable_dependencies end
 function input_dependencies end
 function group_fields end
 variable_subvariables(_) = String[]
+# For variable references (@Variable name -> MyLib.func), returns the
+# original function. Used to exclude origin functions from the context
+# when they are already represented by a reference wrapper.
+variable_origin(f) = f
 
 struct Neighbour
     name::String
@@ -759,6 +763,10 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr})
         end
     end
 
+    # Collect origin functions that are already represented by context
+    # variable references, so we don't add them again as separate variables.
+    ctx_origins = Set(variable_origin(f) for f in keys(ctx_variables) if variable_origin(f) !== f)
+
     # Discover all registered variables, inputs, and group types from trait
     # methods. This includes builtins and variables from included modules.
     all_variables = copy(ctx_variables)
@@ -766,7 +774,9 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr})
         F = m.sig.parameters[2]
         isdefined(F, :instance) || continue
         func = F.instance
-        haskey(all_variables, func) || (all_variables[func] = variable_dependencies(func))
+        if !haskey(all_variables, func) && func ∉ ctx_origins
+            all_variables[func] = variable_dependencies(func)
+        end
     end
 
     for m in methods(group_fields)
