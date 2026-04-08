@@ -1,37 +1,35 @@
 import Base.ScopedValues: ScopedValue, @with
 
-import CImGui as ig
-import CImGui: ImVec2, ImVec4
-import CImGui.CSyntax: @c
-import ImPlot
-import GLFW
+using CImGui: CImGui as ig, ImVec2, ImVec4, IM_COL32
+using CImGui.CSyntax: @c
+using ImPlot: ImPlot
+using GLFW: GLFW
 using ModernGL
 
 include("imnodes.jl")
-include("imgui_helpers.jl")
 
 using NaNStatistics: nanmean, nanmaximum, nanminimum
 using DimensionalData: DimensionalData as DD, DimVector, DimMatrix, DimArray, At, lookup
 include("plotting.jl")
 
-import LibSSH as ssh
-import HTTP: WebSockets
-import XfaEngine: EngineState, getavailableport
+using LibSSH: LibSSH as ssh
+using HTTP: HTTP, WebSockets
+using XfaEngine: EngineState, getavailableport
+using Dates: Dates, unix2datetime, @dateformat_str
 include("states.jl")
+include("imgui_helpers.jl")
 
 using Printf: @sprintf
-import TOML
-import Sockets
-import CRC32c: crc32c
+using TOML: TOML
+using Sockets: Sockets
+using CRC32c: crc32c
 using Serialization
-import HTTP
-import XfaEngine
-import XfaEngine.Context: KaraboDependency, Dependency, Parameter
 using XfaEngine.Protocol
-import XfaEngine.Protocol: send
-using .ImGuiHelpers
+using XfaEngine: XfaEngine, Protocol
+using XfaEngine.Context: KaraboDependency, Dependency, Parameter, KaraboDevice
 include("state_inspector.jl")
 include("client.jl")
+include("context_edit.jl")
 
 import Revise
 
@@ -95,6 +93,9 @@ function draw_main_menubar()
             @c MenuItem("Stack tool", &state[].show_stacktool)
             @c MenuItem("Debug log", &state[].show_debug_log)
             @c MenuItem("State inspector", &state[].show_state_inspector)
+            if @c MenuItem("Engine logs", &state[].show_engine_logs)
+                state[].select_engine_logs = true
+            end
 
             ig.EndMenu()
         end
@@ -103,13 +104,13 @@ function draw_main_menubar()
     end
 end
 
-function draw_parameter(name, param::Parameter{Float64})
+function draw_parameter_widget(name, param::Parameter{Float64})
     ret = @c ig.InputDouble(name, &param.value, 0.0, 0.0, "%.3f0", ig.ImGuiInputTextFlags_EnterReturnsTrue)
 
     return ret, param.value
 end
 
-function draw_parameter(name, param::Parameter{Int})
+function draw_parameter_widget(name, param::Parameter{Int})
     int32_value = Int32(param.value)
     @c ig.InputInt(name, &int32_value)
     param.value = Int(int32_value)
@@ -117,17 +118,24 @@ function draw_parameter(name, param::Parameter{Int})
     return false, nothing
 end
 
-function draw_parameter(name, param::Parameter{String})
+function draw_parameter_widget(name, param::Parameter{String})
     SafeInputText(name; current_text=param.value)
 end
 
-function draw_parameter(name, param::Parameter{Vector{String}})
+function draw_parameter_widget(name, param::Parameter{Vector{String}})
     ig.Text("Vector{String}")
 
     return false, nothing
 end
 
-function draw_parameter(name, param::Parameter{Bool})
+function draw_parameter_widget(name, param::Parameter{KaraboDevice})
+    device = param.value
+    ig.Text("$(device.name) ($(device.topic))")
+
+    return false, nothing
+end
+
+function draw_parameter_widget(name, param::Parameter{Bool})
     @c ig.Checkbox(name, &param.value)
 
     return false, nothing
@@ -156,6 +164,201 @@ function clear_variables()
     for plot in client.plots
         clear_plot(plot)
     end
+end
+
+function draw_device_tree(device_tree)
+    if isempty(device_tree)
+        ig.TextDisabled("No devices loaded")
+        return
+    end
+
+    n_devices = sum(length(devs) for (_, devs) in device_tree)
+    n_topics = length(device_tree)
+    if ig.TreeNode("Devices ($n_devices across $n_topics topics)##device-tree")
+        for (topic, devices) in device_tree
+            if ig.TreeNode("$topic ($(length(devices)))##topic-$topic")
+                for (name, info_pairs) in devices
+                    class_id_pair = findfirst(p -> p.first == "classId", info_pairs)
+                    class_id = isnothing(class_id_pair) ? "" : info_pairs[class_id_pair].second
+                    if ig.TreeNode("$name##dev-$name")
+                        for (key, value) in info_pairs
+                            ig.Text("$key: $value")
+                        end
+                        ig.TreePop()
+                    else
+                        ig.SameLine()
+                        ig.TextDisabled(class_id)
+                    end
+                end
+                ig.TreePop()
+            end
+        end
+        ig.TreePop()
+    end
+end
+
+function get_source_properties(client, device_name)
+    idx = findfirst(s -> s.name == device_name, client.source_list)
+    isnothing(idx) && return DeviceProperties()
+
+    topic = client.source_list[idx].topic
+    key = (topic, device_name)
+    return get!(client.source_properties, key) do
+        id = send(client, GetDeviceSchema(topic, device_name))
+        client.device_schema_requests[key] = id
+        DeviceProperties()
+    end
+end
+
+# Draw a single parameter with appropriate width, and send a change message
+# if modified.
+function draw_parameter(name, param; min_node_width=150)
+    ig.SetNextItemWidth(round(Int, min_node_width * 1.5))
+    modified, new_value = draw_parameter_widget(name, param)
+    if modified
+        change_parameter(Parameter(param.name, new_value))
+    end
+end
+
+# Draw the parameters section of a variable node. Can be called from custom
+# draw_variable_content() methods to include the default parameter UI.
+function draw_parameters(var_data)
+    if haskey(var_data, "parameters")
+        ig.Text("Parameters:")
+        for (param_name, param) in var_data["parameters"]
+            draw_parameter(param_name, param)
+        end
+    end
+end
+
+# Specialize on Val{Symbol("ModulePath.function_name")} to draw custom content
+# inside a variable node. Called after the titlebar and before parameters.
+# Return a gui state object to persist custom state across frames, or nothing.
+draw_variable_content(::Val, name, var_data, gui_state) = nothing
+
+function draw_variable_content(::Val{Symbol("XfaEngine.Context.KaraboBridge")}, name, var_data, gui_state)
+    var_data["draw_parameters"] = false
+    params = var_data["parameters"]
+
+    ig.Text("Parameters:")
+    draw_parameter("trainmatcher", params["trainmatcher"])
+    draw_parameter("manual_configuration", params["manual_configuration"])
+
+    if params["manual_configuration"].value
+        draw_parameter("hostname", params["hostname"])
+        draw_parameter("port", params["port"])
+    end
+
+    return nothing
+end
+
+# Draws a variable node. The node shell (titlebar, dependencies, outputs) is
+# always the same, but draw_variable_content() is called inside to allow
+# custom rendering for specific variables.
+function draw_variable(name, var_data)
+    client = state[].client
+    min_node_width = 150
+    variable_store = get(client.variable_data, name, nothing)
+
+    ImNodes.BeginNode(var_data["id"])
+
+    # Draw titlebar
+    ImNodes.BeginNodeTitleBar()
+    edited, new_name = ElidedText("var-name-$(name)", name; editable=true)
+    if edited
+        @guiasync rename_variable(state[], name, new_name)
+    end
+    ImNodes.EndNodeTitleBar()
+
+    # Draw custom content
+    origin = var_data["origin"]
+    gui_state = get(client.variable_gui_states, name, nothing)
+    new_gui_state = draw_variable_content(Val(Symbol(origin)), name, var_data, gui_state)
+    if !isnothing(new_gui_state) && !haskey(client.variable_gui_states, name)
+        client.variable_gui_states[name] = new_gui_state
+    end
+
+    if var_data["draw_parameters"]
+        draw_parameters(var_data)
+    end
+
+    ig.Dummy(min_node_width, 20)
+
+    # Draw dependencies
+    deps = var_data["dependencies"]
+    for (dep_id, dep_pair) in deps
+        arg_name, dep = dep_pair
+        # Don't draw pins for parameters
+        if dep isa Parameter
+            continue
+        end
+
+        pin_shape = dep isa KaraboDependency ? ImNodes.ImNodesPinShape_TriangleFilled : ImNodes.ImNodesPinShape_CircleFilled
+
+        ImNodes.BeginInputAttribute(dep_id, pin_shape)
+        if dep isa KaraboDependency
+            ig.TextDisabled("Karabo")
+            ig.SameLine()
+            dep_state = get!(client.karabo_dep_states, dep_id, KaraboDepTextState())
+            device_props = if isnothing(dep_state.device)
+                DeviceProperties()
+            else
+                get_source_properties(client, dep_state.device)
+            end
+            disable_dep = client.context.pipeline_status ∉ (PipelineStatus_Stopped, PipelineStatus_Started)
+            @Disabled disable_dep begin
+                edited, new_text = KaraboDepText("dep-$(dep_id)", string(dep), dep_state,
+                                                client.source_list, device_props)
+                if edited
+                    @guiasync rename_karabo_dep(state[], name, arg_name, KaraboDependency(new_text))
+                end
+            end
+        else
+            ig.Text(arg_name)
+        end
+        ImNodes.EndInputAttribute()
+    end
+
+    ig.Dummy(min_node_width, 10)
+
+    ig.TextDisabled("Outputs")
+    if !isnothing(variable_store)
+        ig.SameLine()
+        ig.TextDisabled(@sprintf "%.2f Hz" variable_store.update_rate)
+    end
+    draw_list = ig.GetWindowDrawList()
+    start_pos = ig.GetCursorScreenPos()
+    gray = ig.IM_COL32(100, 100, 100, 255)
+    ig.AddLine(draw_list, start_pos, (start_pos.x + min_node_width / 2f0, start_pos.y), gray, 2)
+    ig.Dummy(min_node_width, 2)
+
+    # Draw outputs
+    for (output_id, output) in var_data["outputs"]
+        label = string(output)
+        output_name = isempty(label) ? name : "$(name).$(label)"
+        ImNodes.BeginOutputAttribute(output_id, ImNodes.ImNodesPinShape_CircleFilled)
+
+        ig.Indent(min_node_width - ig.CalcTextSize(label).x)
+        typestr = get_variable_typeinfo(output_name)
+        if !isempty(typestr)
+            label = isempty(label) ? typestr : "$(label) - $(typestr)"
+        end
+
+        if !isempty(label)
+            if haskey(client.variable_data, output_name)
+                if ig.Button("$(label)###plot_button")
+                    push!(client.plots, Plot(output_name, client.plot_counter))
+                    client.plot_counter += 1
+                end
+            else
+                ig.Text(label)
+            end
+        end
+
+        ImNodes.EndOutputAttribute()
+    end
+
+    ImNodes.EndNode()
 end
 
 function draw_dag()
@@ -207,6 +410,17 @@ function draw_dag()
         Spinner()
     end
 
+    ig.SameLine()
+    ig.SetCursorPosX(ig.GetCursorPos().x + ig.GetContentRegionAvail().x - 100)
+    if ig.Button("Add variable")
+        ig.OpenPopup("add_variable_popup")
+    end
+    if ig.BeginPopup("add_variable_popup")
+        if ig.Selectable("Karabo source")
+        end
+        ig.EndPopup()
+    end
+
     ig.Dummy(0, 10)
 
     ImNodes.BeginNodeEditor()
@@ -214,94 +428,11 @@ function draw_dag()
     for (name, var_data) in ctx_state
         ig.PushID(name)
 
-        min_node_width = 150
-        node_id = var_data["id"]
-        variable_store = get(client.variable_data, name, nothing)
-
-        # Draw titlebar
-        ImNodes.BeginNode(node_id)
-        ImNodes.BeginNodeTitleBar()
-        ig.Text(name)
-        ImNodes.EndNodeTitleBar()
-
-        # Draw parameters
-        if haskey(var_data, "parameters")
-            ig.Text("Parameters:")
-            for (param_name, param) in var_data["parameters"]
-                ig.SetNextItemWidth(round(Int, min_node_width * 1.5))
-                modified, new_value = draw_parameter(param_name, param)
-                if modified
-                    change_parameter(Parameter(param.name, new_value))
-                end
-            end
-        end
-
-        ig.Dummy(min_node_width, 20)
-
-        # Draw dependencies
-        deps = var_data["dependencies"]
-        for (dep_id, dep_pair) in deps
-            arg_name, dep = dep_pair
-            # Don't draw pins for parameters
-            if dep isa Parameter
-                continue
-            end
-
-            pin_shape = dep isa KaraboDependency ? ImNodes.ImNodesPinShape_TriangleFilled : ImNodes.ImNodesPinShape_CircleFilled
-
-            ImNodes.BeginInputAttribute(dep_id, pin_shape)
-            ig.Text(arg_name)
-            if dep isa KaraboDependency
-                ig.SameLine()
-                InfoMarker(string(dep), "Karabo")
-            end
-            ImNodes.EndInputAttribute()
-        end
-
-        ig.Dummy(min_node_width, 10)
-
-        ig.TextDisabled("Outputs")
-        if !isnothing(variable_store)
-            ig.SameLine()
-            ig.TextDisabled(@sprintf "%.2f Hz" variable_store.update_rate)
-        end
-        draw_list = ig.GetWindowDrawList()
-        start_pos = ig.GetCursorScreenPos()
-        gray = ig.IM_COL32(100, 100, 100, 255)
-        ig.AddLine(draw_list, start_pos, (start_pos.x + min_node_width / 2f0, start_pos.y), gray, 2)
-        ig.Dummy(min_node_width, 2)
-
-        # Draw outputs
-        for (output_id, output) in var_data["outputs"]
-            label = string(output)
-            output_name = isempty(label) ? name : "$(name).$(label)"
-            ImNodes.BeginOutputAttribute(output_id, ImNodes.ImNodesPinShape_CircleFilled)
-
-            ig.Indent(min_node_width - ig.CalcTextSize(label).x)
-            typestr = get_variable_typeinfo(output_name)
-            if !isempty(typestr)
-                label = isempty(label) ? typestr : "$(label) - $(typestr)"
-            end
-
-            if !isempty(label)
-                if haskey(client.variable_data, output_name)
-                    if ig.Button("$(label)###plot_button")
-                        push!(client.plots, Plot(output_name, client.plot_counter))
-                        client.plot_counter += 1
-                    end
-                else
-                    ig.Text(label)
-                end
-            end
-
-            ImNodes.EndOutputAttribute()
-        end
-
-        ImNodes.EndNode()
+        draw_variable(name, var_data)
 
         pos = context.node_positions[name]
         if pos != Point2d(-1, -1)
-            ImNodes.SetNodeGridSpacePos(node_id, (pos.x, pos.y))
+            ImNodes.SetNodeGridSpacePos(var_data["id"], (pos.x, pos.y))
             context.node_positions[name] = Point2d(-1, -1)
         end
 
@@ -539,9 +670,40 @@ function draw_plots()
     end
 end
 
+function draw_engine_logs()
+    client = state[].client
+
+    ig.Dummy(0, 5)
+    if ig.Button("Clear all logs")
+        empty!(client.engine_logs)
+    end
+
+    ig.Dummy(0, 5)
+    ig.Separator()
+
+    for (i, log) in enumerate(client.engine_logs)
+        ig.PushID(i)
+
+        timestamp = Dates.format(unix2datetime(log.timestamp), client.log_dateformat)
+        ig.Text(timestamp)
+        ig.SameLine(ig.CalcTextSize("0000-00-00 00:00:00  ").x)
+
+        if !isnothing(log.extra_details)
+            if ig.TreeNode(log.message)
+                ig.TextUnformatted(log.extra_details)
+                ig.TreePop()
+            end
+        else
+            ig.BulletText(log.message)
+        end
+
+        ig.PopID()
+    end
+end
+
 ## Main GUI function
 
-default(value, default="") = isnothing(value) ? default : value
+default(value, default="") = something(value, default)
 
 function draw_gui()
     # Dock the main window by default
@@ -563,7 +725,7 @@ function draw_gui()
         draw_main_menubar()
 
         if Threads.threadid() == 1
-            BorderedText("Warning: GUI is running on thread 1, this may cause performance issues")
+            BorderedText("Warning: GUI is running on thread 1, this may cause performance issues. Start Julia with e.g. `julia -t auto,2` instead.")
         end
 
         ig.BeginTabBar("main-tab-bar")
@@ -663,10 +825,17 @@ function draw_gui()
                 ig.Separator()
                 ig.Dummy(0, 2)
 
-                ig.Text("Debug mode")
-                ig.SameLine()
-                if ig.Checkbox("##debug-mode", client.debug_mode)
-                    set_debug_mode(state[])
+                @Disabled is_pending(client, client.debug_mode_request) begin
+                    ig.Text("Debug mode")
+                    ig.SameLine()
+                    if ig.Checkbox("##debug-mode", client.debug_mode)
+                        set_debug_mode(state[])
+                    end
+
+                    if is_pending(client, client.debug_mode_request)
+                        ig.SameLine()
+                        Spinner()
+                    end
                 end
 
                 @Disabled client.remoterepl_status == RemoteReplStatus_Changing begin
@@ -685,7 +854,6 @@ function draw_gui()
                                                          current_text=default(client.context_path))
                 if edited
                     client.context_path = new_context_path
-                    client.context_path_valid = true
                 end
 
                 if !client.context_path_valid
@@ -694,36 +862,64 @@ function draw_gui()
 
                 ig.Dummy(0, 10)
 
-                if ig.Button("Update trainmatchers")
-                    get_trainmatchers(client)
-                end
-
-                # Show trainmatchers as a table
-                if client.trainmatchers_request_status == RequestStatus_Waiting
-                    Spinner("Waiting for trainmatcher list")
-                else ig.BeginTable("##trainmatchers", 2, ig.ImGuiTableFlags_Borders | ig.ImGuiTableFlags_RowBg)
-                    ig.TableSetupColumn("Topic")
-                    ig.TableSetupColumn("Default trainmatcher")
-                    ig.TableHeadersRow()
-
-                    for topic in sort(collect(keys(client.trainmatchers)))
-                        matchers = client.trainmatchers[topic]
-                        ig.TableNextRow()
-                        ig.TableNextColumn()
-                        ig.Text(topic)
-                        ig.TableNextColumn()
-
-                        if length(matchers) == 1
-                            ig.Text(matchers[1])
-                        elseif length(matchers) > 1
-                            if !haskey(client.trainmatcher_selected_idx, topic)
-                                client.trainmatcher_selected_idx[topic] = Ref(Cint(0))
-                            end
-                            ig.Combo("##matcher-$topic", client.trainmatcher_selected_idx[topic], matchers)
-                        end
+                trainmatcher_request_pending = is_pending(client, client.trainmatcher_set_request)
+                @Disabled trainmatcher_request_pending begin
+                    if ig.Button("Update trainmatchers")
+                        get_trainmatchers(client)
+                    end
+                    if trainmatcher_request_pending
+                        ig.SameLine()
+                        Spinner()
                     end
 
-                    ig.EndTable()
+                    # Show trainmatchers as a table
+                    if client.trainmatchers_request_status == RequestStatus_Waiting
+                        Spinner("Waiting for trainmatcher list")
+                    else
+                        ig.BeginTable("##trainmatchers", 2, ig.ImGuiTableFlags_Borders | ig.ImGuiTableFlags_RowBg)
+                        ig.TableSetupColumn("Topic")
+                        ig.TableSetupColumn("Default trainmatcher")
+                        ig.TableHeadersRow()
+
+                        for topic in sort(collect(keys(client.trainmatchers)))
+                            matchers = client.trainmatchers[topic]
+                            names = [m[1] for m in matchers]
+                            ig.TableNextRow()
+                            ig.TableNextColumn()
+                            ig.Text(topic)
+                            ig.TableNextColumn()
+
+                            if !isempty(matchers)
+                                if !haskey(client.trainmatcher_selected_idx, topic)
+                                    client.trainmatcher_selected_idx[topic] = Ref(Cint(0))
+                                end
+
+                                if CopyableCombo("matcher-$topic", names, client.trainmatcher_selected_idx[topic])
+                                    idx = client.trainmatcher_selected_idx[topic][] + 1
+                                    set_topic_trainmatcher(client, topic, names[idx])
+                                end
+
+                                # Warn if the selected trainmatcher is not configurable
+                                sel_idx = client.trainmatcher_selected_idx[topic][] + 1
+                                if 1 <= sel_idx <= length(matchers) && !matchers[sel_idx][2]
+                                    ig.SameLine()
+                                    ig.TextColored(ImVec4(1.0, 0.6, 0.0, 1.0), "(not in webproxy whitelist)")
+                                end
+                            end
+                        end
+
+                        ig.EndTable()
+                    end
+                end
+
+                ig.Dummy(0, 10)
+
+                @Disabled is_pending(client, client.devices_request) begin
+                    if ig.Button("Get devices")
+                        get_devices(client)
+                    end
+
+                    draw_device_tree(client.device_tree)
                 end
             end
         end
@@ -731,6 +927,18 @@ function draw_gui()
         @Disabled client.status != RemoteStatus_Connected || isempty(client.context_path) begin
             if ig.BeginTabItem("Analysis pipeline")
                 draw_dag()
+                ig.EndTabItem()
+            end
+        end
+
+        if state[].show_engine_logs
+            engine_log_flags = ig.ImGuiTabItemFlags_None
+            if state[].select_engine_logs
+                engine_log_flags |= ig.ImGuiTabItemFlags_SetSelected
+                state[].select_engine_logs = false
+            end
+            if @c ig.BeginTabItem("Engine logs", &state[].show_engine_logs, engine_log_flags)
+                draw_engine_logs()
                 ig.EndTabItem()
             end
         end
@@ -781,6 +989,8 @@ function main(; test_engine=nothing)
     style.FrameBorderSize = 1
 
     # Load fonts
+    font_config = ig.ImFontConfig()
+    font_config.MergeMode = true
     font_atlas = unsafe_load(ig.GetIO().Fonts)
     font_dir = joinpath(@__DIR__, "fonts")
     fonts=[
@@ -791,6 +1001,7 @@ function main(; test_engine=nothing)
     ]
     for (font, font_size) in fonts
         ig.AddFontFromFileTTF(font_atlas, font, font_size)
+        ig.AddFontFromFileTTF(font_atlas, joinpath(font_dir, "fa-regular-400.otf"), 20, font_config)
     end
 
     # Setup ImPlot context
@@ -831,7 +1042,7 @@ function main(; test_engine=nothing)
 
         ImPlot.DestroyContext(implot_ctx)
         ImNodes.DestroyContext(imnodes_ctx)
-        empty!(ImGuiHelpers.safe_input_text_cache)
+        empty!(safe_input_text_cache)
         close(gui_state)
     end
     t = ig.render(imgui_ctx; on_exit, window_title="XFA", wait=false, spawn=true, engine=test_engine) do
@@ -863,3 +1074,6 @@ function main(; test_engine=nothing)
 
     return t, gui_state
 end
+
+precompile(main, ())
+precompile(draw_gui, ())

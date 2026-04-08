@@ -1,6 +1,6 @@
 module Context
 
-export @karabo_str, @Variable, @Input, @Group, Parameter, tryset
+export @karabo_str, @Variable, @Input, @Group, @add_subvariable, Parameter, tryset, KaraboDevice
 
 import Base.ScopedValues: @with
 
@@ -12,10 +12,17 @@ import OrderedCollections: OrderedDict
 import DimensionalData as DD
 import ..XfaEngine
 
-const registered_variables = Dict{Function, Vector{Any}}()
-const registered_subvariables = Dict{Function, Vector{String}}()
-const registered_inputs = Dict{Function, Any}()
-const registered_groups = Dict{DataType, Any}()
+# Trait functions for dispatch-based metadata registration.
+# Overloaded by @Variable, @Input, and @Group macros for each
+# function/type they define, enabling Revise compatibility.
+function variable_dependencies end
+function input_dependencies end
+function group_fields end
+variable_subvariables(_) = String[]
+# For variable references (@Variable name -> MyLib.func), returns the
+# original function. Used to exclude origin functions from the context
+# when they are already represented by a reference wrapper.
+variable_origin(f) = f
 
 struct Neighbour
     name::String
@@ -36,6 +43,7 @@ const proposal = ScopedValue{Int}()
 const name = ScopedValue{String}()
 
 const scratch = ScopedValue(Dict{String, Any}())
+const subvariables = ScopedValue(Dict{String, Any}())
 
 end
 
@@ -79,6 +87,8 @@ end
     forwarder::Function = Returns(nothing)
     output_forwarder_task::Union{Task, Nothing} = nothing
 
+    path::String = ""
+
     is_running::Threads.Atomic{Bool} = Threads.Atomic{Bool}(false)
     events_channel::Union{RemoteChannel, Nothing} = nothing
     watcher_task::Task = Task(Returns(nothing))
@@ -113,17 +123,42 @@ function external_dependencies(ctx::XfaContext; per_variable=false)
     return per_variable ? deps_per_variable : unique(all_deps)
 end
 
+# Returns the name used to match a dependency against a variable name.
+# For most dependencies this is the full string, but for SubvariableDependency
+# it's the parent name since subvariables share their parent's channel.
+dep_variable_name(x) = string(x)
+dep_variable_name(x::SubvariableDependency) = x.parent
+
 function find_downstream_neighbours(ctx::XfaContext, dep_name, T::DataType)
     neighbours = Set{String}()
     for (var_name, deps) in ctx.dag
         for (_, dep) in deps
-            if dep isa T && string(dep) == dep_name
+            if dep isa T && dep_variable_name(dep) == dep_name
                 push!(neighbours, var_name)
             end
         end
     end
 
     return neighbours
+end
+
+# Return the origin path for a variable function or group type, stripping the
+# anonymous context module prefix so that context-local definitions are just
+# their name (e.g. "foo") and imported ones keep their module path
+# (e.g. "MyLib.bar").
+function origin_path(x)
+    origin = x isa Function ? variable_origin(x) : x
+    mod = parentmodule(origin)
+    parts = String[]
+    while !startswith(string(nameof(mod)), "XfaContext")
+        pushfirst!(parts, string(nameof(mod)))
+        if mod === parentmodule(mod)
+            break
+        end
+        mod = parentmodule(mod)
+    end
+    push!(parts, string(nameof(origin)))
+    return join(parts, ".")
 end
 
 function to_dict(ctx::XfaContext)
@@ -134,11 +169,25 @@ function to_dict(ctx::XfaContext)
 
     groups = sort(collect(keys(ctx.groups)))
 
+    origins = Dict{String, String}()
+    for (name, func) in ctx.functions
+        origins[name] = origin_path(func)
+    end
+    for (group_type, _) in ctx.group_types
+        for (name, obj) in ctx.groups
+            if obj isa group_type
+                origins[name] = origin_path(group_type)
+            end
+        end
+    end
+
     return Dict("dag" => ctx.dag,
                 "subvariables" => ctx.subvariables,
                 "parameters" => ctx.parameters,
                 "inputs" => inputs,
-                "groups" => groups)
+                "groups" => groups,
+                "origins" => origins,
+                "path" => ctx.path)
 end
 
 """
@@ -220,7 +269,7 @@ function execute_variables(ctx::XfaContext, inputs::Dict)
         # Call the function
         if length(args) == length(ctx.dag[name])
             try
-                results[name] = ctx.functions[name](args...)
+                results[name] = @invokelatest ctx.functions[name](args...)
             catch ex
                 @error "Error executing $(name)!" exception=ex
             end
@@ -346,13 +395,13 @@ function stream_external_dependency(name, input_neighbour, downstream_neighbours
     end
 end
 
-function stream_variable(name, stream_output, upstream, downstream)
+function stream_variable(name, stream_output, upstream, downstream, deps)
     # Initialize the scratch space
     scratch = Dict{String, Any}()
 
-    matcher = Trainmatcher(keys(upstream))
+    matcher = Trainmatcher(k for (k, v) in upstream if v isa RemoteChannel)
     matched_trains = Dict{Int, Any}()
-    args = Vector{Any}(undef, length(upstream))
+    args = Vector{Any}(undef, length(deps))
     try
         while true
             while isempty(matched_trains)
@@ -367,33 +416,37 @@ function stream_variable(name, stream_output, upstream, downstream)
                 end
             end
 
-            tid, variable_args = only(matched_trains)
+            tid, matched_data = only(matched_trains)
             empty!(matched_trains)
-            for (i, (arg_name, arg)) in enumerate(upstream)
-                if arg isa RemoteChannel
-                    args[i] = pop!(variable_args, arg_name)
+
+            # Build args from deps, extracting subvariable values as needed
+            for (i, (arg_name, dep)) in enumerate(deps)
+                if dep isa GroupDependency
+                    args[i] = upstream[dep.name]
+                elseif dep isa SubvariableDependency
+                    args[i] = matched_data[dep.parent].subvariables[string(dep)]
                 else
-                    # e.g. a Group object
-                    args[i] = arg
+                    args[i] = matched_data[string(dep)].data
                 end
             end
 
             # Don't execute the variable if any inputs are `nothing`
             empty_result = VariableData(tid, name, nothing)
-            unwrapped_args = [arg isa VariableData ? arg.data : arg for arg in args]
-            if any(isnothing.(unwrapped_args))
+            if any(isnothing, args)
                 putall!(values(downstream), empty_result)
                 continue
             end
 
             # Execute the variable
             f = worker_state.dag_functions[name]
+            subvar_values = Dict{String, Any}()
             @debug "Executing variable '$(name)'..."
             @lock worker_state.task_locks[name] try
                 out = @with(Meta.tid => tid,
                             Meta.name => name,
                             Meta.scratch => scratch,
-                            f(unwrapped_args...))
+                            Meta.subvariables => subvar_values,
+                            f(args...))
             catch ex
                 @error "Execution of variable '$(name)' failed" exception=(ex, catch_backtrace())
                 putall!(values(downstream), empty_result)
@@ -401,7 +454,7 @@ function stream_variable(name, stream_output, upstream, downstream)
             end
 
             # Send output
-            out = VariableData(tid, name, out)
+            out = VariableData(tid, name, out, subvar_values)
             maybe_send_output(stream_output, out)
             putall!(values(downstream), out)
             @debug "Pushed output from '$(name)' to: $(keys(downstream))"
@@ -534,30 +587,41 @@ function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50)
     # Start the variables themselves
     execution_order = topological_sort(ctx)
     for name in execution_order
-        # Build up the argument list
+        # Build up the upstream channel list, deduplicating channels for
+        # SubvariableDependency's that share their parent's channel.
         args = OrderedDict{String, Any}()
         for dep in values(ctx.dag[name])
             dep_name = string(dep)
 
             if dep isa KaraboDependency
                 args[dep_name] = ctx.external_dependency_channels[dep_name][name]
+            elseif dep isa SubvariableDependency
+                if !haskey(args, dep.parent)
+                    args[dep.parent] = ctx.variable_channels[dep.parent][name]
+                end
             elseif dep isa Dependency
                 args[dep_name] = ctx.variable_channels[dep_name][name]
             elseif dep isa GroupDependency
-                args[dep_name] = ctx.groups[dep.name]
+                args[dep.name] = ctx.groups[dep.name]
             else
                 throw(XfaContextException("Unrecognized dependency type: $(typeof(dep))"))
             end
         end
 
-        # Find downstream variables
+        # Find downstream variables, including those that depend on our
+        # subvariables.
         downstream = Dict{String, RemoteChannel}()
         for neighbour in find_downstream_neighbours(ctx, name, Dependency)
             downstream[neighbour] = RemoteChannel()
         end
+        for neighbour in find_downstream_neighbours(ctx, name, SubvariableDependency)
+            if !haskey(downstream, neighbour)
+                downstream[neighbour] = RemoteChannel()
+            end
+        end
         ctx.variable_channels[name] = downstream
 
-        ctx.variable_tasks[name] = Threads.@spawn stream_variable(name, ctx.stream_output, args, downstream)
+        ctx.variable_tasks[name] = Threads.@spawn stream_variable(name, ctx.stream_output, args, downstream, ctx.dag[name])
         errormonitor(ctx.variable_tasks[name])
     end
 
@@ -648,18 +712,39 @@ function run(f::Function, ctx::XfaContext; timeout=10, kwargs...)
     end
 end
 
-function load_from_string(ctx_str::AbstractString)
-    # Clean up all the registered things from previous evaluations of the
-    # context file. This isn't strictly necessary but it makes debugging
-    # simpler.
-    for item_cache in (registered_variables, registered_subvariables, registered_inputs, registered_groups)
-        for key in keys(item_cache)
-            parent_modules = string.(fullname(parentmodule(key)))
-            if any(startswith.(parent_modules, "XfaContext"))
-                pop!(item_cache, key)
+function _is_context_method(m::Method)
+    # Check if the method's type parameter belongs to an XfaContext module.
+    # For variable/input traits: signature is Tuple{typeof(f), typeof(func)}
+    #   where parentmodule(func) is the context module
+    # For group traits: signature is Tuple{typeof(f), Type{T}}
+    #   where parentmodule(T) is the context module
+    length(m.sig.parameters) >= 2 || return false
+    T = m.sig.parameters[2]
+
+    owner = if T <: Type
+        T.parameters[1]  # extract T from Type{T}
+    elseif isdefined(T, :instance)
+        T.instance        # extract func from typeof(func)
+    else
+        return false      # not a concrete singleton (e.g. the default method)
+    end
+
+    mod_names = string.(fullname(parentmodule(owner)))
+    return any(startswith.(mod_names, "XfaContext"))
+end
+
+function _cleanup_context_methods()
+    for f in (variable_dependencies, variable_subvariables, input_dependencies, group_fields)
+        for m in methods(f)
+            if _is_context_method(m)
+                Base.delete_method(m)
             end
         end
     end
+end
+
+function load_from_string(ctx_str::AbstractString)
+    _cleanup_context_methods()
 
     ctx_module = Module(Symbol(:XfaContext, gensym()))
     init_expr = quote
@@ -690,34 +775,63 @@ end
 function load_from_module(ctx_module::Module, exprs::Vector{Expr})
     parameters = Dict{String, Parameter}()
 
-    # Find top-level parameters
+    # Discover all variables, inputs, group types, and parameters defined
+    # in ctx_module by scanning its names and checking for trait methods.
+    ctx_variables = Dict{Function, Vector{Any}}()
+    ctx_inputs = Dict{Function, Vector{Any}}()
+    group_types = Dict{DataType, Group}()
+
+    # Scan ctx_module for variables and parameters
     for name in names(ctx_module; all=true)
-        object = getproperty(ctx_module, name)
-        if object isa Parameter
-            object.name = string(name)
-            parameters[string(name)] = object
+        isdefined(ctx_module, name) || continue
+        obj = getfield(ctx_module, name)
+
+        if obj isa Parameter
+            obj.name = string(name)
+            parameters[string(name)] = obj
+        elseif obj isa Function && parentmodule(obj) === ctx_module &&
+               hasmethod(variable_dependencies, Tuple{typeof(obj)})
+            ctx_variables[obj] = variable_dependencies(obj)
         end
     end
 
-    # Load the group types
-    group_types = Dict{DataType, Group}()
-    for (group_struct, param_fields) in registered_groups
-        group_types[group_struct] = Group(group_struct, Function[])
+    # Collect origin functions that are already represented by context
+    # variable references, so we don't add them again as separate variables.
+    ctx_origins = Set(variable_origin(f) for f in keys(ctx_variables) if variable_origin(f) !== f)
 
-        for (func, deps) in registered_variables
-            if isempty(deps)
-                continue
-            end
+    # Discover all registered variables, inputs, and group types from trait
+    # methods. This includes builtins and variables from included modules.
+    all_variables = copy(ctx_variables)
+    for m in methods(variable_dependencies)
+        F = m.sig.parameters[2]
+        isdefined(F, :instance) || continue
+        func = F.instance
+        if !haskey(all_variables, func) && func ∉ ctx_origins
+            all_variables[func] = variable_dependencies(func)
+        end
+    end
 
-            first_arg_type = deps[1][2]
-            if first_arg_type isa GroupDependency && first_arg_type.type == group_struct
-                push!(group_types[group_struct].variables, func)
+    for m in methods(group_fields)
+        T = m.sig.parameters[2].parameters[1]
+        group_types[T] = Group(T, Function[])
+    end
+
+    for m in methods(input_dependencies)
+        F = m.sig.parameters[2]
+        func = F.instance
+        ctx_inputs[func] = input_dependencies(func)
+    end
+
+    # Associate variables with their group types
+    for (group_struct, group) in group_types
+        for (func, deps) in merge(all_variables, ctx_inputs)
+            if !isempty(deps) && deps[1][2] isa GroupDependency && deps[1][2].type == group_struct
+                push!(group.variables, func)
             end
         end
     end
 
     # Check if there are any parameters with the same name as a variable
-    ctx_variables = filter(pair -> parentmodule(pair.first) === ctx_module, registered_variables)
     ctx_variable_names = string.(nameof.(keys(ctx_variables)))
     common_var_param_names = intersect(ctx_variable_names,
                                        keys(parameters))
@@ -731,9 +845,6 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr})
     for func in keys(ctx_variables)
         functions[string(nameof(func))] = func
     end
-
-    # Find all the inputs defined in the context file itself
-    ctx_inputs = filter(pair -> parentmodule(pair.first) == ctx_module, registered_inputs)
 
     # Check for duplicate variable/input names
     ctx_variable_names = Set(nameof.(keys(ctx_variables)))
@@ -772,7 +883,7 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr})
         # If so, then add all their variables to the DAG
         for variable_func in group_types[group_type].variables
             # If it's an input, handle it later
-            if haskey(registered_inputs, variable_func)
+            if haskey(ctx_inputs, variable_func)
                 continue
             end
 
@@ -818,7 +929,7 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr})
         end
 
         # And all the inputs
-        for (input_func, deps) in registered_inputs
+        for (input_func, deps) in ctx_inputs
             input_name = string(nameof(input_func))
 
             if length(deps) == 1
@@ -848,12 +959,8 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr})
     topological_sort(dag)
 
     ctx_subvariables = Dict{String, Vector{String}}()
-    for (func, subvars) in registered_subvariables
-        if parentmodule(func) !== ctx_module
-            continue
-        end
-
-        ctx_subvariables[string(nameof(func))] = subvars
+    for func in keys(ctx_variables)
+        ctx_subvariables[string(nameof(func))] = variable_subvariables(func)
     end
 
     global worker_state = WorkerState(; dag_functions=functions, current_ctx_module=ctx_module, parameters)
@@ -871,7 +978,9 @@ function load_from_file(ctx_path::AbstractString)
         throw(ArgumentError("$(ctx_path) is not a file!"))
     end
 
-    return load_from_string(read(ctx_path, String))
+    ctx = load_from_string(read(ctx_path, String))
+    ctx.path = ctx_path
+    return ctx
 end
 
 function _get_group_objects(ctx_module, group_types)
@@ -891,7 +1000,7 @@ end
 function _get_deps(func, parameters)
     final_deps = OrderedDict()
 
-    for (arg_name, dep) in registered_variables[func]
+    for (arg_name, dep) in variable_dependencies(func)
         if !(dep isa AbstractDependency)
             throw(ArgumentError("Dependency of type '$(typeof(dep))' is not allowed"))
         end

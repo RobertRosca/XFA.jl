@@ -28,11 +28,37 @@ end
     PipelineStatus_Stopped
 end
 
+const SourceInfo = @NamedTuple{topic::String, name::String, ambiguous::Bool}
+
+struct PropertyList
+    names::Vector{String}
+    displayed_names::Vector{String}
+    descriptions::Vector{String}
+    value_types::Vector{String}
+end
+PropertyList() = PropertyList(String[], String[], String[], String[])
+
+struct DeviceProperties
+    slow::PropertyList
+    fast::Dict{String, PropertyList}
+end
+DeviceProperties() = DeviceProperties(PropertyList(), Dict{String, PropertyList}())
+
 @enum RemoteReplStatus begin
     RemoteReplStatus_Running
     RemoteReplStatus_Changing
     RemoteReplStatus_Stopped
 end
+
+mutable struct KaraboDepTextState
+    cursor_pos::Cint
+    device::Maybe{String}
+    # If set, the callback will replace the buffer contents with this text,
+    # move the cursor to the end, and then clear it.
+    wanted_text::Maybe{String}
+end
+
+KaraboDepTextState() = KaraboDepTextState(-1, nothing, nothing)
 
 mutable struct KbdintPromptState
     msg::String
@@ -128,6 +154,7 @@ end
 @kwdef mutable struct ContextState
     context_state::Dict{String, Any} = Dict()
     context_path::String = ""
+    source::String = ""
     node_positions::Dict{String, Point2d} = Dict()
     pipeline_status::PipelineStatus = PipelineStatus_Stopped
 
@@ -157,11 +184,25 @@ function Base.setproperty!(ctx::ContextState, sym::Symbol, x)
     @lock ctx setfield!(ctx, sym, x)
 end
 
+struct PendingRequest
+    msg_type::Type
+    sent_at::Float64
+end
+
+struct EngineLog
+    timestamp::Float64
+    message::String
+    extra_details::Maybe{String}
+end
+
+EngineLog(message::String, extra_details::Maybe{String}=nothing) = EngineLog(time(), message, extra_details)
+
 @kwdef mutable struct ClientState
     client_id::String = ""
     worker_info::Dict = Dict()
 
     debug_mode::Ref{Bool} = Ref(false)
+    debug_mode_request::Maybe{Int} = nothing
     syncing::Bool = false
     status::RemoteStatus = RemoteStatus_Unconnected
     websocket::Maybe{WebSockets.WebSocket} = nothing
@@ -176,27 +217,46 @@ end
     embedded_engine::Bool = false
     engine::Maybe{EngineState} = nothing
 
-    default_topic_idx::Ref{Cint} = Ref(Cint(0))
-    available_topics::Vector{String} = String[]
     webproxy_status::RequestStatus = RequestStatus_Idle
     remoterepl_mode::Ref{Bool} = Ref(false)
     remoterepl_status::RemoteReplStatus = RemoteReplStatus_Stopped
 
     # Context file and pipeline
     context_path::String = ""
-    context_path_valid::Bool = false
+    context_path_valid::Bool = true
     context::ContextState = ContextState()
 
     # Karabo status
-    trainmatchers::Dict{String, Vector{String}} = Dict()
+    trainmatchers::Dict{String, Vector{Tuple{String, Bool}}} = Dict()
     trainmatchers_request_status::RequestStatus = RequestStatus_Idle
     trainmatcher_selected_idx::Dict{String, Ref{Cint}} = Dict{String, Ref{Cint}}()
-    karabo_devices::Dict{String, Any} = Dict()
+    trainmatcher_set_request::Maybe{Int} = nothing
+    karabo_devices::Dict{String, Dict{String, Any}} = Dict()
+    devices_request::Maybe{Int} = nothing
+    # Pre-sorted for display: [(topic, [(device_name, sorted_info_pairs), ...]), ...]
+    device_tree::Vector{Tuple{String, Vector{Tuple{String, Vector{Pair{String, Any}}}}}} = []
+    # Flat list of sources for autocompletion. Sources include both devices and
+    # their pipeline outputs (e.g. "foo" and "foo:output"). The ambiguous flag
+    # indicates that the source name appears in more than one topic.
+    source_list::Vector{SourceInfo} = SourceInfo[]
+
+    # KaraboDepText widget state, keyed by dependency ID
+    karabo_dep_states::Dict{Int, KaraboDepTextState} = Dict{Int, KaraboDepTextState}()
+    source_properties::Dict{Tuple{String, String}, DeviceProperties} = Dict{Tuple{String, String}, DeviceProperties}()
+    device_schema_requests::Dict{Tuple{String, String}, Int} = Dict{Tuple{String, String}, Int}()
 
     # Variables and plots
     variable_data::Dict{String, VariableStore} = Dict()
+    variable_gui_states::Dict{String, Any} = Dict()
     plot_counter::Int = 0
     plots::Vector{Union{Plot, CorrelationPlot}} = Union{Plot, CorrelationPlot}[]
+
+    # Engine log messages
+    engine_logs::Vector{EngineLog} = EngineLog[]
+    log_dateformat::Dates.DateFormat = dateformat"yyyy-mm-dd HH:MM:SS"
+
+    # Message tracking
+    pending_requests::Dict{Int, PendingRequest} = Dict()
 
     lock::ReentrantLock = ReentrantLock()
 end
@@ -252,7 +312,7 @@ function Base.close(client::ClientState)
     end
 
     # Delete any cached values
-    empty!(ImGuiHelpers.safe_input_text_cache)
+    empty!(safe_input_text_cache)
     empty!(client.variable_data)
 end
 
@@ -267,6 +327,8 @@ end
     show_stacktool::Bool = false
     show_debug_log::Bool = false
     show_state_inspector::Bool = false
+    show_engine_logs::Bool = false
+    select_engine_logs::Bool = false
 
     # Connections to remote things
     address::String = "wrigleyj@exflonc202.desy.de"

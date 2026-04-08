@@ -29,37 +29,54 @@ end
 GroupDependency(type::DataType) = GroupDependency(nothing, type)
 
 struct KaraboDependency <: AbstractDependency
+    topic::Union{String, Nothing}
     source::String
     property::String
 end
+
+KaraboDependency(source::AbstractString, property::AbstractString) = KaraboDependency(nothing, source, property)
 
 struct FunctionArgument
     name::String
     type::Union{Nothing, Type}
 end
 
+const slow_data_re = r"^(\S+?)\.([\w|\.]+)$"
+const fast_data_re = r"^(\S+):(\S+)\[(\S+)\]$"
+const topic_prefix_re = r"^(\w+)//(.+)$"
+
 function KaraboDependency(str::AbstractString)
-    slow_data_re = r"^(\S+?)\.([\w|\.]+)$"
-    fast_data_re = r"^(\S+):(\S+)\[(\S+)\]$"
+    topic = nothing
+    m = match(topic_prefix_re, str)
+    if !isnothing(m)
+        topic = m.captures[1]
+        str = m.captures[2]
+    end
 
     m = match(slow_data_re, str)
-    if m != nothing
-        return KaraboDependency(m.captures[1], m.captures[2])
+    if !isnothing(m)
+        return KaraboDependency(topic, m.captures[1], m.captures[2])
     end
 
     m = match(fast_data_re, str)
-    if m != nothing
-        return KaraboDependency("$(m.captures[1]):$(m.captures[2])", m.captures[3])
+    if !isnothing(m)
+        return KaraboDependency(topic, "$(m.captures[1]):$(m.captures[2])", m.captures[3])
     end
 
     throw(ArgumentError("'$(str)' is not a valid Karabo device property"))
 end
 
 function Base.string(kp::KaraboDependency)
-    if occursin(':', kp.source)
-        return "$(kp.source)[$(kp.property)]"
+    device_str = if occursin(':', kp.source)
+        "$(kp.source)[$(kp.property)]"
     else
-        return "$(kp.source).$(kp.property)"
+        "$(kp.source).$(kp.property)"
+    end
+
+    if isnothing(kp.topic)
+        return device_str
+    else
+        return "$(kp.topic)//$(device_str)"
     end
 end
 
@@ -90,11 +107,12 @@ function _parse_function_args(args; is_input=false)
                             # subvariable and we convert it to a string so it's
                             # not evaluated.
                             value = :(Context.SubvariableDependency($("$head"), $("$tail")))
-                        elseif !(value isa AbstractDependency || @capture(value, @karabo_str _))
-                            # Otherwise, we convert all non-Karabo
-                            # dependencies (i.e. variable and maybe future
-                            # parameter dependencies) into Dependency's.
+                        elseif value isa AbstractDependency || @capture(value, @karabo_str _)
+                            # Keep as-is
+                        elseif value isa Symbol
                             value = :(Context.Dependency($("$value")))
+                        else
+                            throw(ArgumentError("Unrecognized dependency expression: $(value)"))
                         end
                         push!(dependencies, :(($("$arg_name"), $value)))
 
@@ -124,18 +142,91 @@ function _parse_function_args(args; is_input=false)
     return dependencies, new_args
 end
 
+# Helper functions for detecting variable references. A reference can be a
+# module-qualified name (MyLib.func), a bare symbol (func), or a call on
+# either of those with dependency overrides (MyLib.func(data -> ...)).
+_is_qualified_name(expr) = expr isa Expr && expr.head == :.
+_is_ref_name(expr) = expr isa Symbol || _is_qualified_name(expr)
+_is_variable_ref(expr) = _is_ref_name(expr) || (expr isa Expr && expr.head == :call && _is_ref_name(expr.args[1]))
+
+function _ref_basename(expr)
+    if expr isa Expr && expr.head == :call
+        return _ref_basename(expr.args[1])
+    elseif _is_qualified_name(expr)
+        return expr.args[2].value
+    elseif expr isa Symbol
+        return expr
+    end
+end
+
+function _split_ref(expr)
+    if expr isa Expr && expr.head == :call
+        return expr.args[1], expr.args[2:end]
+    else
+        return expr, []
+    end
+end
+
+# Generates code for a variable that references an existing variable from
+# another module. Creates a wrapper function and registers trait methods
+# that delegate to the original, with optional dependency overrides.
+function _variable_reference(new_name, ref_expr, side_effects)
+    orig_func_expr, override_args = _split_ref(ref_expr)
+
+    # Build dependency registration code
+    if !isempty(override_args)
+        overrides, _ = _parse_function_args(override_args)
+        overrides_expr = Expr(:vect, overrides...)
+        deps_code = quote
+            let orig_deps = Context.variable_dependencies($orig_func_expr),
+                overrides = Dict{String, Any}($overrides_expr)
+                Context.variable_dependencies(::typeof($new_name)) = [(name, get(overrides, name, dep)) for (name, dep) in orig_deps]
+            end
+        end
+    else
+        deps_code = :(Context.variable_dependencies(::typeof($new_name)) = Context.variable_dependencies($orig_func_expr))
+    end
+
+    # Build subvariable registration code, remapping names if renamed.
+    # When names match the replace is a no-op.
+    orig_name_str = string(_ref_basename(ref_expr))
+    new_name_str = string(new_name)
+    subvars_code = quote
+        Context.variable_subvariables(::typeof($new_name)) = [replace(s, $orig_name_str => $new_name_str, count=1)
+                                                              for s in Context.variable_subvariables($orig_func_expr)]
+    end
+
+    return esc(quote
+        function $new_name(args...)
+            $orig_func_expr(args...)
+        end
+
+        if $side_effects
+            Context.variable_origin(::typeof($new_name)) = $orig_func_expr
+            $deps_code
+            $subvars_code
+        end
+    end)
+end
+
 function _variable(ctx_module, expr, side_effects)
     if !(expr isa Expr)
         throw(ArgumentError("Must pass an Expr to @Variable"))
     end
 
-    # Handle declarations of the form `@Variable name -> karabo"..."`
+    # Handle the `->` shorthand form. The right-hand side can be:
+    # - A Karabo dependency: @Variable cam -> karabo"camera.pixels"
+    # - A variable reference (qualified or bare symbol), optionally with
+    #   dependency overrides:
+    #     @Variable my_norm -> MyLib.normalize
+    #     @Variable my_norm -> normalize
+    #     @Variable my_norm -> MyLib.normalize(data -> karabo"other.source")
+    #   Bare symbols are only allowed here (not without ->), because without
+    #   a rename the new wrapper function would conflict with the imported name.
     if @capture(expr, name_ -> value_)
         # Strip quote nodes etc
         value = MacroTools.unblock(value)
 
-        # For this shorthand-form we only allow proper dependencies, not
-        # arbitrary expressions.
         if value isa KaraboDependency || (value isa Expr && @capture(value, @karabo_str _))
             function_expr = quote
                 function $name(data -> $value)
@@ -145,6 +236,8 @@ function _variable(ctx_module, expr, side_effects)
 
             # Recurse with the generated function
             return _variable(ctx_module, function_expr, side_effects)
+        elseif _is_variable_ref(value)
+            return _variable_reference(name, value, side_effects)
         else
             throw(ArgumentError("Unrecognized dependency: $(value)"))
         end
@@ -155,26 +248,22 @@ function _variable(ctx_module, expr, side_effects)
         # Extract dependency information
         dependencies, new_args = _parse_function_args(args)
 
-        # Look through the body for subvariables, and replace all the toplevel
-        # ones.
+        # Look through the body for @add_subvariable calls to register them.
+        # Only toplevel calls are allowed. Note that we capture the macro name
+        # and check it explicitly because MacroTools doesn't handle the
+        # underscore in the name properly.
         subvariables = String[]
-        new_body = []
         for body_expr in body.args
-            if @capture(body_expr, subvar_name_ = @Variable subvar_expr_)
+            if @capture(body_expr, @macroname_(subvar_name_, _)) && macroname == Symbol("@add_subvariable")
                 push!(subvariables, "$(func_name).$(subvar_name)")
-                body_expr = :($subvar_name = $subvar_expr)
             end
-
-            push!(new_body, body_expr)
         end
-        new_body = Expr(:block, new_body...)
 
-        # Once all the toplevel subvariables have been replaced, recurse
-        # through all the expressions and throw an error if we find a
-        # non-toplevel subvariable.
-        postwalk(new_body) do body_expr
-            if @capture(body_expr, subvar_name_ = @Variable _)
-                throw(ArgumentError("Subvariable '$(func_name).$(subvar_name)' must be defined at the toplevel of the function"))
+        postwalk(body) do body_expr
+            if @capture(body_expr, @macroname_(subvar_name_, _)) && macroname == Symbol("@add_subvariable")
+                if "$(func_name).$(subvar_name)" ∉ subvariables
+                    throw(ArgumentError("Subvariable '$(func_name).$(subvar_name)' must be defined at the toplevel of the function"))
+                end
             end
 
             body_expr
@@ -186,19 +275,41 @@ function _variable(ctx_module, expr, side_effects)
         subvariables_expr = Expr(:vect, subvariables...)
         new_function = quote
             function $func_name($(new_args...))
-                $new_body
+                $body
             end
 
             if $side_effects
-                Context.registered_variables[$func_name] = $dependencies_expr
-                Context.registered_subvariables[$func_name] = $subvariables_expr
+                Context.variable_dependencies(::typeof($func_name)) = $dependencies_expr
+                Context.variable_subvariables(::typeof($func_name)) = $subvariables_expr
             end
         end
 
         return esc(new_function)
+
+    elseif _is_qualified_name(expr) || (expr isa Expr && expr.head == :call && _is_qualified_name(expr.args[1]))
+        # Handle module-qualified references without rename:
+        #   @Variable MyLib.func
+        #   @Variable MyLib.func(data -> karabo"other.source")
+        # Requires a qualified name (not a bare symbol) to avoid conflicting
+        # with the imported binding.
+        new_name = _ref_basename(expr)
+        return _variable_reference(new_name, expr, side_effects)
     end
 
     throw(ArgumentError("Could not construct variable from expression: $(prettify(expr))"))
+end
+
+# Register a subvariable value in the current execution context. This is
+# emitted by the @Variable macro when it encounters inner subvariable
+# declarations, and should not be called directly.
+macro add_subvariable(name, value)
+    esc(quote
+        let _val = $value
+            _key = "$(Context.Meta.name[]).$($name)"
+            Context.Meta.subvariables[][_key] = _val
+            _val
+        end
+    end)
 end
 
 """
@@ -246,6 +357,7 @@ function tryset(param::Parameter, value; force=false)
 end
 
 Base.getindex(param::Parameter) = param.value
+Base.setindex!(param::Parameter, value) = param.value = value
 
 function set_parameter(name::String, value, requestor::String)
     @info "Setting parameter '$(name)' to $(value) as requested by '$(requestor)'"
@@ -273,7 +385,7 @@ function _input(ctx_module, expr, side_effects)
             end
 
             if $side_effects
-                Context.registered_inputs[$name] = $dependencies_expr
+                Context.input_dependencies(::typeof($name)) = $dependencies_expr
             end
         end
 
@@ -331,7 +443,7 @@ function _group(ctx_module, expr, side_effects)
             $(expr)
 
             if $side_effects
-                Context.registered_groups[$name] = []
+                Context.group_fields(::Type{$name}) = []
             end
 
             $name

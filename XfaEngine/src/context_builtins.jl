@@ -2,10 +2,14 @@
 
 update_sources(::MockInput, _) = nothing
 
+struct KaraboDevice
+    topic::String
+    name::String
+end
 
 @Group struct KaraboBridge
     manual_configuration::Parameter{Bool}
-    trainmatcher::Parameter{String}
+    trainmatcher::Parameter{KaraboDevice}
     hostname::Parameter{String}
     port::Parameter{Int}
 
@@ -13,7 +17,7 @@ update_sources(::MockInput, _) = nothing
 end
 
 function KaraboBridge(hostname, port, sources=String[])
-    KaraboBridge(Parameter(false), Parameter(""),
+    KaraboBridge(Parameter(false), Parameter(KaraboDevice("", "")),
                  Parameter(hostname), Parameter(port), sources)
 end
 
@@ -21,8 +25,8 @@ KaraboBridge(trainmatcher) = KaraboBridge(Parameter(false), Parameter(trainmatch
                                           Parameter(""), Parameter(-1), String[])
 
 
-function get_sources(::KaraboBridge)
-    wp = XfaEngine.get_webproxy()
+function get_sources(bridge::KaraboBridge)
+    wp = XfaEngine.get_webproxy(bridge.trainmatcher[])
     devices = XfaEngine.get_devices(wp)
     return collect(keys(devices))
 end
@@ -33,21 +37,18 @@ function update_sources(bridge::KaraboBridge, sources)
         return
     end
 
-    wp = XfaEngine.get_webproxy()
-    params = Dict("sources" => sources)
-    XfaEngine.call_slot(wp, bridge.trainmatcher[], "set_sources", params)
+    XfaEngine.put_property(bridge.trainmatcher[], "sources", [Dict("source" => s) for s in sources])
 end
 
 @Input function stream(bridge::KaraboBridge, output)
-    declare_sources(Meta.name[], get_sources(bridge))
-
     address = ""
     if bridge.manual_configuration[]
         address = "tcp://$(bridge.hostname[]):$(bridge.port[])"
     else
+        declare_sources(Meta.name[], get_sources(bridge))
+
         # Get the output list
-        wp = XfaEngine.get_webproxy()
-        config = XfaEngine.get_config(wp, bridge.trainmatcher[])
+        config = XfaEngine.get_config(bridge.trainmatcher[])
         address = config["zmqOutputs"][1]["address"]
     end
 

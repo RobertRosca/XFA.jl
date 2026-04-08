@@ -2,26 +2,23 @@ module XfaEngineTests
 
 __revise_mode__ = :eval
 
-import Logging
-import Sockets
-import Sockets: @ip_str, send, recv
-import Statistics: mean
-import Test: with_logger, TestLogger
-import ReTest: @testset, @test, @test_throws, @test_logs
+using Logging: Logging
+using Sockets: Sockets, @ip_str, send, recv
+using Statistics: mean
+using Test: with_logger, TestLogger
+using ReTest: @testset, @test, @test_throws, @test_logs
 
-import ZMQ
-import HTTP
-import HTTP: WebSockets
-import OrderedCollections: OrderedDict as OD
+using ZMQ: ZMQ
+using HTTP: HTTP, WebSockets
+using OrderedCollections: OrderedDict as OD
 
-import XfaEngine
-import XfaEngine: Context
-import XfaEngine.Context: @Variable, @karabo_str, VariableData, Dependency, KaraboDependency,
-    GroupDependency, SubvariableDependency, XfaContextException, Parameter, FunctionArgument
-import XfaEngine.KaraboBridge
-import XfaEngine.KaraboBridge: KaraboBridgeClient, KaraboBridgeServer, ThreadsafeSocket
-import XfaEngine: Protocol
+using XfaEngine: XfaEngine, Context, KaraboBridge, Protocol
+using XfaEngine.Context: @Variable, @karabo_str, VariableData, Dependency, KaraboDependency,
+    GroupDependency, SubvariableDependency, XfaContextException, Parameter, FunctionArgument, KaraboDevice
+using XfaEngine.KaraboBridge: KaraboBridgeClient, KaraboBridgeServer, ThreadsafeSocket
 
+
+keyset(dict) = Set(keys(dict))
 
 function test_connect(port=1331)
     client = Client()
@@ -31,6 +28,7 @@ function test_connect(port=1331)
 
         id = WebSockets.receive(ws)
         client.client_id = id
+        WebSockets.receive(ws) # engine directory
 
         for msg_bytes in ws
             buffer = IOBuffer(msg_bytes)
@@ -54,10 +52,14 @@ function server_exists(port)
     end
 end
 
-function mock_webproxy(f::Function, port)
+function mock_webproxy(f::Function, port, bridge_port=-1)
     server = HTTP.serve!(Sockets.localhost, port) do request
         if request.target == "/devices.json"
             return HTTP.Response(read(joinpath(@__DIR__, "mid-devices.json"), String))
+        elseif endswith(request.target, "/set_sources.json")
+            return HTTP.Response("""{"status": "ok"}""")
+        elseif endswith(request.target, "/config.json")
+            return HTTP.Response("""{"zmqOutputs": [{"address": "tcp://localhost:$(bridge_port)"}]}""")
         else
             return HTTP.Response(404, "Path not supported")
         end
@@ -110,52 +112,54 @@ end
     log = TestLogger()
     temp_engine(; log) do address, stop_event, info_path
         WebSockets.open(address) do ws
-            # Test that we get a valid ID
+            # Test that we get a valid ID and initial trainmatchers
             id = WebSockets.receive(ws)
             @test id isa String
             @test length(id) > 5
-
-            # The next message should be the available topics
-            @test Protocol.receive(ws) isa Protocol.AvailableTopics
-            Protocol.send(ws, Protocol.SetDefaultTopic("localhost"))
+            engine_dir = WebSockets.receive(ws)
+            @test engine_dir isa String
+            @test engine_dir == pkgdir(XfaEngine)
+            @test Protocol.receive(ws).msg isa Protocol.AvailableTrainmatchers
 
             # Test Ping
-            Protocol.send(ws, Protocol.Ping())
-            @test Protocol.receive(ws) isa Protocol.Pong
+            Protocol.client_send(ws, Protocol.Ping())
+            @test Protocol.receive(ws).msg isa Protocol.Pong
 
             # Test GetDevices
             webproxy_port = XfaEngine.getavailableport(8484)
             mock_webproxy(webproxy_port) do
-                Protocol.send(ws, Protocol.GetDevices())
-                @test Protocol.receive(ws) isa Protocol.Devices
+                Protocol.client_send(ws, Protocol.GetDevices())
+                @test Protocol.receive(ws).msg isa Protocol.Devices
             end
 
             # Test LoadContext
             mktemp() do path, io
                 # Test loading an invalid context
                 # write(path, "@Variable x -> foo")
-                # Protocol.send(ws, Protocol.LoadContext(path))
-                # msg = Protocol.receive(ws)
+                # Protocol.client_send(ws, Protocol.LoadContext(path))
+                # msg = Protocol.receive(ws).msg
                 # @test msg isa Protocol.ContextInfo
                 # @test msg.info isa Exception
 
                 # Test loading a valid context
                 write(path, """
                             p = Parameter(0)
-                            @Variable x -> karabo"foo.bar" 
+                            @Variable x -> karabo"foo.bar"
                             """)
-                Protocol.send(ws, Protocol.LoadContext(path))
-                msg = Protocol.receive(ws)
+                Protocol.client_send(ws, Protocol.LoadContext(path))
+                msg = Protocol.receive(ws).msg
                 @test msg isa Protocol.ContextInfo
                 @test msg.info isa Dict
                 @test haskey(msg.info["dag"], "x")
             end
 
             # Test ChangeParameter
-            Protocol.send(ws, Protocol.ChangeParameter(Parameter("p", 1)))
+            Protocol.client_send(ws, Protocol.ChangeParameter(Parameter("p", 1)))
+            @test Protocol.receive(ws).msg isa Protocol.Ack
 
             # Test ReviseCode
-            Protocol.send(ws, Protocol.ReviseCode())
+            Protocol.client_send(ws, Protocol.ReviseCode())
+            @test Protocol.receive(ws).msg isa Protocol.Ack
         end
     end
 
@@ -171,6 +175,38 @@ end
     #         run(`$(executable) --project=$(environment) --startup-file=no --color=no $(launcher_script)`)
     #     end
     # end
+end
+
+@testset "Message tracking" begin
+    log = TestLogger()
+    temp_engine(; log) do address, stop_event, info_path
+        WebSockets.open(address) do ws
+            # Consume the client ID, engine dir, and initial trainmatchers
+            WebSockets.receive(ws)
+            WebSockets.receive(ws)
+            Protocol.receive(ws)
+
+            # Test that send always assigns an ID and the server
+            # echoes it back as reply_to
+            id = Protocol.client_send(ws, Protocol.Ping())
+            @test id > 0
+            envelope = Protocol.receive(ws)
+            @test envelope isa Protocol.Envelope
+            @test envelope.id < 0
+            @test envelope.reply_to == id
+            @test envelope.msg isa Protocol.Pong
+
+            # Test that Ack messages carry reply_to for fire-and-forget
+            # messages
+            id1 = Protocol.client_send(ws, Protocol.SetTopicTrainmatcher("localhost", "tm1"))
+            id2 = Protocol.client_send(ws, Protocol.SetTopicTrainmatcher("localhost", "tm2"))
+            env1 = Protocol.receive(ws)
+            env2 = Protocol.receive(ws)
+            @test env1.msg isa Protocol.Ack
+            @test env2.msg isa Protocol.Ack
+            @test Set([env1.reply_to, env2.reply_to]) == Set([id1, id2])
+        end
+    end
 end
 
 function getavailableport(port_hint; interface=ip"127.0.0.1")
@@ -326,6 +362,32 @@ end
     @test_throws ArgumentError KaraboDependency("foo")
     @test_throws ArgumentError KaraboDependency("foo.bar[]")
     @test_throws ArgumentError KaraboDependency("foo:[bar]")
+
+    # Topic macros
+    @test karabo"MID//foo.bar" == KaraboDependency("MID", "foo", "bar")
+    @test karabo"SA2//foo:output[bar]" == KaraboDependency("SA2", "foo:output", "bar")
+
+    # Parsing from string with topic
+    @test KaraboDependency("MID//foo.bar") == KaraboDependency("MID", "foo", "bar")
+    @test KaraboDependency("SA2//foo:output[bar]") == KaraboDependency("SA2", "foo:output", "bar")
+
+    # Round trip
+    @test KaraboDependency(string(karabo"MID//foo.bar")) == karabo"MID//foo.bar"
+    @test KaraboDependency(string(karabo"SA2//foo:output[bar]")) == karabo"SA2//foo:output[bar]"
+end
+
+# Helper module that defines variables for reference tests, defined in
+# Main so that load_from_string's context modules can access it.
+@eval Main module VariableLibrary
+    using XfaEngine.Context
+    @Variable function normalize(data -> karabo"camera.pixels")
+        return data ./ maximum(data)
+    end
+
+    @Variable function with_subvar(data -> karabo"device.property")
+        @add_subvariable("half", data / 2)
+        return data
+    end
 end
 
 @testset "@Variable" begin
@@ -393,12 +455,15 @@ end
     @test_throws ArgumentError Context._variable(@__MODULE__, :(foo -> 42), false)
     @test_throws ArgumentError Context._variable(@__MODULE__, :(foo -> "foo.bar"), false)
 
+    # Using an unrecognized macro as a dependency should fail
+    @test_throws ArgumentError Context._variable(@__MODULE__, :(function foo(data -> bar"baz") data end), false)
+
     # We should not be able to create a subvariable that isn't defined at the
     # top level of a function.
     @test_throws "defined at the toplevel" Context._variable(@__MODULE__, quote
                                                                  function foo()
                                                                      if true
-                                                                         data = @Variable(42)
+                                                                         @add_subvariable("data", 42)
                                                                      end
                                                                  end
                                                              end,
@@ -407,9 +472,9 @@ end
     # Test creating a subvariable
     ctx = Context.load_from_string(raw"""
     @Variable function foo(data -> karabo"device.property")
-        bar = @Variable(mean(data))
+        @add_subvariable("bar", mean(data))
 
-        return data, bar
+        return data
     end
 
     @Variable function quux(data -> foo.bar)
@@ -429,6 +494,66 @@ end
     write(io, ctx_code)
     close(io)
     @test Context.load_from_file(path).dag == ctx_from_str.dag
+
+    @testset "@Variable references" begin
+        # Test bare reference: @Variable VariableLibrary.normalize
+        ctx = Context.load_from_string("""
+        using Main: VariableLibrary
+        @Variable VariableLibrary.normalize
+        """)
+        @test keyset(ctx.functions) == Set(["normalize"])
+        @test ctx.dag["normalize"] == OD("data" => karabo"camera.pixels")
+
+        # Test renamed reference: @Variable my_norm -> VariableLibrary.normalize
+        ctx = Context.load_from_string("""
+        using Main: VariableLibrary
+        using .VariableLibrary: normalize
+        @Variable my_norm -> normalize
+        """)
+        @test keyset(ctx.functions) == Set(["my_norm"])
+        @test ctx.dag["my_norm"] == OD("data" => karabo"camera.pixels")
+
+        # Test reference with dependency override
+        ctx = Context.load_from_string("""
+        using Main: VariableLibrary
+        @Variable VariableLibrary.normalize(data -> karabo"other_camera.data")
+        """)
+        @test ctx.dag["normalize"] == OD("data" => karabo"other_camera.data")
+
+        # Test renamed reference with dependency override
+        ctx = Context.load_from_string("""
+        using Main: VariableLibrary
+        @Variable my_norm -> VariableLibrary.normalize(data -> karabo"other_camera.data")
+        """)
+        @test keyset(ctx.functions) == Set(["my_norm"])
+        @test ctx.dag["my_norm"] == OD("data" => karabo"other_camera.data")
+
+        # Test that the wrapper function delegates to the original
+        invokelatest() do
+            @test ctx.functions["my_norm"]([2, 4, 6]) == Main.VariableLibrary.normalize([2, 4, 6])
+        end
+
+        # Test that variable_origin points to the original
+        invokelatest() do
+            my_norm_func = ctx.functions["my_norm"]
+            @test Context.variable_origin(my_norm_func) === Main.VariableLibrary.normalize
+        end
+
+        # Test subvariable remapping on rename
+        ctx = Context.load_from_string("""
+        using Main: VariableLibrary
+        @Variable renamed -> VariableLibrary.with_subvar
+        """)
+        @test ctx.subvariables["renamed"] == ["renamed.half"]
+
+        # Test that the original variable is excluded from the context when referenced
+        ctx = Context.load_from_string("""
+        using Main: VariableLibrary
+        @Variable my_norm -> VariableLibrary.normalize
+        @Variable foo -> karabo"foo.bar"
+        """)
+        @test Set(keys(ctx.functions)) == Set(["my_norm", "foo"])
+    end
 end
 
 @testset "Parameter" begin
@@ -472,8 +597,6 @@ end
     @test timedwait(() -> length(log.logs) == 1, 5) == :ok
     @test occursin("Setting parameter", log.logs[1].message)
 
-    @show ctx.inputs
-
     # Variables and parameters with the same name doesn't work
     @test_throws ErrorException Context.load_from_string(raw"""
     foo = Parameter(0)
@@ -495,8 +618,7 @@ end
     x = Context.MockInput()
     """)
     @test isempty(ctx.dag)
-    @show ctx.inputs
-    @test ctx.inputs["x.bridge"] == Dict("output" => FunctionArgument("output", Channel))
+    @test ctx.inputs["x.bridge"] == Dict("_" => GroupDependency("x", Context.MockInput))
 
     # And a input function that's part of a group
     ctx = Context.load_from_string(raw"""
@@ -613,8 +735,8 @@ end
         @Variable camera -> karabo"camera.data"
         """)
         # Variables shouldn't be executed unless they have all their dependencies
-        # @test length(Context.execute_variables(ctx, Dict())) == 0
-        # @test Context.execute_variables(ctx, Dict("camera.data" => 1)) == Dict("camera" => 1)
+        @test length(Context.execute_variables(ctx, Dict())) == 0
+        @test Context.execute_variables(ctx, Dict("camera.data" => 1)) == Dict("camera" => 1)
 
         # Test that dependencies are passed correctly
         ctx = Context.load_from_string(raw"""
@@ -624,11 +746,11 @@ end
             return (2 * data, norm[])
         end
         """)
-        # @test Context.execute_variables(ctx, Dict("foo.bar" => 1)) == Dict("foo" => 1, "bar" => (2, 1))
+        @test Context.execute_variables(ctx, Dict("foo.bar" => 1)) == Dict("foo" => 1, "bar" => (2, 1))
 
         # Test executing inputs
         ctx = Context.load_from_string("""
-        @Input function fakecamera(output)
+        @Input function fakecamera(::Context.MockInput, output)
             tid = 0
             data = Dict("camera" => Dict("data" => rand(100, 100)))
             while true
@@ -636,26 +758,30 @@ end
                 tid += 1
             end
         end
+
+        x = Context.MockInput()
         """)
         Context.run(ctx) do
             @test length(ctx.input_channels) == 1
-            @test timedwait(() -> isready(ctx.input_channels["fakecamera"]), 10) == :ok
+            @test timedwait(() -> isready(ctx.input_channels["x.fakecamera"]), 10) == :ok
 
-            @test isempty(ctx.input_variable_channels["fakecamera"])
+            @test isempty(ctx.input_variable_channels["x.fakecamera"])
         end
-        @test istaskdone(ctx.input_tasks["fakecamera"])
-        @test istaskdone(ctx.input_variables_tasks["fakecamera"])
+        @test istaskdone(ctx.input_tasks["x.fakecamera"])
+        @test istaskdone(ctx.input_variables_tasks["x.fakecamera"])
 
         # Stopping execution should close all tasks/channels
         @test !isopen(ctx.stream_output)
 
         # Test executing external dependency variables
         ctx = Context.load_from_string("""
-        @Input function fakecamera(output)
+        @Input function fakecamera(::Context.MockInput, output)
             put!(output, (0, Dict("camera" => Dict("data" => 42))))
         end
 
         @Variable foo -> karabo"camera.data"
+
+        x = Context.MockInput()
         """)
         Context.run(ctx) do
             @test only(keys(ctx.external_dependency_tasks)) == "camera.data"
@@ -669,9 +795,10 @@ end
 
         # Test executing variables
         ctx = Context.load_from_string("""
-        @Input function input(output)
+        @Input function input(::Context.MockInput, output)
             put!(output, (0, Dict("motor1" => Dict("pos" => 1), "motor2" => Dict("pos" => 2))))
         end
+        x = Context.MockInput()
 
         @Variable motor1 -> karabo"motor1.pos"
 
@@ -689,9 +816,10 @@ end
         # Variables that throw shouldn't cause execution of the other variables to
         # fail.
         ctx = Context.load_from_string(raw"""
-        @Input function input(output)
+        @Input function input(::Context.MockInput, output)
             put!(output, (0, Dict("motor1" => Dict("pos" => 1))))
         end
+        x = Context.MockInput()
 
         @Variable function foo(data -> karabo"motor1.pos")
             error("foo")
@@ -713,9 +841,10 @@ end
 
         # Variables that fail should block downstream dependencies from running
         ctx = Context.load_from_string(raw"""
-        @Input function input(output)
+        @Input function input(::Context.MockInput, output)
             put!(output, (0, Dict("motor1" => Dict("pos" => 1))))
         end
+        x = Context.MockInput()
 
         @Variable function foo(data -> karabo"motor1.pos")
             error("foo")
@@ -736,9 +865,10 @@ end
 
         # Slightly more complicated DAG to test that everything is wired up correctly
         ctx = Context.load_from_string(raw"""
-        @Input function input(output)
+        @Input function input(::Context.MockInput, output)
             put!(output, (0, Dict("motor1" => Dict("pos" => 1), "motor2" => Dict("pos" => 1))))
         end
+        i = Context.MockInput()
 
         @Variable function x(data -> karabo"motor1.pos")
             return data
@@ -770,9 +900,10 @@ end
 
         # Test scheduling with groups and parameters
         ctx = Context.load_from_string(raw"""
-        @Input function input(output)
+        @Input function input(::Context.MockInput, output)
             put!(output, (0, Dict("motor1" => Dict("pos" => 1))))
         end
+        x = Context.MockInput()
 
         @Group struct Foo
             x::Parameter{Int}
@@ -791,11 +922,40 @@ end
         @test isready(ctx.stream_output)
         @test take!(ctx.stream_output) == VariableData(0, "foo.bar", 2)
 
+        # Test subvariable execution
+        ctx = Context.load_from_string(raw"""
+        @Input function input(::Context.MockInput, output)
+            put!(output, (0, Dict("motor1" => Dict("pos" => 10))))
+        end
+        x = Context.MockInput()
+
+        @Variable function foo(data -> karabo"motor1.pos")
+            @add_subvariable("half", data / 2)
+            return data
+        end
+
+        @Variable function bar(data -> foo.half)
+            return data + 1
+        end
+        """)
+        Context.run(ctx) do
+            @test timedwait(() -> !isopen(ctx.stream_output), 5) == :ok
+        end
+
+        results = VariableData[]
+        while isready(ctx.stream_output)
+            push!(results, take!(ctx.stream_output))
+        end
+        @test length(results) == 2
+        @test results[1] == VariableData(0, "foo", 10, Dict{String, Any}("foo.half" => 5.0))
+        @test results[2] == VariableData(0, "bar", 6.0)
+
         # Test input groups
         ctx = Context.load_from_string(raw"""
         @Group struct Foo
             x::Int
         end
+        Context.update_sources(::Foo, _) = nothing
 
         @Input function input(foo::Foo, output)
             put!(output, (0, Dict("foo" => Dict("x" => foo.x))))
@@ -813,9 +973,10 @@ end
 
         # Test the Meta module
         ctx = Context.load_from_string(raw"""
-        @Input function input(output)
+        @Input function input(::Context.MockInput, output)
             put!(output, (42, Dict("motor1" => Dict("pos" => 1))))
         end
+        x = Context.MockInput()
 
         @Variable function foo(data -> karabo"motor1.pos")
             scratch = Meta.scratch[]
@@ -833,11 +994,12 @@ end
         ctx = Context.load_from_string(raw"""
         next_input = Base.Event()
 
-        @Input function input(output)
+        @Input function input(::Context.MockInput, output)
             put!(output, (42, Dict("motor1" => Dict("pos" => 1))))
             wait(next_input)
             put!(output, (42, Dict("motor1" => Dict("pos" => 1))))
         end
+        i = Context.MockInput()
 
         x_side_effect = 0
         x = Parameter(0) do x
@@ -866,18 +1028,19 @@ end
 
         ctx = Context.load_from_string("""
         bridge = KaraboBridge("localhost", $(port), ["foo.x"])
+        bridge.manual_configuration[] = true
 
         @Variable foo -> karabo"foo.x"
         """)
 
         # Make a mock engine so we can use the mock webproxy
         webproxies = Dict("localhost" => XfaEngine.WebProxy("localhost:8484"))
-        XfaEngine.current_engine_state = XfaEngine.EngineState(; webproxies, default_topic="localhost")
+        XfaEngine.current_engine_state = XfaEngine.EngineState(; webproxies)
 
         # Simple example with two trains of data
         put!(bridge_server, Dict("foo" => Dict("x" => 42.0)))
         put!(bridge_server, Dict("foo" => Dict("x" => 40.0)))
-        mock_webproxy(8484) do
+        mock_webproxy(8484, port) do
             Context.run(ctx) do
                 @test timedwait(() -> isready(ctx.stream_output), 5) == :ok
                 @test take!(ctx.stream_output) == VariableData(0, "foo", 42.0)
@@ -895,9 +1058,11 @@ end
         bridge_server = KaraboBridgeServer("tcp://localhost:$(port)")
         KaraboBridge.startbridge(bridge_server)
         put!(bridge_server, Dict("foo" => Dict("x" => 38.0)))
-        Context.run(ctx) do
-            @test timedwait(() -> isready(ctx.stream_output), 5) == :ok
-            @test take!(ctx.stream_output) == VariableData(0, "foo", 38.0)
+        mock_webproxy(8484, port) do
+            Context.run(ctx) do
+                @test timedwait(() -> isready(ctx.stream_output), 5) == :ok
+                @test take!(ctx.stream_output) == VariableData(0, "foo", 38.0)
+            end
         end
 
         close(bridge_server)
@@ -906,7 +1071,7 @@ end
 
 @testset "Serialization" begin
     ctx = Context.load_from_string(raw"""
-    bridge = KaraboBridge()
+    bridge = KaraboBridge("", 45000)
 
     period = Parameter(2π)
 
@@ -915,7 +1080,7 @@ end
     @Variable function foo() 42 end
 
     @Variable function bar(data -> xgm)
-        max_data = @Variable(max(data))
+        @add_subvariable("max_data", max(data))
         mean(data)
     end
     """)
@@ -928,10 +1093,17 @@ end
                                        "subvariables" => Dict("xgm" => [],
                                                               "foo" => [],
                                                               "bar" => ["bar.max_data"]),
+                                       "origins" => Dict("xgm" => "xgm",
+                                                         "foo" => "foo",
+                                                         "bar" => "bar",
+                                                         "bridge" => "XfaEngine.Context.KaraboBridge",
+                                                         "bridge.stream" => "XfaEngine.Context.stream"),
                                        "parameters" => Dict("period" => Parameter("period", 2π),
                                                             "bridge.hostname" => Parameter("bridge.hostname", ""),
                                                             "bridge.port" => Parameter("bridge.port", 45000),
-                                                            "bridge.manual_configuration" => Parameter("bridge.manual_configuration", false)))
+                                                            "bridge.trainmatcher" => Parameter("bridge.trainmatcher", KaraboDevice("", "")),
+                                                            "bridge.manual_configuration" => Parameter("bridge.manual_configuration", false)),
+                                       "path" => "")
 end
 
 end

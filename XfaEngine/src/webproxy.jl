@@ -45,15 +45,30 @@ function WebProxy(address)
     return WebProxy(address, default_cache, default_cache)
 end
 
-function get_webproxy()
+"""
+    get_webproxy(device::AbstractString)
+
+Get the webproxy for a device by extracting the topic from its name.
+Device names are expected to start with the topic, e.g. `MID_FOO_BAR/...`
+uses the `MID` topic webproxy.
+"""
+function get_webproxy(device::AbstractString)
     if isnothing(current_engine_state)
         error("Engine is not initialized, cannot get a WebProxy")
     elseif isempty(current_engine_state.webproxies)
         error("No WebProxy's are available to connect to")
     end
 
-    return current_engine_state.webproxies[current_engine_state.default_topic]
+    for topic in keys(current_engine_state.webproxies)
+        if startswith(device, topic)
+            return current_engine_state.webproxies[topic]
+        end
+    end
+
+    error("No webproxy found for device '$device'")
 end
+
+get_webproxy(device::KaraboDevice) = current_engine_state.webproxies[device.topic]
 
 # Flatten the returned dict a bit by removing timestamp and tid entries for each
 # node.
@@ -71,6 +86,14 @@ end
 
 function get_json(wp, path; timeout=5)
     res = HTTP.get(wp.address * path;
+                   connect_timeout=timeout, readtimeout=timeout)
+    return JSON3.read(res.body, Dict{String, Any})
+end
+
+function put_json(wp, path, body; timeout=5)
+    res = HTTP.put(wp.address * path,
+                   ["Content-Type" => "application/json"],
+                   JSON3.write(body);
                    connect_timeout=timeout, readtimeout=timeout)
     return JSON3.read(res.body, Dict{String, Any})
 end
@@ -98,23 +121,54 @@ function get_devices(wp; timeout=5, max_age=10, classId=nothing)
     return devices
 end
 
+function get_all_devices(webproxies; classId=nothing)
+    devices = Dict{String, Dict{String, Any}}()
+    for (topic, wp) in webproxies
+        devices[topic] = get_devices(wp; classId)
+    end
+
+    return devices
+end
+
 # This takes in a dict from topic to webproxy
 function get_all_trainmatchers(webproxies::Dict)
-    trainmatchers = Dict{String, Vector{String}}()
+    trainmatchers = Dict{String, Vector{Tuple{String, Bool}}}()
 
     for (topic, wp) in webproxies
         devices = get_devices(wp; classId="TrainMatcher")
-        trainmatchers[topic] = collect(keys(devices))
-        sort!(trainmatchers[topic])
+        whitelisted = try
+            get_property(wp, "karabo/WebProxy/device", "devices")
+        catch ex
+            @warn "Failed to query webproxy whitelist for $topic" exception=(ex, catch_backtrace())
+            String[]
+        end
+        names = sort!(collect(keys(devices)))
+        trainmatchers[topic] = [(name, name in whitelisted) for name in names]
     end
 
     return trainmatchers
 end
 
-function get_config(wp, device; timeout=5)
-    config = get_json(wp, "/devices/$(device)/config.json"; timeout)
+function get_config(device::KaraboDevice; timeout=5)
+    wp = get_webproxy(device)
+    config = get_json(wp, "/devices/$(device.name)/config.json"; timeout)
     strip_metadata!(config)
     return config
+end
+
+function get_property(wp, device, property; timeout=5)
+    config = get_json(wp, "/devices/$(device).$(property)/config.json"; timeout)
+    return config["value"]
+end
+
+function put_property(device::KaraboDevice, property, value; timeout=5)
+    wp = get_webproxy(device)
+    put_json(wp, "/devices/$(device.name).$(property)/config.json", value; timeout)
+end
+
+function get_schema(device::KaraboDevice; timeout=5)
+    wp = get_webproxy(device)
+    return get_json(wp, "/devices/$(device.name)/schema.json"; timeout)
 end
 
 function call_slot(wp, device, slot, params=HTTP.nobody; timeout=5)

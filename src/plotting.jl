@@ -470,8 +470,8 @@ mutable struct Plot
     const name::String
     const id::String
     const open::Ref{Bool}
-    const autofit_x::Ref{Bool}
-    const autofit_y::Ref{Bool}
+    const autoscale_x::Ref{Bool}
+    const autoscale_y::Ref{Bool}
     const fixed_aspect::Ref{Bool}
     gpu_heatmap::Union{Nothing, GPUHeatmap}
     dock_id::UInt32
@@ -500,27 +500,27 @@ function check_plot_interaction!(plot)
     y_hovered = ImPlot.IsAxisHovered(ImPlot.ImAxis_Y1)
     plot_hovered = ImPlot.IsPlotHovered()
 
-    # Disable autofit on the axes being interacted with
+    # Disable autoscale on the axes being interacted with
     if interacting
         if plot_hovered
-            plot.autofit_x[] = false
-            plot.autofit_y[] = false
+            plot.autoscale_x[] = false
+            plot.autoscale_y[] = false
         elseif x_hovered
-            plot.autofit_x[] = false
+            plot.autoscale_x[] = false
         elseif y_hovered
-            plot.autofit_y[] = false
+            plot.autoscale_y[] = false
         end
     end
 
-    # Double-click to re-enable autofit
+    # Double-click to re-enable autoscale
     if ig.IsMouseDoubleClicked(ig.ImGuiMouseButton_Left)
         if plot_hovered
-            plot.autofit_x[] = true
-            plot.autofit_y[] = true
+            plot.autoscale_x[] = true
+            plot.autoscale_y[] = true
         elseif x_hovered
-            plot.autofit_x[] = true
+            plot.autoscale_x[] = true
         elseif y_hovered
-            plot.autofit_y[] = true
+            plot.autoscale_y[] = true
         end
     end
 end
@@ -537,34 +537,34 @@ function toggle_button(label, active::Bool)
     return clicked
 end
 
-"""Draw the autofit toggle button group: [X] [Y] [XY]"""
-function autofit_buttons(plot)
+"""Draw the autoscale toggle button group: [X] [Y] [XY]"""
+function autoscale_buttons(plot)
     ig.AlignTextToFramePadding()
-    ig.Text("Autofit:")
+    ig.Text("Autoscale:")
     ig.SameLine()
-    if toggle_button("X##$(plot.id)", plot.autofit_x[])
-        plot.autofit_x[] = !plot.autofit_x[]
+    if toggle_button("X##$(plot.id)", plot.autoscale_x[])
+        plot.autoscale_x[] = !plot.autoscale_x[]
     end
     ig.SameLine()
-    if toggle_button("Y##$(plot.id)", plot.autofit_y[])
-        plot.autofit_y[] = !plot.autofit_y[]
+    if toggle_button("Y##$(plot.id)", plot.autoscale_y[])
+        plot.autoscale_y[] = !plot.autoscale_y[]
     end
     ig.SameLine()
-    both = plot.autofit_x[] && plot.autofit_y[]
+    both = plot.autoscale_x[] && plot.autoscale_y[]
     if toggle_button("XY##$(plot.id)", both)
         new_state = !both
-        plot.autofit_x[] = new_state
-        plot.autofit_y[] = new_state
+        plot.autoscale_x[] = new_state
+        plot.autoscale_y[] = new_state
     end
 end
 
-"""Call per-axis SetNextAxisToFit based on autofit state."""
-function apply_autofit(plot)
-    if plot.autofit_x[] && plot.autofit_y[]
+"""Call per-axis SetNextAxisToFit based on autoscale state."""
+function apply_autoscale(plot)
+    if plot.autoscale_x[] && plot.autoscale_y[]
         ImPlot.SetNextAxesToFit()
-    elseif plot.autofit_x[]
+    elseif plot.autoscale_x[]
         ImPlot.SetNextAxisToFit(ImPlot.ImAxis_X1)
-    elseif plot.autofit_y[]
+    elseif plot.autoscale_y[]
         ImPlot.SetNextAxisToFit(ImPlot.ImAxis_Y1)
     end
 end
@@ -590,17 +590,25 @@ function draw_plot(plot::Plot, data, was_updated)
         xlabel = is_dimarray ? DD.label(data_dims[1]) : ""
         label = is_dimarray ? DD.label(data) : plot.name
 
-        apply_autofit(plot)
+        apply_autoscale(plot)
 
         region_avail = ig.GetContentRegionAvail()
         plot_size = ImVec2(region_avail.x, max(region_avail.y - 30, 100))
 
         if data isa AbstractVector
             if ImPlot.BeginPlot(plot.id, xlabel, "", plot_size)
-                if is_dimarray
-                    ImPlot.PlotLine(label, parent(lookup(data)[1]), parent(data))
+                if length(data) == 1
+                    if is_dimarray
+                        ImPlot.PlotScatter(label, parent(lookup(data)[1]), parent(data))
+                    else
+                        ImPlot.PlotScatter(label, data)
+                    end
                 else
-                    ImPlot.PlotLine(label, data)
+                    if is_dimarray
+                        ImPlot.PlotLine(label, parent(lookup(data)[1]), parent(data))
+                    else
+                        ImPlot.PlotLine(label, data)
+                    end
                 end
                 check_plot_interaction!(plot)
                 ImPlot.EndPlot()
@@ -639,7 +647,7 @@ function draw_plot(plot::Plot, data, was_updated)
             end
         end
 
-        autofit_buttons(plot)
+        autoscale_buttons(plot)
         if data isa AbstractMatrix
             ig.SameLine()
             ig.Checkbox("Fixed aspect", plot.fixed_aspect)
@@ -659,8 +667,8 @@ end
     const y_var::Ref{Cint} = Ref(Cint(0))
     const x_data::Vector{Float64} = Float64[]
     const y_data::Vector{Float64} = Float64[]
-    const autofit_x::Ref{Bool} = Ref(true)
-    const autofit_y::Ref{Bool} = Ref(true)
+    const autoscale_x::Ref{Bool} = Ref(true)
+    const autoscale_y::Ref{Bool} = Ref(true)
     trainId::Int = -1
     dock_id::UInt32 = 0
 end
@@ -786,7 +794,7 @@ function draw_plot(plot::CorrelationPlot, variable_data, updated_variables)
             if x.type != y.type
                 ig.Text("Both variables must have the same type to correlate against each other.")
             else
-                apply_autofit(plot)
+                apply_autoscale(plot)
 
                 if x.type == VariableType_Scalar
                     if haskey(updated_variables, x_name) || haskey(updated_variables, y_name)
@@ -833,7 +841,7 @@ function draw_plot(plot::CorrelationPlot, variable_data, updated_variables)
                     ig.Text("Unsupported correlation of data type '$(x.type)'")
                 end
 
-                autofit_buttons(plot)
+                autoscale_buttons(plot)
             end
         end
 

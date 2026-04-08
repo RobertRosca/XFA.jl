@@ -1,6 +1,22 @@
 const BASTION = "bastion.desy.de"
 const GATEWAY = "exflgateway.desy.de"
 
+function log_engine_error(state::GuiState, message::String, extra_details::Maybe{String}=nothing)
+    push!(state.client.engine_logs, EngineLog(message, extra_details))
+    state.show_engine_logs = true
+    state.select_engine_logs = true
+end
+
+function send(client::ClientState, msg::AbstractMessage)
+    id = Protocol.client_send(client.websocket, msg)
+    client.pending_requests[id] = PendingRequest(typeof(msg), time())
+    return id
+end
+
+function is_pending(client::ClientState, id::Union{MessageId, Nothing})
+    !isnothing(id) && haskey(client.pending_requests, id)
+end
+
 function peekall(buffer::IOBuffer)
     return String(take!(copy(buffer)))
 end
@@ -152,7 +168,6 @@ function sync_files()
         end
 
         changed_files = split(git_diff, "\n")
-        @info "Syncing files" changed_files
 
         for path in changed_files
             local_path = joinpath(engine_dir, basename(path))
@@ -183,24 +198,6 @@ function initialize_engine(state)
         "source /etc/profile.d/modules.sh; SASE=0 module load exfel julia/202502 > /dev/null 2>&1"
     end
 
-    julia_binary = if is_local
-        "julia"
-    else
-        out = readchomp("$(julia_module_prefix); which julia", client.ssh_hops[end].session)
-        split(out, "\n")[end]
-    end
-
-    client.remote_engine_dir = if is_local
-        pkgdir(XfaEngine)
-    else
-        cmd_str = "$(julia_module_prefix); julia --project=@xfa-default -E 'import XfaEngine; pkgdir(XfaEngine)'"
-        cmd = `bash -c $(cmd_str)`
-        @show cmd
-        proc = run(ignorestatus(cmd),
-                   client.ssh_hops[end].session; print_out=false)
-        string(chomp(String(proc.out))[2:end - 1])
-    end
-
     bootstrap_process = nothing
 
     try
@@ -221,11 +218,9 @@ function initialize_engine(state)
             end
 
             bootstrap_env = Dict("XFA_ENVIRONMENT" => state.engine_environment,
-                                 "XFA_ENGINE_DIR" => client.remote_engine_dir,
-                                 "XFA_WORKING_DIR" => working_dir,
-                                 "XFA_JULIA_BINARY" => julia_binary)
+                                 "XFA_WORKING_DIR" => working_dir)
             bootstrap_env_str = join(["$(key)=$(value)" for (key, value) in bootstrap_env], " ")
-            bootstrap_cmd = "$(bootstrap_env_str) bash -c '$(julia_module_prefix); julia --color=no $(bootstrap_jl)'"
+            bootstrap_cmd = "$(bootstrap_env_str) bash -c '$(julia_module_prefix); julia --project=$(state.engine_environment) --color=no $(bootstrap_jl)'"
             bootstrap_process = run(bootstrap_cmd, session; wait=false)
 
             while !process_exited(bootstrap_process)
@@ -288,11 +283,15 @@ function disconnect_engine(state, shutdown_engine)
 
     if shutdown_engine && !isnothing(client.websocket)
         if !WebSockets.isclosed(client.websocket)
-            send(client.websocket, Shutdown())
+            send(client, Shutdown())
         end
 
         # Wait for the websocket to be closed before killing the connection
         timedwait(() -> WebSockets.isclosed(client.websocket), 10)
+    end
+
+    if client.embedded_engine
+        rm("worker-info.toml"; force=true)
     end
 
     close(state.client)
@@ -313,6 +312,8 @@ function build_context_state(state, ctx_info)
         ctx_state[name]["dependencies"] = []
         ctx_state[name]["outputs"] = []
         ctx_state[name]["type"] = :variable
+        ctx_state[name]["origin"] = ctx_info["origins"][name]
+        ctx_state[name]["draw_parameters"] = true
 
         for (value_name, current_values) in [("dependencies", deps),
                                              ("outputs", ["", ctx_info["subvariables"][name]...])]
@@ -330,6 +331,8 @@ function build_context_state(state, ctx_info)
         ctx_state[name]["dependencies"] = []
         ctx_state[name]["outputs"] = []
         ctx_state[name]["type"] = :group
+        ctx_state[name]["origin"] = ctx_info["origins"][name]
+        ctx_state[name]["draw_parameters"] = true
         ctx_state[name]["links"] = []
         ctx_state[name]["parameters"] = Dict{String, Any}()
 
@@ -402,6 +405,10 @@ function build_context_state(state, ctx_info)
 
     state.client.context.node_positions = merge(new_positions, state.client.context.node_positions)
 
+    for var_data in values(ctx_state)
+        var_data["renaming"] = false
+    end
+
     return ctx_state
 end
 
@@ -421,40 +428,97 @@ function coffman_graham(dag; W=3)
     return levels
 end
 
-function handle_msg(state, msg)
+function schema_property_names(schema::Dict)
+    props = DeviceProperties()
+    collect_properties!(props, "", schema)
+    slow_order = sortperm(props.slow.names)
+    sorted_slow = PropertyList(props.slow.names[slow_order], props.slow.displayed_names[slow_order],
+                               props.slow.descriptions[slow_order], props.slow.value_types[slow_order])
+    sorted_fast = Dict{String, PropertyList}()
+    for (pipeline, plist) in props.fast
+        order = sortperm(plist.names)
+        sorted_fast[pipeline] = PropertyList(plist.names[order], plist.displayed_names[order],
+                                             plist.descriptions[order], plist.value_types[order])
+    end
+    return DeviceProperties(sorted_slow, sorted_fast)
+end
+
+function collect_properties!(props, prefix, node::Dict, target::PropertyList=props.slow)
+    for (key, value) in node
+        path = isempty(prefix) ? key : "$(prefix).$(key)"
+        if value isa Dict
+            if get(value, "nodeType", "") == "Leaf"
+                push!(target.names, path)
+                push!(target.displayed_names, get(value, "displayedName", ""))
+                push!(target.descriptions, get(value, "description", ""))
+                push!(target.value_types, get(value, "valueType", ""))
+            elseif haskey(value, "noInputShared") && haskey(value, "schema")
+                pipeline_props = get!(props.fast, path, PropertyList())
+                collect_properties!(props, "", value["schema"], pipeline_props)
+            else
+                collect_properties!(props, path, value, target)
+            end
+        end
+    end
+end
+
+function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothing)
     client = state.client
 
     if msg isa Pong
         nothing
-    elseif msg isa AvailableTopics
-        client.available_topics = msg.topics
-        sort!(client.available_topics)
-
-        if !isempty(client.available_topics)
-            set_default_topic(state)
-        end
-    elseif msg isa Started
-        client.context.pipeline_status = PipelineStatus_Started
     elseif msg isa Stopped
         client.context.pipeline_status = PipelineStatus_Stopped
     elseif msg isa Devices
         if msg.device_names isa Exception
             @error "Error from server with DEVICES" exception=msg
+            log_engine_error(state, "Failed to get devices", sprint(showerror, msg.device_names))
             client.webproxy_status = RequestStatus_Error
         else
             client.karabo_devices = msg.device_names
+            client.device_tree = sort(
+                [(topic, sort([(name, sort(collect(info); by=first))
+                               for (name, info) in devices]; by=first))
+                 for (topic, devices) in msg.device_names]; by=first)
+            all_names = [name for (_, devices) in client.device_tree for (name, _) in devices]
+            seen = Set{String}()
+            ambiguous = Set{String}()
+            for name in all_names
+                if name in seen
+                    push!(ambiguous, name)
+                else
+                    push!(seen, name)
+                end
+            end
+            client.source_list = [SourceInfo((topic, name, name in ambiguous))
+                                  for (topic, devices) in client.device_tree
+                                  for (name, _) in devices]
             client.webproxy_status = RequestStatus_Idle
-            client.trainmatchers = filter(x -> occursin("Matcher", x.second["classId"]),
-                                          client.karabo_devices)
         end
     elseif msg isa AvailableTrainmatchers
         client.trainmatchers = msg.topic_trainmatchers
         client.trainmatchers_request_status = RequestStatus_Idle
+
+        # Apply defaults to combo selection indices
+        for (topic, default_tm) in msg.defaults
+            matchers = client.trainmatchers[topic]
+            idx = findfirst(m -> m[1] == default_tm, matchers)
+            if !isnothing(idx)
+                client.trainmatcher_selected_idx[topic] = Ref(Cint(idx - 1))
+            end
+        end
+    elseif msg isa DeviceSchema
+        client.source_properties[(msg.topic, msg.name)] = schema_property_names(msg.schema)
+        delete!(client.device_schema_requests, (msg.topic, msg.name))
     elseif msg isa ContextInfo
         if msg.info isa Dict
             client.context.context_state = build_context_state(state, msg.info)
+            client.context.source = msg.source
+            client.context_path = msg.info["path"]
+            filter!(kv -> haskey(client.context.context_state, kv.first), client.variable_data)
         else
             @error "Context failed to load"
+            log_engine_error(state, "Context failed to load", sprint(showerror, msg.info))
         end
 
         client.context.pipeline_status = msg.is_running ? PipelineStatus_Started : PipelineStatus_Stopped
@@ -498,6 +562,19 @@ function handle_msg(state, msg)
     elseif msg isa RemoteReplState
         client.remoterepl_mode[] = msg.enabled
         client.remoterepl_status = msg.enabled ? RemoteReplStatus_Running : RemoteReplStatus_Stopped
+    elseif msg isa Ack
+        if !isnothing(msg.error)
+            @error "Server reported an error" exception=msg.error
+            log_engine_error(state, "Server reported an error", sprint(showerror, msg.error))
+        end
+
+        if !isnothing(replied_to) && replied_to.msg_type == Start
+            if isnothing(msg.error)
+                client.context.pipeline_status = PipelineStatus_Started
+            else
+                client.context.pipeline_status = PipelineStatus_Stopped
+            end
+        end
     else
         @warn "Received unsupported message of type '$(typeof(msg))'"
     end
@@ -520,18 +597,26 @@ function handle_server(state)
             WebSockets.open("ws://localhost:$(port)") do ws
                 client.websocket = ws
 
-                # The first message we receive is our client ID
+                # The first messages we receive are our client ID and engine directory
                 id = WebSockets.receive(ws)
                 client.client_id = id
+                client.remote_engine_dir = WebSockets.receive(ws)
 
                 client.status = RemoteStatus_Connected
+                get_devices(client)
 
                 for msg_bytes in ws
                     buffer = IOBuffer(msg_bytes)
-                    msg::AbstractMessage = deserialize(buffer)
+                    envelope::Envelope = deserialize(buffer)
+
+                    replied_to = if !isnothing(envelope.reply_to)
+                        pop!(client.pending_requests, envelope.reply_to, nothing)
+                    else
+                        nothing
+                    end
 
                     try
-                        @invokelatest handle_msg(state, msg)
+                        @invokelatest handle_msg(state, envelope.msg, replied_to)
                     catch ex
                         @error "Error handling message!" exception=(ex, catch_backtrace())
                     end
@@ -575,35 +660,30 @@ function handle_server(state)
     end
 end
 
-function get_devices(state)
-    client = state.client
-    send(client.websocket, GetDevices())
-    client.webproxy_status = RequestStatus_Waiting
-    empty!(client.karabo_devices)
-    empty!(client.trainmatchers)
-    empty!(client.trainmatcher_selected_idx)
+function get_devices(client)
+    client.devices_request = send(client, GetDevices())
 end
 
 function get_trainmatchers(client)
-    send(client.websocket, GetTrainmatchers())
+    send(client, GetTrainmatchers())
     client.trainmatchers_request_status = RequestStatus_Waiting
 end
 
 function load_context(state)
     client = state.client
-    send(client.websocket, LoadContext(client.context_path))
+    send(client, LoadContext(client.context_path))
     client.context.pipeline_status = PipelineStatus_LoadingContext
 end
 
 function revise_engine(state)
     client = state.client
     if client.status == RemoteStatus_Connected && !isnothing(client.websocket)
-        send(client.websocket, ReviseCode())
+        send(client, ReviseCode())
     end
 end
 
 function change_parameter(param::Parameter)
-    send(state[].client.websocket, ChangeParameter(param))
+    send(state[].client, ChangeParameter(param))
 end
 
 function start(state)
@@ -612,29 +692,26 @@ function start(state)
         store.update_rate = 0
     end
 
-    send(state.client.websocket, Start())
+    send(state.client, Start())
     state.client.context.pipeline_status = PipelineStatus_Starting
 end
 
 function stop(state)
-    send(state.client.websocket, Stop())
+    send(state.client, Stop())
     state.client.context.pipeline_status = PipelineStatus_Stopping
 end
 
-function set_default_topic(state)
-    client = state.client
-    idx = client.default_topic_idx[] + 1 # Add 1 to go from a C index to a Julia index
-    topic = client.available_topics[idx]
-    send(client.websocket, SetDefaultTopic(topic))
+function set_topic_trainmatcher(client, topic, trainmatcher)
+    client.trainmatcher_set_request = send(client, SetTopicTrainmatcher(topic, trainmatcher))
 end
 
 function set_debug_mode(state)
     client = state.client
-    send(client.websocket, SetDebugMode(client.debug_mode[]))
+    client.debug_mode_request = send(client, SetDebugMode(client.debug_mode[]))
 end
 
 function set_remoterepl(state)
     client = state.client
     client.remoterepl_status = RemoteReplStatus_Changing
-    send(client.websocket, SetRemoteRepl(client.remoterepl_mode[]))
+    send(client, SetRemoteRepl(client.remoterepl_mode[]))
 end

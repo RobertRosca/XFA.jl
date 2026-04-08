@@ -1,34 +1,11 @@
-import Pkg
 import TOML
-using Printf
+using Printf: @sprintf
 
 environment = ENV["XFA_ENVIRONMENT"]
-engine_dir = ENV["XFA_ENGINE_DIR"]
 working_dir = ENV["XFA_WORKING_DIR"]
-julia_binary = ENV["XFA_JULIA_BINARY"]
+julia_binary = joinpath(Sys.BINDIR, "julia")
 
-@info "Bootstrapping..." environment engine_dir working_dir julia_binary
-
-# Install the package
-is_shared_env = startswith(environment, "@")
-Pkg.activate(is_shared_env ? environment[2:end] : environment; shared=is_shared_env)
-proxy = "exflproxy01:3128"
-dependencies = ["Revise", "LoggingFormats", "LoggingExtras", "DistributedNext"]
-
-function init_environment()
-    Pkg.develop(path=joinpath(homedir(), engine_dir))
-    Pkg.add(dependencies)
-    Pkg.instantiate()
-end
-
-if haskey(ENV, "SASE") && endswith(gethostname(), ".desy.de")
-    # If we're on the online cluster, set the proxy so we can connect to the internet
-    withenv("http_proxy" => proxy, "https_proxy" => proxy) do
-        init_environment()
-    end
-else
-    init_environment()
-end
+@info "Bootstrapping..." environment working_dir julia_binary
 
 # Check if a worker file already exists
 toml_path = joinpath(working_dir, "worker-info.toml")

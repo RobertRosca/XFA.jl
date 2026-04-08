@@ -348,12 +348,8 @@ function serialize(data, metadata=nothing)
         for (key, value) in pairs(props)
             # Only treat an array as an 'array' (i.e. to be serialized in
             # zero-copy mode in separate ZMQ messages) if it's of a concrete and
-            # numeric type, it's larger than 500 elements (to avoid the overhead
-            # of another ZMQ message), and it's not Float16 (because MsgPack
-            # doesn't support that).
-            if (value isa AbstractArray && isconcretetype(eltype(value)) &&
-                eltype(value) <: Number && (length(value) > 500 || eltype(value) == Float16))
-
+            # numeric type.
+            if (value isa AbstractArray && isconcretetype(eltype(value)) && eltype(value) <: Number)
                 arrays[key] = value
             else
                 main_data[key] = value
@@ -406,6 +402,14 @@ function deserialize(msgs::Vector{ZMQ.Message})
 
         if content == "msgpack"
             data[source] = MsgPack.unpack(payload)
+            for (name, value) in data[source]
+                if value isa Vector{Any} && !isempty(value)
+                    T = mapreduce(typeof, promote_type, value)
+                    if T !== Any
+                        data[source][name] = Vector{T}(value)
+                    end
+                end
+            end
             meta[source] = get(header, "metadata", Dict())
         elseif content == "array"
             shape = tuple(Int.(header["shape"])...)
@@ -414,7 +418,7 @@ function deserialize(msgs::Vector{ZMQ.Message})
             array = let rank = length(shape)
                 if rank == 1
                     reinterpret(dtype, payload)
-                elseif rank >= 2
+                else
                     # The data coming over the wire is row-major, so at first we
                     # load it into an array with reversed dimensions.
                     reshape(reinterpret(dtype, payload), reverse(shape))
