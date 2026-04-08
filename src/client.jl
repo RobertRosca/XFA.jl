@@ -312,6 +312,8 @@ function build_context_state(state, ctx_info)
         ctx_state[name]["dependencies"] = []
         ctx_state[name]["outputs"] = []
         ctx_state[name]["type"] = :variable
+        ctx_state[name]["origin"] = ctx_info["origins"][name]
+        ctx_state[name]["draw_parameters"] = true
 
         for (value_name, current_values) in [("dependencies", deps),
                                              ("outputs", ["", ctx_info["subvariables"][name]...])]
@@ -329,6 +331,8 @@ function build_context_state(state, ctx_info)
         ctx_state[name]["dependencies"] = []
         ctx_state[name]["outputs"] = []
         ctx_state[name]["type"] = :group
+        ctx_state[name]["origin"] = ctx_info["origins"][name]
+        ctx_state[name]["draw_parameters"] = true
         ctx_state[name]["links"] = []
         ctx_state[name]["parameters"] = Dict{String, Any}()
 

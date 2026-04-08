@@ -142,6 +142,25 @@ function find_downstream_neighbours(ctx::XfaContext, dep_name, T::DataType)
     return neighbours
 end
 
+# Return the origin path for a variable function or group type, stripping the
+# anonymous context module prefix so that context-local definitions are just
+# their name (e.g. "foo") and imported ones keep their module path
+# (e.g. "MyLib.bar").
+function origin_path(x)
+    origin = x isa Function ? variable_origin(x) : x
+    mod = parentmodule(origin)
+    parts = String[]
+    while !startswith(string(nameof(mod)), "XfaContext")
+        pushfirst!(parts, string(nameof(mod)))
+        if mod === parentmodule(mod)
+            break
+        end
+        mod = parentmodule(mod)
+    end
+    push!(parts, string(nameof(origin)))
+    return join(parts, ".")
+end
+
 function to_dict(ctx::XfaContext)
     inputs = Dict{String, Vector{String}}()
     for (name, deps) in ctx.inputs
@@ -150,11 +169,24 @@ function to_dict(ctx::XfaContext)
 
     groups = sort(collect(keys(ctx.groups)))
 
+    origins = Dict{String, String}()
+    for (name, func) in ctx.functions
+        origins[name] = origin_path(func)
+    end
+    for (group_type, _) in ctx.group_types
+        for (name, obj) in ctx.groups
+            if obj isa group_type
+                origins[name] = origin_path(group_type)
+            end
+        end
+    end
+
     return Dict("dag" => ctx.dag,
                 "subvariables" => ctx.subvariables,
                 "parameters" => ctx.parameters,
                 "inputs" => inputs,
                 "groups" => groups,
+                "origins" => origins,
                 "path" => ctx.path)
 end
 

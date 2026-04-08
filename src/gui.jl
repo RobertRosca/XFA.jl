@@ -104,13 +104,13 @@ function draw_main_menubar()
     end
 end
 
-function draw_parameter(name, param::Parameter{Float64})
+function draw_parameter_widget(name, param::Parameter{Float64})
     ret = @c ig.InputDouble(name, &param.value, 0.0, 0.0, "%.3f0", ig.ImGuiInputTextFlags_EnterReturnsTrue)
 
     return ret, param.value
 end
 
-function draw_parameter(name, param::Parameter{Int})
+function draw_parameter_widget(name, param::Parameter{Int})
     int32_value = Int32(param.value)
     @c ig.InputInt(name, &int32_value)
     param.value = Int(int32_value)
@@ -118,24 +118,24 @@ function draw_parameter(name, param::Parameter{Int})
     return false, nothing
 end
 
-function draw_parameter(name, param::Parameter{String})
+function draw_parameter_widget(name, param::Parameter{String})
     SafeInputText(name; current_text=param.value)
 end
 
-function draw_parameter(name, param::Parameter{Vector{String}})
+function draw_parameter_widget(name, param::Parameter{Vector{String}})
     ig.Text("Vector{String}")
 
     return false, nothing
 end
 
-function draw_parameter(name, param::Parameter{KaraboDevice})
+function draw_parameter_widget(name, param::Parameter{KaraboDevice})
     device = param.value
     ig.Text("$(device.name) ($(device.topic))")
 
     return false, nothing
 end
 
-function draw_parameter(name, param::Parameter{Bool})
+function draw_parameter_widget(name, param::Parameter{Bool})
     @c ig.Checkbox(name, &param.value)
 
     return false, nothing
@@ -210,6 +210,157 @@ function get_source_properties(client, device_name)
     end
 end
 
+# Draw a single parameter with appropriate width, and send a change message
+# if modified.
+function draw_parameter(name, param; min_node_width=150)
+    ig.SetNextItemWidth(round(Int, min_node_width * 1.5))
+    modified, new_value = draw_parameter_widget(name, param)
+    if modified
+        change_parameter(Parameter(param.name, new_value))
+    end
+end
+
+# Draw the parameters section of a variable node. Can be called from custom
+# draw_variable_content() methods to include the default parameter UI.
+function draw_parameters(var_data)
+    if haskey(var_data, "parameters")
+        ig.Text("Parameters:")
+        for (param_name, param) in var_data["parameters"]
+            draw_parameter(param_name, param)
+        end
+    end
+end
+
+# Specialize on Val{Symbol("ModulePath.function_name")} to draw custom content
+# inside a variable node. Called after the titlebar and before parameters.
+# Return a gui state object to persist custom state across frames, or nothing.
+draw_variable_content(::Val, name, var_data, gui_state) = nothing
+
+function draw_variable_content(::Val{Symbol("XfaEngine.Context.KaraboBridge")}, name, var_data, gui_state)
+    var_data["draw_parameters"] = false
+    params = var_data["parameters"]
+
+    ig.Text("Parameters:")
+    draw_parameter("trainmatcher", params["trainmatcher"])
+    draw_parameter("manual_configuration", params["manual_configuration"])
+
+    if params["manual_configuration"].value
+        draw_parameter("hostname", params["hostname"])
+        draw_parameter("port", params["port"])
+    end
+
+    return nothing
+end
+
+# Draws a variable node. The node shell (titlebar, dependencies, outputs) is
+# always the same, but draw_variable_content() is called inside to allow
+# custom rendering for specific variables.
+function draw_variable(name, var_data)
+    client = state[].client
+    min_node_width = 150
+    variable_store = get(client.variable_data, name, nothing)
+
+    ImNodes.BeginNode(var_data["id"])
+
+    # Draw titlebar
+    ImNodes.BeginNodeTitleBar()
+    edited, new_name = ElidedText("var-name-$(name)", name; editable=true)
+    if edited
+        @guiasync rename_variable(state[], name, new_name)
+    end
+    ImNodes.EndNodeTitleBar()
+
+    # Draw custom content
+    origin = var_data["origin"]
+    gui_state = get(client.variable_gui_states, name, nothing)
+    new_gui_state = draw_variable_content(Val(Symbol(origin)), name, var_data, gui_state)
+    if !isnothing(new_gui_state) && !haskey(client.variable_gui_states, name)
+        client.variable_gui_states[name] = new_gui_state
+    end
+
+    if var_data["draw_parameters"]
+        draw_parameters(var_data)
+    end
+
+    ig.Dummy(min_node_width, 20)
+
+    # Draw dependencies
+    deps = var_data["dependencies"]
+    for (dep_id, dep_pair) in deps
+        arg_name, dep = dep_pair
+        # Don't draw pins for parameters
+        if dep isa Parameter
+            continue
+        end
+
+        pin_shape = dep isa KaraboDependency ? ImNodes.ImNodesPinShape_TriangleFilled : ImNodes.ImNodesPinShape_CircleFilled
+
+        ImNodes.BeginInputAttribute(dep_id, pin_shape)
+        if dep isa KaraboDependency
+            ig.TextDisabled("Karabo")
+            ig.SameLine()
+            dep_state = get!(client.karabo_dep_states, dep_id, KaraboDepTextState())
+            device_props = if isnothing(dep_state.device)
+                DeviceProperties()
+            else
+                get_source_properties(client, dep_state.device)
+            end
+            disable_dep = client.context.pipeline_status ∉ (PipelineStatus_Stopped, PipelineStatus_Started)
+            @Disabled disable_dep begin
+                edited, new_text = KaraboDepText("dep-$(dep_id)", string(dep), dep_state,
+                                                client.source_list, device_props)
+                if edited
+                    @guiasync rename_karabo_dep(state[], name, arg_name, KaraboDependency(new_text))
+                end
+            end
+        else
+            ig.Text(arg_name)
+        end
+        ImNodes.EndInputAttribute()
+    end
+
+    ig.Dummy(min_node_width, 10)
+
+    ig.TextDisabled("Outputs")
+    if !isnothing(variable_store)
+        ig.SameLine()
+        ig.TextDisabled(@sprintf "%.2f Hz" variable_store.update_rate)
+    end
+    draw_list = ig.GetWindowDrawList()
+    start_pos = ig.GetCursorScreenPos()
+    gray = ig.IM_COL32(100, 100, 100, 255)
+    ig.AddLine(draw_list, start_pos, (start_pos.x + min_node_width / 2f0, start_pos.y), gray, 2)
+    ig.Dummy(min_node_width, 2)
+
+    # Draw outputs
+    for (output_id, output) in var_data["outputs"]
+        label = string(output)
+        output_name = isempty(label) ? name : "$(name).$(label)"
+        ImNodes.BeginOutputAttribute(output_id, ImNodes.ImNodesPinShape_CircleFilled)
+
+        ig.Indent(min_node_width - ig.CalcTextSize(label).x)
+        typestr = get_variable_typeinfo(output_name)
+        if !isempty(typestr)
+            label = isempty(label) ? typestr : "$(label) - $(typestr)"
+        end
+
+        if !isempty(label)
+            if haskey(client.variable_data, output_name)
+                if ig.Button("$(label)###plot_button")
+                    push!(client.plots, Plot(output_name, client.plot_counter))
+                    client.plot_counter += 1
+                end
+            else
+                ig.Text(label)
+            end
+        end
+
+        ImNodes.EndOutputAttribute()
+    end
+
+    ImNodes.EndNode()
+end
+
 function draw_dag()
     client = state[].client
     context = client.context
@@ -277,110 +428,11 @@ function draw_dag()
     for (name, var_data) in ctx_state
         ig.PushID(name)
 
-        min_node_width = 150
-        node_id = var_data["id"]
-        variable_store = get(client.variable_data, name, nothing)
-
-        ImNodes.BeginNode(node_id)
-
-        # Draw titlebar
-        ImNodes.BeginNodeTitleBar()
-        edited, new_name = ElidedText("var-name-$(name)", name; editable=true)
-        if edited
-            @guiasync rename_variable(state[], name, new_name)
-        end
-        ImNodes.EndNodeTitleBar()
-
-        # Draw parameters
-        if haskey(var_data, "parameters")
-            ig.Text("Parameters:")
-            for (param_name, param) in var_data["parameters"]
-                ig.SetNextItemWidth(round(Int, min_node_width * 1.5))
-                modified, new_value = draw_parameter(param_name, param)
-                if modified
-                    change_parameter(Parameter(param.name, new_value))
-                end
-            end
-        end
-
-        ig.Dummy(min_node_width, 20)
-
-        # Draw dependencies
-        deps = var_data["dependencies"]
-        for (dep_id, dep_pair) in deps
-            arg_name, dep = dep_pair
-            # Don't draw pins for parameters
-            if dep isa Parameter
-                continue
-            end
-
-            pin_shape = dep isa KaraboDependency ? ImNodes.ImNodesPinShape_TriangleFilled : ImNodes.ImNodesPinShape_CircleFilled
-
-            ImNodes.BeginInputAttribute(dep_id, pin_shape)
-            if dep isa KaraboDependency
-                ig.TextDisabled("Karabo")
-                ig.SameLine()
-                dep_state = get!(client.karabo_dep_states, dep_id, KaraboDepTextState())
-                device_props = if isnothing(dep_state.device)
-                    DeviceProperties()
-                else
-                    get_source_properties(client, dep_state.device)
-                end
-                edited, new_text = KaraboDepText("dep-$(dep_id)", string(dep), dep_state,
-                                                client.source_list, device_props)
-                if edited
-                    @guiasync rename_karabo_dep(state[], name, arg_name, KaraboDependency(new_text))
-                end
-            else
-                ig.Text(arg_name)
-            end
-            ImNodes.EndInputAttribute()
-        end
-
-        ig.Dummy(min_node_width, 10)
-
-        ig.TextDisabled("Outputs")
-        if !isnothing(variable_store)
-            ig.SameLine()
-            ig.TextDisabled(@sprintf "%.2f Hz" variable_store.update_rate)
-        end
-        draw_list = ig.GetWindowDrawList()
-        start_pos = ig.GetCursorScreenPos()
-        gray = ig.IM_COL32(100, 100, 100, 255)
-        ig.AddLine(draw_list, start_pos, (start_pos.x + min_node_width / 2f0, start_pos.y), gray, 2)
-        ig.Dummy(min_node_width, 2)
-
-        # Draw outputs
-        for (output_id, output) in var_data["outputs"]
-            label = string(output)
-            output_name = isempty(label) ? name : "$(name).$(label)"
-            ImNodes.BeginOutputAttribute(output_id, ImNodes.ImNodesPinShape_CircleFilled)
-
-            ig.Indent(min_node_width - ig.CalcTextSize(label).x)
-            typestr = get_variable_typeinfo(output_name)
-            if !isempty(typestr)
-                label = isempty(label) ? typestr : "$(label) - $(typestr)"
-            end
-
-            if !isempty(label)
-                if haskey(client.variable_data, output_name)
-                    if ig.Button("$(label)###plot_button")
-                        push!(client.plots, Plot(output_name, client.plot_counter))
-                        client.plot_counter += 1
-                    end
-                else
-                    ig.Text(label)
-                end
-            end
-
-            ImNodes.EndOutputAttribute()
-        end
-
-        ImNodes.EndNode()
+        draw_variable(name, var_data)
 
         pos = context.node_positions[name]
         if pos != Point2d(-1, -1)
-            ImNodes.SetNodeGridSpacePos(node_id, (pos.x, pos.y))
+            ImNodes.SetNodeGridSpacePos(var_data["id"], (pos.x, pos.y))
             context.node_positions[name] = Point2d(-1, -1)
         end
 

@@ -247,6 +247,7 @@ EngineLog(message::String, extra_details::Maybe{String}=nothing) = EngineLog(tim
 
     # Variables and plots
     variable_data::Dict{String, VariableStore} = Dict()
+    variable_gui_states::Dict{String, Any} = Dict()
     plot_counter::Int = 0
     plots::Vector{Union{Plot, CorrelationPlot}} = Union{Plot, CorrelationPlot}[]
 
