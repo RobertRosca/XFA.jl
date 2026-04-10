@@ -133,14 +133,23 @@ end
     VariableType_Unknown
 end
 
+const SCALAR_BUFFER_CAPACITY = 10_000
+
 mutable struct VariableStore
     const updates::Channel
-    data::Union{Vector, Matrix, DimVector, DimMatrix}
+    data::Union{Vector, Matrix, DimVector, DimMatrix, CircularBuffer}
     type::VariableType
 
     # This field is only used for non-scalar data. Scalar data is stored as a
-    # DimArray with a train ID.
+    # CircularBuffer with a parallel CircularBuffer for train IDs.
     trainId::Int
+
+    # Train IDs for scalar data, parallel to `data` when it's a CircularBuffer
+    scalar_tids::Maybe{CircularBuffer{Int}}
+
+    # Contiguous caches for plotting scalar CircularBuffer data
+    const scalar_data_cache::Vector{Float64}
+    const scalar_tids_cache::Vector{Float64}
 
     # Timestamps of recent updates for computing average rate (updates/sec)
     const update_timestamps::Vector{Float64}
@@ -148,7 +157,13 @@ mutable struct VariableStore
 end
 
 function VariableStore(data)
-    VariableStore(Channel(100), data, VariableType_Unknown, -1, Float64[], 0.0)
+    VariableStore(Channel(100), data, VariableType_Unknown, -1, nothing,
+                  Float64[], Float64[], Float64[], 0.0)
+end
+
+function VariableStore(data::CircularBuffer, tids::CircularBuffer{Int})
+    VariableStore(Channel(100), data, VariableType_Unknown, -1, tids,
+                  Float64[], Float64[], Float64[], 0.0)
 end
 
 @kwdef mutable struct ContextState
@@ -257,6 +272,7 @@ EngineLog(message::String, extra_details::Maybe{String}=nothing) = EngineLog(tim
 
     # Message tracking
     pending_requests::Dict{Int, PendingRequest} = Dict()
+    engine_request_callbacks::Dict{Int, Function} = Dict()
 
     lock::ReentrantLock = ReentrantLock()
 end

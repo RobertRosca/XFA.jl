@@ -58,7 +58,7 @@ function EditableComboBox(label, text, completions;
     return edited, unsafe_string(pointer(input))
 end
 
-function SafeInputText(label; max_len=63, hint="", current_text="", password=false, reset=false,
+function SafeInputText(label; max_len=127, hint="", current_text="", password=false, reset=false,
                        callback=C_NULL, user_data=C_NULL)
     id = ig.GetID(label)
     if !haskey(safe_input_text_cache, id) || reset
@@ -410,8 +410,8 @@ function CopyButton(label, text)
 end
 
 function RowCopyButton_size()
-    width = ig.CalcTextSize("\uf0c5").x + unsafe_load(ig.GetStyle().FramePadding.x) * 2
-    height = ig.GetFontSize() + 2
+    width = ig.CalcTextSize("\uf0c5").x + 2
+    height = ig.GetFontSize() + 1
 
     width, height
 end
@@ -425,7 +425,7 @@ function RowCopyButton(label, copy_text, popup_width)
     row_min = ig.GetItemRectMin()
     row_max = ig.GetItemRectMax()
     ig.SameLine(popup_width - width - unsafe_load(ig.GetStyle().WindowPadding.x) * 2)
-    if ig.IsMouseHoveringRect(row_min, ImVec2(row_max.x, row_max.y))
+    if ig.IsMouseHoveringRect(row_min, ImVec2(row_min.x + popup_width, row_max.y))
         CopyButton(label, copy_text)
     else
         ig.Dummy(ImVec2(width, height))
@@ -443,8 +443,10 @@ function CopyableCombo(label, items, selected_idx::Ref{Cint})
 
     # AllowOverlap so the copy button overlaid on the preview can receive clicks
     ig.SetNextItemAllowOverlap()
+    combo_w = ig.CalcItemWidth() + ig.GetFrameHeight()
+    ig.SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(combo_w, Cfloat(typemax(Int32))))
     if ig.BeginCombo("##$label", preview)
-        popup_w = ig.GetWindowSize().x
+        popup_w = combo_w
         for (i, name) in enumerate(items)
             ig.SetNextItemAllowOverlap()
             if ig.Selectable("##$label-$i")
@@ -592,7 +594,8 @@ after each call to determine which source's `DeviceProperties` to pass on the
 next frame.
 """
 function KaraboDepText(label, text, dep_state::KaraboDepTextState,
-                       source_list, device_props::DeviceProperties)
+                       source_list, device_props::DeviceProperties;
+                       device_only::Bool=false)
     id = ig.GetID(label)
 
     cb = @cfunction(dep_text_callback, Cint, (Ptr{ig.ImGuiInputTextCallbackData},))
@@ -604,7 +607,8 @@ function KaraboDepText(label, text, dep_state::KaraboDepTextState,
         user_data=pointer_from_objref(dep_state),
         completions=input -> begin
             live_text[] = input
-            items, formatter, query = dep_completions(input, dep_state.cursor_pos,
+            cursor = device_only ? -1 : dep_state.cursor_pos
+            items, formatter, query = dep_completions(input, cursor,
                                                       source_list, device_props)
             renderer = items isa Vector{SourceInfo} ? source_completion_renderer : property_completion_renderer
             (items, formatter, renderer, query)
@@ -624,7 +628,7 @@ function KaraboDepText(label, text, dep_state::KaraboDepTextState,
         has_colon = !isnothing(sep) && new_text[sep] == ':'
         # A complete expression is either "device.property" (dot separator) or
         # "device:pipeline[property]" (colon separator with closing bracket).
-        is_complete = !isnothing(sep) && (!has_colon || endswith(new_text, ']'))
+        is_complete = device_only || !isnothing(sep) && (!has_colon || endswith(new_text, ']'))
         if is_complete
             dep_state.cursor_pos = -1
             dep_state.device = nothing

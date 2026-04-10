@@ -28,6 +28,16 @@ end
 
 GroupDependency(type::DataType) = GroupDependency(nothing, type)
 
+# Represents a dependency that comes from a group parameter. This is used
+# when a group variable's argument references one of its group's Parameter
+# fields (e.g. `@Variable foo(::MyGroup, data -> MyGroup.data_param)`).
+# At load time this is resolved to the actual dependency value held by the
+# parameter.
+struct GroupParameterDependency <: AbstractDependency
+    group_type::String
+    parameter::String
+end
+
 struct KaraboDependency <: AbstractDependency
     topic::Union{String, Nothing}
     source::String
@@ -97,16 +107,22 @@ Helper function to parse the arguments of a function.
 """
 function _parse_function_args(args; is_input=false)
     dependencies = []
+    group_type_name = nothing  # Set when first arg is a GroupDependency
     new_args = [postwalk(arg) do arg_expr
                     if @capture(arg_expr, arg_name_ -> value_)
                         # Strip quote nodes etc
                         value = MacroTools.unblock(value)
 
                         if @capture(value, head_.tail_)
-                            # If it's of the form `head.tail`, that's a
-                            # subvariable and we convert it to a string so it's
-                            # not evaluated.
-                            value = :(Context.SubvariableDependency($("$head"), $("$tail")))
+                            if !isnothing(group_type_name) && "$head" == group_type_name
+                                # Group parameter reference: e.g. MyGroup.data_param
+                                value = :(Context.GroupParameterDependency($("$head"), $("$tail")))
+                            else
+                                # Subvariable reference: e.g. var.subvar
+                                value = :(Context.SubvariableDependency($("$head"), $("$tail")))
+                            end
+                        elseif !isnothing(group_type_name)
+                            throw(ArgumentError("Dependencies of @Group @Variable's must refer to a group parameter (e.g. $(group_type_name).<parameter>) or a subvariable of another group variable, got: $(value)"))
                         elseif value isa AbstractDependency || @capture(value, @karabo_str _)
                             # Keep as-is
                         elseif value isa Symbol
@@ -126,6 +142,7 @@ function _parse_function_args(args; is_input=false)
                         if !is_input || (is_input && i == 1 && length(args) == 2)
                             # If the first argument has a type and no explicit
                             # dependency, then we assume it belongs to a group.
+                            group_type_name = "$T"
                             push!(dependencies, :(($arg_name_expr, Context.GroupDependency($T))))
                         else
                             # Otherwise it's just a regular function argument

@@ -8,8 +8,9 @@ using ModernGL
 
 include("imnodes.jl")
 
-using NaNStatistics: nanmean, nanmaximum, nanminimum
+using NaNStatistics: nanmean, nanmaximum, nanminimum, nanpctile
 using DimensionalData: DimensionalData as DD, DimVector, DimMatrix, DimArray, At, lookup
+using DataStructures: CircularBuffer
 include("plotting.jl")
 
 using LibSSH: LibSSH as ssh
@@ -30,6 +31,7 @@ using XfaEngine.Context: KaraboDependency, Dependency, Parameter, KaraboDevice
 include("state_inspector.jl")
 include("client.jl")
 include("context_edit.jl")
+include("variable_widgets.jl")
 
 import Revise
 
@@ -38,20 +40,6 @@ import .ImNodes
 const state = ScopedValue{GuiState}()
 
 ## Helper functions for the GUI
-
-# function update_device_list(state)
-#     client = state.client.webproxy_client
-#     client.status = WebProxyClientStatus_Connecting
-
-#     try
-#         devices = WebProxy.get_devices(state.webproxy_client)
-#         state.karabo_devices = keys(devices)
-#         client.status = WebProxyClientStatus_Connected
-#     catch ex
-#         client.status = WebProxyClientStatus_Error
-#         client.last_error = Util.exception2str(ex, catch_backtrace())
-#     end
-# end
 
 function draw_revise()
     can_revise = length(Revise.revision_queue) > 0
@@ -129,14 +117,35 @@ function draw_parameter_widget(name, param::Parameter{Vector{String}})
 end
 
 function draw_parameter_widget(name, param::Parameter{KaraboDevice})
+    client = state[].client
+    dep_key = node_hash(param.name)
+    dep_state = get!(client.karabo_dep_states, dep_key, KaraboDepTextState())
+    device_props = if isnothing(dep_state.device)
+        DeviceProperties()
+    else
+        get_source_properties(client, dep_state.device)
+    end
+
     device = param.value
-    ig.Text("$(device.name) ($(device.topic))")
+    text = "$(device.topic)//$(device.name)"
+    edited, new_text = KaraboDepText("param-$(param.name)", text, dep_state,
+                                     client.source_list, device_props; device_only=true)
+    if edited
+        new_device = KaraboDevice(new_text)
+        if isempty(new_device.topic)
+            idx = findfirst(s -> s.name == new_device.name, client.source_list)
+            if !isnothing(idx)
+                new_device = KaraboDevice(client.source_list[idx].topic, new_device.name)
+            end
+        end
+        return true, new_device
+    end
 
     return false, nothing
 end
 
 function draw_parameter_widget(name, param::Parameter{Bool})
-    @c ig.Checkbox(name, &param.value)
+    @c ig.Checkbox("", &param.value)
 
     return false, nothing
 end
@@ -158,6 +167,9 @@ function clear_variables()
     for store in values(client.variable_data)
         if store.data isa AbstractVector
             empty!(store.data)
+        end
+        if !isnothing(store.scalar_tids)
+            empty!(store.scalar_tids)
         end
     end
 
@@ -213,6 +225,8 @@ end
 # Draw a single parameter with appropriate width, and send a change message
 # if modified.
 function draw_parameter(name, param; min_node_width=150)
+    ig.Text(name * ":")
+    ig.SameLine()
     ig.SetNextItemWidth(round(Int, min_node_width * 1.5))
     modified, new_value = draw_parameter_widget(name, param)
     if modified
@@ -236,22 +250,6 @@ end
 # Return a gui state object to persist custom state across frames, or nothing.
 draw_variable_content(::Val, name, var_data, gui_state) = nothing
 
-function draw_variable_content(::Val{Symbol("XfaEngine.Context.KaraboBridge")}, name, var_data, gui_state)
-    var_data["draw_parameters"] = false
-    params = var_data["parameters"]
-
-    ig.Text("Parameters:")
-    draw_parameter("trainmatcher", params["trainmatcher"])
-    draw_parameter("manual_configuration", params["manual_configuration"])
-
-    if params["manual_configuration"].value
-        draw_parameter("hostname", params["hostname"])
-        draw_parameter("port", params["port"])
-    end
-
-    return nothing
-end
-
 # Draws a variable node. The node shell (titlebar, dependencies, outputs) is
 # always the same, but draw_variable_content() is called inside to allow
 # custom rendering for specific variables.
@@ -260,6 +258,7 @@ function draw_variable(name, var_data)
     min_node_width = 150
     variable_store = get(client.variable_data, name, nothing)
 
+    ig.PushID(name)
     ImNodes.BeginNode(var_data["id"])
 
     # Draw titlebar
@@ -359,6 +358,7 @@ function draw_variable(name, var_data)
     end
 
     ImNodes.EndNode()
+    ig.PopID()
 end
 
 function draw_dag()
@@ -636,11 +636,21 @@ function draw_plots()
             push!(new_tids, tid)
             store.type = type
             if x isa Number
-                push!(array, x, (; trainId=tid))
+                push!(array, x)
+                push!(store.scalar_tids, tid)
             elseif x isa AbstractArray
                 store.data = x
                 store.trainId = tid
             end
+        end
+
+        # Update contiguous caches for scalar data so plotting doesn't allocate
+        if !isnothing(store.scalar_tids)
+            n = length(store.data)
+            resize!(store.scalar_data_cache, n)
+            resize!(store.scalar_tids_cache, n)
+            copyto!(store.scalar_data_cache, store.data)
+            copyto!(store.scalar_tids_cache, store.scalar_tids)
         end
 
         updated_variables[name] = new_tids
@@ -652,8 +662,7 @@ function draw_plots()
             draw_plot(plot, client.variable_data, updated_variables)
         else
             store = get(client.variable_data, plot.name, nothing)
-            data = isnothing(store) ? nothing : store.data
-            draw_plot(plot, data, !isnothing(store) && haskey(updated_variables, plot.name))
+            draw_plot(plot, store, !isnothing(store) && haskey(updated_variables, plot.name))
         end
     end
 

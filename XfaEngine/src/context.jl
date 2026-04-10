@@ -19,6 +19,12 @@ function variable_dependencies end
 function input_dependencies end
 function group_fields end
 variable_subvariables(_) = String[]
+
+# Returns the topic served by an input group, or nothing for generic inputs
+input_topic(::Any) = nothing
+
+# Returns the sources available from an input group
+get_sources(::Any) = String[]
 # For variable references (@Variable name -> MyLib.func), returns the
 # original function. Used to exclude origin functions from the context
 # when they are already represented by a reference wrapper.
@@ -74,6 +80,8 @@ end
     input_tasks::Dict{String, Task} = Dict()
     available_sources::Dict{String, Vector{String}} = Dict()
 
+    dep_to_input::Dict{String, String} = Dict()
+
     input_variable_channels::Dict{String, Dict{String, RemoteChannel}} = Dict()
     input_variables_tasks::Dict{String, Task} = Dict()
 
@@ -121,6 +129,75 @@ function external_dependencies(ctx::XfaContext; per_variable=false)
     end
 
     return per_variable ? deps_per_variable : unique(all_deps)
+end
+
+# Returns the group object for an input, or nothing if it has no group.
+function get_input_group(ctx::XfaContext, input_name)
+    for (_, dep) in ctx.inputs[input_name]
+        if dep isa GroupDependency
+            return ctx.groups[dep.name]
+        end
+    end
+    return nothing
+end
+
+# Build a mapping from external dependency name -> input name.
+# Routing priority:
+# 1. Topic match: dep has a topic, input group's input_topic() matches
+# 2. Source match: dep's source is in the input group's get_sources() result
+# 3. Single input fallback: only one input exists
+function build_dep_routing(ctx::XfaContext)
+    dep_to_input = Dict{String, String}()
+    deps = external_dependencies(ctx)
+
+    if isempty(ctx.inputs) || isempty(deps)
+        return dep_to_input
+    end
+
+    # Build topic -> input name map and sources -> input name map
+    topic_map = Dict{String, String}()
+    source_map = Dict{String, String}()
+    for (input_name, _) in ctx.inputs
+        group = get_input_group(ctx, input_name)
+        isnothing(group) && continue
+
+        topic = input_topic(group)
+        if !isnothing(topic)
+            topic_map[topic] = input_name
+        end
+
+        for source in get_sources(group)
+            source_map[source] = input_name
+        end
+    end
+
+    for dep in deps
+        dep_name = string(dep)
+
+        # 1. Topic match
+        if !isnothing(dep.topic) && haskey(topic_map, dep.topic)
+            dep_to_input[dep_name] = topic_map[dep.topic]
+            continue
+        end
+
+        # 2. Source match
+        if haskey(source_map, dep.source)
+            dep_to_input[dep_name] = source_map[dep.source]
+            continue
+        end
+
+        # 3. Single input fallback
+        if length(ctx.inputs) == 1
+            dep_to_input[dep_name] = first(keys(ctx.inputs))
+            continue
+        end
+
+        throw(XfaContextException("Cannot determine which input serves dependency '$(dep_name)'. " *
+                                  "Use a topic prefix (e.g. karabo\"TOPIC//$(dep_name)\") or ensure " *
+                                  "the source is available from one of the inputs."))
+    end
+
+    return dep_to_input
 end
 
 # Returns the name used to match a dependency against a variable name.
@@ -187,6 +264,7 @@ function to_dict(ctx::XfaContext)
                 "inputs" => inputs,
                 "groups" => groups,
                 "origins" => origins,
+                "dep_to_input" => ctx.dep_to_input,
                 "path" => ctx.path)
 end
 
@@ -502,17 +580,20 @@ function declare_sources(input_name, new_sources)
     current_ctx.available_sources[input_name] = new_sources
 
     pause_pipeline() do
+        update_input_sources(current_ctx)
     end
 end
 
 function update_input_sources(ctx::XfaContext)
     deps = external_dependencies(ctx)
-    sources = [occursin(':', dep.source) ? dep.source : string(dep) for dep in deps]
-    group_dependency = only(values(only(values(ctx.inputs))))
-    for (group_name, group) in ctx.groups
-        if group isa group_dependency.type
-            update_sources(group, sources)
-        end
+    for (input_name, _) in ctx.inputs
+        group = get_input_group(ctx, input_name)
+        isnothing(group) && continue
+
+        input_deps = [dep for dep in deps
+                      if get(ctx.dep_to_input, string(dep), nothing) == input_name]
+        sources = [dep.source for dep in input_deps]
+        update_sources(group, sources)
     end
 end
 
@@ -534,6 +615,14 @@ function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50)
 
     global current_ctx = ctx
 
+    # Verify all external deps are routed to an input
+    unrouted = [string(dep) for dep in external_dependencies(ctx)
+                if !haskey(ctx.dep_to_input, string(dep))]
+    if !isempty(unrouted)
+        throw(XfaContextException("Cannot start pipeline: the following external dependencies have " *
+                                  "no input: $(join(unrouted, ", "))"))
+    end
+
     # Start the input functions to feed the DAG
     for (name, deps) in ctx.inputs
         group = nothing
@@ -551,11 +640,15 @@ function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50)
         errormonitor(ctx.input_tasks[name])
     end
 
-    # Start the input variables
+    # Start the input variables, each with downstream channels only for
+    # the external deps routed to that input.
     for name in keys(ctx.inputs)
         downstream_neighbours = Dict{String, RemoteChannel}()
         for dep in external_dependencies(ctx)
-            downstream_neighbours[string(dep)] = RemoteChannel()
+            dep_name = string(dep)
+            if get(ctx.dep_to_input, dep_name, nothing) == name
+                downstream_neighbours[dep_name] = RemoteChannel()
+            end
         end
         ctx.input_variable_channels[name] = downstream_neighbours
 
@@ -567,7 +660,7 @@ function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50)
     unique_external_deps = external_dependencies(ctx)
     for dep in unique_external_deps
         dep_name = string(dep)
-        input_name = only(keys(ctx.inputs))
+        input_name = ctx.dep_to_input[dep_name]
         input_channel = ctx.input_variable_channels[input_name][dep_name]
         input_neighbour = Neighbour(input_name, input_channel)
 
@@ -897,6 +990,25 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr})
                                 argument_names)
             dag_deps[argument_names[arg_idx]] = GroupDependency(group_name, group_type)
 
+            # Resolve GroupParameterDependency entries by looking up the
+            # parameter value from the instantiated group.
+            for (arg_name, dep) in dag_deps
+                if dep isa GroupParameterDependency
+                    param_field = Symbol(dep.parameter)
+                    if !hasfield(group_type, param_field) || !(fieldtype(group_type, param_field) <: Parameter)
+                        throw(XfaContextException("'$(dep.parameter)' is not a Parameter field of $(nameof(group_type))"))
+                    end
+                    param = getproperty(object, param_field)
+                    if isnothing(param.value)
+                        throw(XfaContextException("Parameter '$(dep.parameter)' of group '$(group_name)' has no value"))
+                    end
+                    if !(param.value isa AbstractDependency)
+                        throw(XfaContextException("Parameter '$(dep.parameter)' of group '$(group_name)' must hold a Dependency or KaraboDependency value"))
+                    end
+                    dag_deps[arg_name] = param.value
+                end
+            end
+
             func_name = string(nameof(variable_func))
             group_var_name = "$group_name.$func_name"
             dag[group_var_name] = dag_deps
@@ -968,9 +1080,11 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr})
         worker_state.task_locks[name] = ReentrantLock()
     end
 
-    return XfaContext(; functions, group_types, groups, dag,
-                      subvariables=ctx_subvariables, parameters, exprs,
-                      inputs)
+    ctx = XfaContext(; functions, group_types, groups, dag,
+                     subvariables=ctx_subvariables, parameters, exprs,
+                     inputs)
+    ctx.dep_to_input = build_dep_routing(ctx)
+    return ctx
 end
 
 function load_from_file(ctx_path::AbstractString)

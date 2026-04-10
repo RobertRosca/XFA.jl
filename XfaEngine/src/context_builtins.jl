@@ -7,28 +7,48 @@ struct KaraboDevice
     name::String
 end
 
-@Group struct KaraboBridge
+# Parse a KaraboDevice from a string, which may contain a topic prefix
+# (e.g. "TOPIC//device_name").
+function KaraboDevice(str::AbstractString)
+    m = match(Context.topic_prefix_re, str)
+    if !isnothing(m)
+        return KaraboDevice(m.captures[1], m.captures[2])
+    end
+    return KaraboDevice("", str)
+end
+
+@Group mutable struct KaraboBridge
     manual_configuration::Parameter{Bool}
     trainmatcher::Parameter{KaraboDevice}
-    hostname::Parameter{String}
-    port::Parameter{Int}
+    address::Parameter{String}
 
     sources::Vector{String}
+
+    # Internal field for testing: when set, get_sources() returns this
+    # instead of querying the WebProxy.
+    _mock_sources::Union{Vector{String}, Nothing}
 end
 
-function KaraboBridge(hostname, port, sources=String[])
-    KaraboBridge(Parameter(false), Parameter(KaraboDevice("", "")),
-                 Parameter(hostname), Parameter(port), sources)
+function KaraboBridge(device::KaraboDevice; sources=String[], address="")
+    KaraboBridge(Parameter(false), Parameter(device),
+                 Parameter(address), sources, nothing)
 end
 
-KaraboBridge(trainmatcher) = KaraboBridge(Parameter(false), Parameter(trainmatcher),
-                                          Parameter(""), Parameter(-1), String[])
-
+input_topic(bridge::KaraboBridge) = let t = bridge.trainmatcher[].topic; isempty(t) ? nothing : t end
 
 function get_sources(bridge::KaraboBridge)
-    wp = XfaEngine.get_webproxy(bridge.trainmatcher[])
-    devices = XfaEngine.get_devices(wp)
-    return collect(keys(devices))
+    if !isnothing(bridge._mock_sources)
+        return bridge._mock_sources
+    end
+
+    try
+        wp = XfaEngine.get_webproxy(bridge.trainmatcher[])
+        devices = XfaEngine.get_devices(wp)
+        return collect(keys(devices))
+    catch ex
+        @error "Failed to get sources from KaraboBridge" exception=(ex, catch_backtrace())
+        return String[]
+    end
 end
 
 function update_sources(bridge::KaraboBridge, sources)
@@ -41,18 +61,31 @@ function update_sources(bridge::KaraboBridge, sources)
 end
 
 @Input function stream(bridge::KaraboBridge, output)
-    address = ""
-    if bridge.manual_configuration[]
-        address = "tcp://$(bridge.hostname[]):$(bridge.port[])"
-    else
+    if !bridge.manual_configuration[]
         declare_sources(Meta.name[], get_sources(bridge))
 
-        # Get the output list
-        config = XfaEngine.get_config(bridge.trainmatcher[])
-        address = config["zmqOutputs"][1]["address"]
+        # If no address is set, pick the first available one from the trainmatcher
+        if isempty(bridge.address[])
+            config = XfaEngine.get_config(bridge.trainmatcher[])
+            outputs = config["zmqOutputs"]
+            isempty(outputs) && error("No ZMQ outputs available from trainmatcher")
+            bridge.address.value = outputs[1]["address"]
+
+            # Notify clients of the new address
+            engine_state = XfaEngine.current_engine_state
+            if !isnothing(engine_state)
+                for client in values(engine_state.clients)
+                    XfaEngine.Protocol.server_send(client.websocket,
+                                                   XfaEngine.ParameterChanged(bridge.address))
+                end
+            end
+        end
     end
 
-    client = KaraboBridgeClient(address)
+    if isempty(bridge.address[])
+        error("No address configured for KaraboBridge")
+    end
+    client = KaraboBridgeClient(bridge.address[])
 
     # Start a task just to read from the bridge. Note that this is separate from
     # the task to put it into the output channel to avoid a race condition where

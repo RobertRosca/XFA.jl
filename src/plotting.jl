@@ -569,7 +569,7 @@ function apply_autoscale(plot)
     end
 end
 
-function draw_plot(plot::Plot, data::Nothing, was_updated)
+function draw_plot(plot::Plot, store::Nothing, was_updated)
     ig.SetNextWindowSize((800, 500), ig.ImGuiCond_FirstUseEver)
 
     if ig.Begin(plot.id, plot.open)
@@ -580,24 +580,37 @@ function draw_plot(plot::Plot, data::Nothing, was_updated)
     ig.End()
 end
 
-function draw_plot(plot::Plot, data, was_updated)
+function draw_plot(plot::Plot, store, was_updated)
     ig.SetNextWindowSize((800, 500), ig.ImGuiCond_FirstUseEver)
 
+    data = store.data
     if ig.Begin(plot.id, plot.open)
         plot.dock_id = ig.GetWindowDockID()
         is_dimarray = data isa DimArray
+        is_scalar = data isa CircularBuffer
         data_dims = is_dimarray ? DD.dims(data) : nothing
-        xlabel = is_dimarray ? DD.label(data_dims[1]) : ""
+        xlabel = is_dimarray ? DD.label(data_dims[1]) : is_scalar ? "trainId" : ""
         label = is_dimarray ? DD.label(data) : plot.name
 
         apply_autoscale(plot)
 
         region_avail = ig.GetContentRegionAvail()
         plot_size = ImVec2(region_avail.x, max(region_avail.y - 30, 100))
+        no_data = length(data) == 0
 
-        if data isa AbstractVector
+        if no_data
+            ig.Text("Array has length 0, nothing to plot")
+        elseif data isa AbstractVector
             if ImPlot.BeginPlot(plot.id, xlabel, "", plot_size)
-                if length(data) == 1
+                if is_scalar
+                    tids = store.scalar_tids_cache
+                    vals = store.scalar_data_cache
+                    if length(vals) == 1
+                        ImPlot.PlotScatter(label, tids, vals)
+                    else
+                        ImPlot.PlotLine(label, tids, vals)
+                    end
+                elseif length(data) == 1
                     if is_dimarray
                         ImPlot.PlotScatter(label, parent(lookup(data)[1]), parent(data))
                     else
@@ -625,32 +638,63 @@ function draw_plot(plot::Plot, data, was_updated)
             gpu = plot.gpu_heatmap
 
             # Update colormap if needed (use Viridis as default, index 4)
-            update_colormap!(ctx, Int(ImPlot.ImPlotColormap_Viridis))
+            update_colormap!(ctx, ImPlot.ImPlotColormap_Viridis)
 
             if was_updated || needs_initial_upload
                 upload_data!(gpu, data)
-                dmin = nanminimum(data)
+                dmin = nanpctile(data, 1)
                 dmin = !isfinite(dmin) ? 1.0 : dmin
-                dmax = nanmaximum(data)
+                dmax = nanpctile(data, 99)
                 dmax = !isfinite(dmax) ? 1.0 : dmax
+                gpu.scale_min = dmin
+                gpu.scale_max = dmax
                 render_colormapped!(gpu, ctx, dmin, dmax)
             end
 
+            # Reserve space for the colorbar on the right
+            colorbar_width = 100
+            plot_width = max(plot_size.x - colorbar_width, 100)
+
             plot_flags = plot.fixed_aspect[] ? ImPlot.ImPlotFlags_Equal : ImPlot.ImPlotFlags_None
-            if ImPlot.BeginPlot(plot.id, plot_size, plot_flags)
+            if ImPlot.BeginPlot(plot.id, ImVec2(plot_width, plot_size.y), plot_flags)
                 tex_ref = ig.ImTextureRef(ig.ImTextureID(gpu.output_tex))
                 ImPlot.PlotImage("", tex_ref,
                                  ImPlot.ImPlotPoint(0, rows),
                                  ImPlot.ImPlotPoint(cols, 0))
+
+                # Show pixel coordinates and intensity when hovering
+                if ImPlot.IsPlotHovered()
+                    mouse = ImPlot.GetPlotMousePos()
+                    col = floor(Int, mouse.x) + 1
+                    row = rows - floor(Int, mouse.y)
+                    if 1 <= col <= rows && 1 <= row <= cols
+                        val = data[col, row]
+                        ImPlot.AnnotationClamped(mouse.x, mouse.y,
+                                                 ImVec2(10, -10),
+                                                 "[$col, $row] $val")
+                    end
+                end
+
                 check_plot_interaction!(plot)
                 ImPlot.EndPlot()
             end
+
+            ig.SameLine()
+            ImPlot.ColormapScale("##colorbar_$(plot.id)",
+                                 gpu.scale_min, gpu.scale_max,
+                                 ImVec2(colorbar_width, plot_size.y),
+                                 "%g",
+                                 ImPlot.ImPlotColormapScaleFlags_None,
+                                 ImPlot.ImPlotColormap_Viridis)
         end
 
-        autoscale_buttons(plot)
-        if data isa AbstractMatrix
-            ig.SameLine()
-            ig.Checkbox("Fixed aspect", plot.fixed_aspect)
+        if !no_data
+            autoscale_buttons(plot)
+
+            if data isa AbstractMatrix
+                ig.SameLine()
+                ig.Checkbox("Fixed aspect", plot.fixed_aspect)
+            end
         end
     end
 
@@ -788,8 +832,6 @@ function draw_plot(plot::CorrelationPlot, variable_data, updated_variables)
             y_name = plot.variable_names[plot.y_var[] + 1]
             x = variable_data[x_name]
             y = variable_data[y_name]
-            x_dimarray = x.data isa DimArray
-            y_dimarray = y.data isa DimArray
 
             if x.type != y.type
                 ig.Text("Both variables must have the same type to correlate against each other.")
@@ -804,9 +846,11 @@ function draw_plot(plot::CorrelationPlot, variable_data, updated_variables)
                         end
 
                         for tid in new_tids
-                            if tid in lookup(x.data, :trainId) && tid in lookup(y.data, :trainId)
-                                push!(plot.x_data, x.data[trainId=At(tid)])
-                                push!(plot.y_data, y.data[trainId=At(tid)])
+                            xi = findfirst(==(tid), x.scalar_tids)
+                            yi = findfirst(==(tid), y.scalar_tids)
+                            if !isnothing(xi) && !isnothing(yi)
+                                push!(plot.x_data, x.data[xi])
+                                push!(plot.y_data, y.data[yi])
                             end
                         end
                     end

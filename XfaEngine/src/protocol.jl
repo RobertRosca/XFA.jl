@@ -3,6 +3,7 @@ module Protocol
 export AbstractMessage, Ping, Shutdown,
     GetDevices, GetTrainmatchers, SetTopicTrainmatcher, LoadContext, ReviseCode,
     GetDeviceSchema, DeviceSchema,
+    GetDeviceProperty, DeviceProperty,
     ChangeParameter, Start, Stop,
     SetDebugMode, SetRemoteRepl,
     Pong, AvailableTrainmatchers,
@@ -32,6 +33,12 @@ GetDevices() = GetDevices(nothing)
 struct GetDeviceSchema <: AbstractMessage
     topic::String
     name::String
+end
+
+struct GetDeviceProperty <: AbstractMessage
+    topic::String
+    device::String
+    property::String
 end
 
 struct LoadContext <: AbstractMessage
@@ -81,6 +88,13 @@ struct DeviceSchema <: AbstractMessage
     topic::String
     name::String
     schema::Dict{String, Dict}
+end
+
+struct DeviceProperty <: AbstractMessage
+    topic::String
+    device::String
+    property::String
+    value::Any
 end
 
 struct ContextInfo <: AbstractMessage

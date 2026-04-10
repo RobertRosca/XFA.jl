@@ -14,7 +14,7 @@ using OrderedCollections: OrderedDict as OD
 
 using XfaEngine: XfaEngine, Context, KaraboBridge, Protocol
 using XfaEngine.Context: @Variable, @karabo_str, VariableData, Dependency, KaraboDependency,
-    GroupDependency, SubvariableDependency, XfaContextException, Parameter, FunctionArgument, KaraboDevice
+    GroupDependency, GroupParameterDependency, SubvariableDependency, XfaContextException, Parameter, FunctionArgument, KaraboDevice
 using XfaEngine.KaraboBridge: KaraboBridgeClient, KaraboBridgeServer, ThreadsafeSocket
 
 
@@ -694,12 +694,42 @@ end
     """)
     @test ctx.dag["bar"] == OD("data" => Context.Dependency("foo_group.foo"))
 
+    # Test that group variable dependencies must reference group parameters
+    @test_throws ArgumentError Context._variable(@__MODULE__, :(function bar(::Foo, data -> karabo"motor1.pos") data end), false)
+    @test_throws ArgumentError Context._variable(@__MODULE__, :(function bar(::Foo, data -> some_var) data end), false)
+
+    # Test GroupParameterDependency resolution
+    ctx = Context.load_from_string(raw"""
+    @Group mutable struct Foo
+        source::Parameter{Context.KaraboDependency}
+    end
+
+    @Variable function foo(group::Foo, data -> Foo.source)
+        data
+    end
+
+    foo_group = Foo(Parameter(karabo"motor1.pos"))
+    """)
+    @test ctx.dag["foo_group.foo"] == OD("group" => GroupDependency("foo_group", only(filter(x -> nameof(x) == :Foo, keys(ctx.group_types)))),
+                                         "data" => karabo"motor1.pos")
+
+    # Test that referencing a non-existent parameter throws
+    @test_throws XfaContextException Context.load_from_string(raw"""
+    @Group mutable struct Foo end
+
+    @Variable function foo(group::Foo, data -> Foo.nonexistent)
+        data
+    end
+
+    foo_group = Foo()
+    """)
+
     # Test instantiating groups from other modules
     helper_file_path = joinpath(@__DIR__, "dummy_variables.jl")
     ctx = Context.load_from_string("""
     Base.include(@__MODULE__, "$(helper_file_path)")
 
-    bridge = KaraboBridge("foo", 1, String[])
+    bridge = KaraboBridge(KaraboDevice("MATCHER"))
 
     foo = DummyVariables.Foo(Parameter(1))
     """)
@@ -907,15 +937,17 @@ end
 
         @Group struct Foo
             x::Parameter{Int}
+            source::Parameter{Context.KaraboDependency}
         end
 
-        @Variable function bar(group::Foo, data -> karabo"motor1.pos")
+        @Variable function bar(group::Foo, data -> Foo.source)
             return group.x[] + data
         end
 
-        foo = Foo(Parameter(1))
+        foo = Foo(Parameter(1), Parameter(karabo"motor1.pos"))
         """)
-        @test only(keys(ctx.parameters)) == "foo.x"
+        @test "foo.x" ∈ keys(ctx.parameters)
+        @test "foo.source" ∈ keys(ctx.parameters)
         Context.run(ctx) do
             @test timedwait(() -> !isopen(ctx.stream_output), 5) == :ok
         end
@@ -1018,17 +1050,94 @@ end
             @test Context.worker_state.current_ctx_module.x_side_effect == 1
         end
     end
+
+    @testset "Multiple inputs" begin
+        # Two inputs with different topics, deps routed by topic
+        ctx = Context.load_from_string(raw"""
+        @Group struct TopicA end
+        Context.update_sources(::TopicA, _) = nothing
+        Context.input_topic(::TopicA) = "SA2"
+
+        @Group struct TopicB end
+        Context.update_sources(::TopicB, _) = nothing
+        Context.input_topic(::TopicB) = "MID"
+
+        @Input function sa2_input(::TopicA, output)
+            put!(output, (0, Dict("SA2_DEVICE" => Dict("val" => 10))))
+        end
+
+        @Input function mid_input(::TopicB, output)
+            put!(output, (0, Dict("MID_DEVICE" => Dict("val" => 20))))
+        end
+
+        a = TopicA()
+        b = TopicB()
+
+        @Variable sa2_data -> karabo"SA2//SA2_DEVICE.val"
+        @Variable mid_data -> karabo"MID//MID_DEVICE.val"
+        """)
+        @test ctx.dep_to_input["SA2//SA2_DEVICE.val"] == "a.sa2_input"
+        @test ctx.dep_to_input["MID//MID_DEVICE.val"] == "b.mid_input"
+
+        Context.run(ctx) do
+            @test timedwait(() -> !isopen(ctx.stream_output), 5) == :ok
+        end
+        results = Dict{String, Any}()
+        while isready(ctx.stream_output)
+            r = take!(ctx.stream_output)
+            results[r.name] = r.data
+        end
+        @test results["sa2_data"] == 10
+        @test results["mid_data"] == 20
+
+        # Two inputs with topics, dep without a topic should error
+        @test_throws XfaContextException Context.load_from_string(raw"""
+        @Group struct TopicA2 end
+        Context.update_sources(::TopicA2, _) = nothing
+        Context.input_topic(::TopicA2) = "SA2"
+
+        @Group struct TopicB2 end
+        Context.update_sources(::TopicB2, _) = nothing
+        Context.input_topic(::TopicB2) = "MID"
+
+        @Input function sa2_input(::TopicA2, output) end
+        @Input function mid_input(::TopicB2, output) end
+
+        a = TopicA2()
+        b = TopicB2()
+
+        @Variable foo -> karabo"unknown_device.val"
+        """)
+
+        # Test that single-input contexts still work without topics
+        ctx = Context.load_from_string(raw"""
+        @Input function input(::Context.MockInput, output)
+            put!(output, (0, Dict("motor" => Dict("pos" => 42))))
+        end
+        x = Context.MockInput()
+
+        @Variable motor_pos -> karabo"motor.pos"
+        """)
+        @test only(values(ctx.dep_to_input)) == "x.input"
+        Context.run(ctx) do
+            @test timedwait(() -> !isopen(ctx.stream_output), 5) == :ok
+        end
+        @test take!(ctx.stream_output) == VariableData(0, "motor_pos", 42)
+    end
 end
 
 @testset "Context builtins" begin
     @testset "KaraboBridge" begin
         port = getavailableport(42000)
-        bridge_server = KaraboBridgeServer("tcp://localhost:$(port)")
+        address = "tcp://localhost:$(port)"
+        bridge_server = KaraboBridgeServer(address)
         KaraboBridge.startbridge(bridge_server)
 
         ctx = Context.load_from_string("""
-        bridge = KaraboBridge("localhost", $(port), ["foo.x"])
+        bridge = KaraboBridge(KaraboDevice("MATCHER"); sources=["foo.x"])
+        bridge._mock_sources = String[]
         bridge.manual_configuration[] = true
+        bridge.address[] = "$(address)"
 
         @Variable foo -> karabo"foo.x"
         """)
@@ -1071,19 +1180,20 @@ end
 
 @testset "Serialization" begin
     ctx = Context.load_from_string(raw"""
-    bridge = KaraboBridge("", 45000)
+        bridge = KaraboBridge(KaraboDevice(""))
+        bridge._mock_sources = String[]
 
-    period = Parameter(2π)
+        period = Parameter(2π)
 
-    @Variable xgm -> karabo"xgm.intensity"
+        @Variable xgm -> karabo"xgm.intensity"
 
-    @Variable function foo() 42 end
+        @Variable function foo() 42 end
 
-    @Variable function bar(data -> xgm)
-        @add_subvariable("max_data", max(data))
-        mean(data)
-    end
-    """)
+        @Variable function bar(data -> xgm)
+            @add_subvariable("max_data", max(data))
+            mean(data)
+        end
+        """)
 
     @test Context.to_dict(ctx) == Dict("inputs" => Dict("bridge.stream" => ["bridge"]),
                                        "groups" => ["bridge"],
@@ -1099,10 +1209,10 @@ end
                                                          "bridge" => "XfaEngine.Context.KaraboBridge",
                                                          "bridge.stream" => "XfaEngine.Context.stream"),
                                        "parameters" => Dict("period" => Parameter("period", 2π),
-                                                            "bridge.hostname" => Parameter("bridge.hostname", ""),
-                                                            "bridge.port" => Parameter("bridge.port", 45000),
+                                                            "bridge.address" => Parameter("bridge.address", ""),
                                                             "bridge.trainmatcher" => Parameter("bridge.trainmatcher", KaraboDevice("", "")),
                                                             "bridge.manual_configuration" => Parameter("bridge.manual_configuration", false)),
+                                       "dep_to_input" => Dict("xgm.intensity" => "bridge.stream"),
                                        "path" => "")
 end
 

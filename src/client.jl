@@ -17,6 +17,14 @@ function is_pending(client::ClientState, id::Union{MessageId, Nothing})
     !isnothing(id) && haskey(client.pending_requests, id)
 end
 
+# Send a request to the engine with a callback that will be executed when the
+# response arrives. Returns the message ID.
+function send_with_callback(client::ClientState, msg::AbstractMessage, callback::Function)
+    id = send(client, msg)
+    client.engine_request_callbacks[id] = callback
+    return id
+end
+
 function peekall(buffer::IOBuffer)
     return String(take!(copy(buffer)))
 end
@@ -379,7 +387,7 @@ function build_context_state(state, ctx_info)
 
                 push!(node_dag[name], dep.name)
             elseif dep isa KaraboDependency
-                input_name = only(keys(ctx_info["inputs"]))
+                input_name = ctx_info["dep_to_input"][string(dep)]
                 link_start_id = node_hash(input_name)
                 link_id = node_hash("$(link_start_id)->$(link_end_id)")
                 push!(new_links, (link_id, link_start_id, link_end_id))
@@ -462,6 +470,45 @@ function collect_properties!(props, prefix, node::Dict, target::PropertyList=pro
     end
 end
 
+# Store or update a VariableStore for a given variable/subvariable.
+function store_variable_data!(client, name, tid, data)
+    if !haskey(client.variable_data, name)
+        if data isa Number
+            values = CircularBuffer{Float64}(SCALAR_BUFFER_CAPACITY)
+            tids = CircularBuffer{Int}(SCALAR_BUFFER_CAPACITY)
+            push!(values, data)
+            push!(tids, tid)
+            client.variable_data[name] = VariableStore(values, tids)
+        elseif data isa AbstractArray
+            client.variable_data[name] = VariableStore(data)
+        else
+            @error "Unsupported variable type: $(typeof(data))"
+            return
+        end
+    end
+
+    store = client.variable_data[name]
+    type = if data isa Number
+        VariableType_Scalar
+    elseif data isa AbstractVector
+        VariableType_Vector
+    elseif data isa AbstractArray
+        VariableType_Array
+    else
+        VariableType_Unknown
+    end
+    push!(store.updates, (tid, data, type))
+
+    ts = store.update_timestamps
+    push!(ts, time())
+    if length(ts) > 100
+        popfirst!(ts)
+    end
+    if length(ts) >= 2
+        store.update_rate = 1 / nanmean(diff(ts))
+    end
+end
+
 function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothing)
     client = state.client
 
@@ -510,6 +557,8 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
     elseif msg isa DeviceSchema
         client.source_properties[(msg.topic, msg.name)] = schema_property_names(msg.schema)
         delete!(client.device_schema_requests, (msg.topic, msg.name))
+    elseif msg isa DeviceProperty
+        nothing
     elseif msg isa ContextInfo
         if msg.info isa Dict
             client.context.context_state = build_context_state(state, msg.info)
@@ -524,39 +573,26 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
         client.context.pipeline_status = msg.is_running ? PipelineStatus_Started : PipelineStatus_Stopped
     elseif msg isa TrainData
         for variable in msg.variables
-            is_new = !haskey(client.variable_data, variable.name)
+            store_variable_data!(client, variable.name, variable.tid, variable.data)
 
-            if is_new
-                if variable.data isa Number
-                    array = DimArray([variable.data], (; trainId=[variable.tid]); name=variable.name)
-                    client.variable_data[variable.name] = VariableStore(array)
-                elseif variable.data isa AbstractArray
-                    client.variable_data[variable.name] = VariableStore(variable.data)
-                else
-                    @error "Unsupported variable type: $(typeof(variable.data))"
-                    continue
+            for (subvar_name, subvar_data) in variable.subvariables
+                store_variable_data!(client, subvar_name, variable.tid, subvar_data)
+            end
+        end
+    elseif msg isa ParameterChanged
+        param = msg.parameter
+        # Update the parameter in the context state. Parameter names are
+        # prefixed with the group name (e.g. "bridge.address").
+        parts = split(param.name, "."; limit=2)
+        if length(parts) == 2
+            group, param_name = parts
+            group = String(group)
+            param_name = String(param_name)
+            ctx_state = client.context.context_state
+            if haskey(ctx_state, group) && haskey(ctx_state[group], "parameters")
+                if haskey(ctx_state[group]["parameters"], param_name)
+                    ctx_state[group]["parameters"][param_name].value = param.value
                 end
-            end
-
-            store = client.variable_data[variable.name]
-            type = if variable.data isa Number
-                VariableType_Scalar
-            elseif variable.data isa AbstractVector
-                VariableType_Vector
-            elseif variable.data isa AbstractArray
-                VariableType_Array
-            else
-                VariableType_Unknown
-            end
-            push!(store.updates, (variable.tid, variable.data, type))
-
-            ts = store.update_timestamps
-            push!(ts, time())
-            if length(ts) > 100
-                popfirst!(ts)
-            end
-            if length(ts) >= 2
-                store.update_rate = 1 / nanmean(diff(ts))
             end
         end
     elseif msg isa RemoteReplState
@@ -615,8 +651,17 @@ function handle_server(state)
                         nothing
                     end
 
+                    callback = if !isnothing(envelope.reply_to)
+                        pop!(client.engine_request_callbacks, envelope.reply_to, nothing)
+                    else
+                        nothing
+                    end
+
                     try
                         @invokelatest handle_msg(state, envelope.msg, replied_to)
+                        if !isnothing(callback)
+                            @invokelatest callback(envelope.msg)
+                        end
                     catch ex
                         @error "Error handling message!" exception=(ex, catch_backtrace())
                     end
