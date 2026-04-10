@@ -232,7 +232,7 @@ Re-upload the 1D colormap texture if the active ImPlot colormap has changed.
 Samples 256 points from the colormap and uploads as GL_RGBA8 with linear
 filtering (smooth gradient between color stops).
 """
-function update_colormap!(ctx::HeatmapContext, cmap::Integer)
+function update_colormap!(ctx::HeatmapContext, cmap::ImPlot.ImPlotColormap_)
     ctx.colormap_id == cmap && return
 
     n = 256
@@ -293,6 +293,9 @@ mutable struct GPUHeatmap
     # Reusable buffer for data that needs conversion (e.g. Float64 → Float32).
     # Avoids allocating a new array every frame.
     convert_buf::Vector{UInt8}
+    # Cached scale limits for the colorbar (1st/99th percentile)
+    scale_min::Float64
+    scale_max::Float64
 end
 
 function GPUHeatmap()
@@ -308,7 +311,7 @@ function GPUHeatmap()
     glGenFramebuffers(1, fbo_ref)
     fbo = fbo_ref[]
 
-    return GPUHeatmap(data_tex, output_tex, fbo, 0, 0, false, UInt8[])
+    return GPUHeatmap(data_tex, output_tex, fbo, 0, 0, false, UInt8[], 0.0, 1.0)
 end
 
 function destroy!(h::GPUHeatmap)
