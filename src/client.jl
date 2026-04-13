@@ -314,7 +314,16 @@ node_hash(x) = reinterpret(Cint, crc32c(x))
 function build_context_state(state, ctx_info)
     ctx_state = Dict{String, Any}()
 
+    group_names = Set(ctx_info["groups"])
+    is_group_var(name) = any(startswith(name, "$(g).") for g in group_names)
+    group_of(name) = first(g for g in group_names if startswith(name, "$(g)."))
+
+    # Build regular (non-group) variable nodes
     for (name, deps) in ctx_info["dag"]
+        if is_group_var(name)
+            continue
+        end
+
         ctx_state[name] = Dict{String, Any}("id" => node_hash(name))
 
         ctx_state[name]["dependencies"] = []
@@ -332,6 +341,7 @@ function build_context_state(state, ctx_info)
         end
     end
 
+    # Build group nodes with member variables folded in as inputs/outputs
     for name in ctx_info["groups"]
         group_filter = startswith("$(name).")
 
@@ -344,10 +354,46 @@ function build_context_state(state, ctx_info)
         ctx_state[name]["links"] = []
         ctx_state[name]["parameters"] = Dict{String, Any}()
 
+        # Add dependencies from group member variables as inputs on the group node
+        for (var_name, deps) in ctx_info["dag"]
+            if !group_filter(var_name)
+                continue
+            end
+            for (arg_name, dep) in deps
+                if dep isa Dependency && dep.kind == DepKind_Group
+                    continue
+                end
+                if dep isa Parameter
+                    continue
+                end
+                attr_id = node_hash("$(var_name).dependencies.$(arg_name => dep)")
+                push!(ctx_state[name]["dependencies"], (attr_id, arg_name => dep))
+            end
+        end
+
+        # Add group inputs as outputs
         inputs = filter(group_filter, keys(ctx_info["inputs"]))
         for input_name in inputs
             stripped_name = chopprefix(input_name, "$(name).")
             push!(ctx_state[name]["outputs"], (node_hash(input_name), stripped_name))
+        end
+
+        # Add group variables from the DAG as outputs
+        for (var_name, _) in ctx_info["dag"]
+            if !group_filter(var_name)
+                continue
+            end
+            stripped_name = chopprefix(var_name, "$(name).")
+
+            # The variable itself
+            attr_id = node_hash("$(var_name).outputs.")
+            push!(ctx_state[name]["outputs"], (attr_id, stripped_name))
+
+            # Its subvariables
+            for subvar in ctx_info["subvariables"][var_name]
+                subvar_id = node_hash("$(var_name).outputs.$(subvar)")
+                push!(ctx_state[name]["outputs"], (subvar_id, subvar))
+            end
         end
 
         for (param_name, param) in ctx_info["parameters"]
@@ -377,27 +423,46 @@ function build_context_state(state, ctx_info)
 
     new_links = []
     for (name, deps) in ctx_info["dag"]
-        for (i, dep) in enumerate(values(deps))
-            link_end_id = ctx_state[name]["dependencies"][i][1]
+        # Determine which node this variable belongs to
+        node_name = is_group_var(name) ? group_of(name) : name
 
-            if dep isa Dependency
-                link_start_id = ctx_state[dep.name]["outputs"][1][1]
+        for (arg_name, dep) in deps
+            # Skip deps that weren't added as pins
+            if is_group_var(name) && dep isa Dependency && dep.kind == DepKind_Group
+                continue
+            end
+
+            link_end_id = node_hash("$(name).dependencies.$(arg_name => dep)")
+
+            if dep isa Dependency && dep.kind == DepKind_Variable
+                if is_group_var(dep.name)
+                    # Link from the group node's output pin for this variable
+                    link_start_id = node_hash("$(dep.name).outputs.")
+                    dep_node = group_of(dep.name)
+                else
+                    link_start_id = ctx_state[dep.name]["outputs"][1][1]
+                    dep_node = dep.name
+                end
                 link_id = node_hash("$(link_start_id)->$(link_end_id)")
                 push!(new_links, (link_id, link_start_id, link_end_id))
 
-                push!(node_dag[name], dep.name)
-            elseif dep isa KaraboDependency
-                input_name = ctx_info["dep_to_input"][string(dep)]
+                if dep_node != node_name
+                    push!(node_dag[node_name], dep_node)
+                end
+            elseif dep isa Dependency && dep.kind == DepKind_Karabo
+                input_name = ctx_info["dep_to_input"][dep.name]
                 link_start_id = node_hash(input_name)
                 link_id = node_hash("$(link_start_id)->$(link_end_id)")
                 push!(new_links, (link_id, link_start_id, link_end_id))
 
                 input_node_name = split(input_name, ".")[1]
-                push!(node_dag[name], input_node_name)
+                if input_node_name != node_name
+                    push!(node_dag[node_name], input_node_name)
+                end
             end
         end
 
-        ctx_state[name]["links"] = new_links
+        ctx_state[node_name]["links"] = new_links
     end
 
     # positions = NetworkLayout.squaregrid(adj_matrix) .* 200
