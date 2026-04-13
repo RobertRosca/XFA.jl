@@ -482,6 +482,17 @@ function build_context_state(state, ctx_info)
         var_data["renaming"] = false
     end
 
+    # Build variable names list for DepText autocompletion
+    var_names = String[]
+    for (name, _) in ctx_info["dag"]
+        push!(var_names, name)
+        for subvar in ctx_info["subvariables"][name]
+            push!(var_names, "$(name).$(subvar)")
+        end
+    end
+    sort!(var_names)
+    state.client.variable_names = var_names
+
     return ctx_state
 end
 

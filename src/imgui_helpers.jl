@@ -155,14 +155,23 @@ end
     ElidedEditState_Edit
 end
 
+struct CompletionResult
+    items::Any
+    formatter::Function
+    renderer::Function
+    query::String
+    source::String
+end
+
 mutable struct ElidedTextState
     edit::ElidedEditState
     selected_idx::Int
     cached_query::String
+    cached_source::String
     cached_scored::Vector{Tuple{Int, Any}}
 end
 
-ElidedTextState() = ElidedTextState(ElidedEditState_NoEdit, 1, "", Tuple{Int, Any}[])
+ElidedTextState() = ElidedTextState(ElidedEditState_NoEdit, 1, "", "", Tuple{Int, Any}[])
 
 const elided_text_states = Dict{UInt32, ElidedTextState}()
 
@@ -237,15 +246,15 @@ completion text if one was chosen, `nothing` otherwise.
   return on selection
 - `completion_renderer(item, index, is_selected)`: draws a single completion row
 """
-function draw_autocomplete_popup(label, state::ElidedTextState, query, completions,
-                                 completion_text, completion_renderer)
+function draw_autocomplete_popup(label, state::ElidedTextState, ac::CompletionResult)
     popup_label = "##autocomplete-$(label)"
 
-    scored = if query == state.cached_query && !isempty(state.cached_scored)
+    scored = if ac.query == state.cached_query && ac.source == state.cached_source && !isempty(state.cached_scored)
         state.cached_scored
     else
-        state.cached_query = query
-        state.cached_scored = fuzzy_match(query, completions, completion_text)
+        state.cached_query = ac.query
+        state.cached_source = ac.source
+        state.cached_scored = fuzzy_match(ac.query, ac.items, ac.formatter)
     end
 
     result = nothing
@@ -279,10 +288,10 @@ function draw_autocomplete_popup(label, state::ElidedTextState, query, completio
 
             for (i, (_, item)) in enumerate(scored)
                 is_selected = (i == state.selected_idx)
-                formatted = completion_text(item)
+                formatted = ac.formatter(item)
                 ig.PushID(i)
                 ig.SetNextItemAllowOverlap()
-                if completion_renderer(item, i, is_selected)
+                if ac.renderer(item, i, is_selected)
                     result = formatted
                 end
                 RowCopyButton("ac-$i", formatted, popup_width)
@@ -303,12 +312,16 @@ end
 
 function ElidedText(label::AbstractString, text::AbstractString;
                     max_chars::Int=30, editable::Bool=false,
+                    focus::Bool=false,
                     completions=nothing,
                     completion_text::Function=string,
                     completion_renderer::Function=default_completion_renderer,
                     callback=C_NULL, user_data=C_NULL)
     id = ig.GetID(label)
     state = get!(ElidedTextState, elided_text_states, id)
+    if focus && state.edit == ElidedEditState_NoEdit
+        state.edit = ElidedEditState_WantEdit
+    end
 
     if editable && state.edit != ElidedEditState_NoEdit
         just_started = state.edit == ElidedEditState_WantEdit
@@ -326,13 +339,12 @@ function ElidedText(label::AbstractString, text::AbstractString;
         ac_result = nothing
         ac_hovered = false
         if !isnothing(completions)
-            ac_completions, ac_text_fn, ac_renderer, ac_query = if completions isa Base.Callable
+            ac = if completions isa Base.Callable
                 completions(new_text)
             else
-                (completions, completion_text, completion_renderer, new_text)
+                CompletionResult(completions, completion_text, completion_renderer, new_text, "")
             end
-            ac_result, ac_hovered = draw_autocomplete_popup(label, state, ac_query,
-                                                            ac_completions, ac_text_fn, ac_renderer)
+            ac_result, ac_hovered = draw_autocomplete_popup(label, state, ac)
         end
 
         if !isnothing(ac_result)
@@ -357,7 +369,8 @@ function ElidedText(label::AbstractString, text::AbstractString;
             padding = ImVec2(2, 2)
             cursor = ig.GetCursorPos()
             ig.SetCursorPos(ImVec2(cursor.x, cursor.y - padding.y))
-            ig.InvisibleButton("##elided-btn-$(label)", ImVec2(text_size.x + 2 * padding.x, text_size.y + 2 * padding.y))
+            min_width = ig.CalcTextSize("m").x * 5  # minimum clickable width
+            ig.InvisibleButton("##elided-btn-$(label)", ImVec2(max(text_size.x, min_width) + 2 * padding.x, text_size.y + 2 * padding.y))
             hovered = ig.IsItemHovered()
             clicked = ig.IsItemClicked()
 
@@ -595,14 +608,14 @@ next frame.
 """
 function KaraboDepText(label, text, dep_state::KaraboDepTextState,
                        source_list, device_props::DeviceProperties;
-                       device_only::Bool=false)
+                       device_only::Bool=false, focus::Bool=false)
     id = ig.GetID(label)
 
     cb = @cfunction(dep_text_callback, Cint, (Ptr{ig.ImGuiInputTextCallbackData},))
 
     live_text = Ref(text)
     edited, new_text = ElidedText(label, text;
-        editable=true,
+        editable=true, focus,
         callback=cb,
         user_data=pointer_from_objref(dep_state),
         completions=input -> begin
@@ -611,7 +624,8 @@ function KaraboDepText(label, text, dep_state::KaraboDepTextState,
             items, formatter, query = dep_completions(input, cursor,
                                                       source_list, device_props)
             renderer = items isa Vector{SourceInfo} ? source_completion_renderer : property_completion_renderer
-            (items, formatter, renderer, query)
+            source = @something(dep_state.device, "")
+            CompletionResult(items, formatter, renderer, query, source)
         end)
 
     # Update the device field based on current text and cursor position
@@ -652,4 +666,75 @@ function KaraboDepText(label, text, dep_state::KaraboDepTextState,
     end
 
     return false, text
+end
+
+function variable_completion_renderer(item, i, selected)
+    clicked = ig.Selectable("##var-$i", selected)
+    ig.SameLine(0, 0)
+    ig.Text(item)
+    return clicked
+end
+
+# Draw a dependency editor widget with a type selector (Karabo/Variable) and
+# autocomplete text field. Returns (edited::Bool, new_dep::Dependency) where
+# new_dep is the updated dependency if edited.
+#
+# - `dep`: the current Dependency value
+# - `dep_state`: mutable DepTextState tracking the selected type and karabo state
+# - `source_list`: Karabo source list for Karabo-mode completions
+# - `device_props`: DeviceProperties for the currently-entered Karabo device
+# - `variable_names`: list of variable names (including subvariable outputs) for Variable-mode completions
+# - `device_only`: if true, Karabo mode only completes device names (no property)
+function DepText(label, dep::Dependency, dep_state::DepTextState,
+                 source_list, device_props::DeviceProperties,
+                 variable_names::Vector{String};
+                 device_only::Bool=false, variable_name::String="")
+    # Type selector combo
+    dep_kinds = ["Karabo", "Variable"]
+    current_idx = dep_state.is_karabo ? 0 : 1
+    focus = false
+    frame_padding = unsafe_load(ig.GetStyle().FramePadding.x)
+    ig.SetNextItemWidth(ig.CalcTextSize("Variable ").x)
+    if ig.BeginCombo("##dep-kind-$(label)", dep_kinds[current_idx + 1], ig.ImGuiComboFlags_NoArrowButton)
+        for (i, kind_label) in enumerate(dep_kinds)
+            selected = (i - 1) == current_idx
+            if ig.Selectable(kind_label, selected)
+                focus = dep_state.is_karabo != (i == 1)
+                dep_state.is_karabo = (i == 1)
+                # Reset karabo state when switching
+                dep_state.karabo_state.cursor_pos = -1
+                dep_state.karabo_state.device = nothing
+                dep_state.karabo_state.wanted_text = nothing
+            end
+        end
+        ig.EndCombo()
+    end
+
+    ig.SameLine()
+
+    if dep_state.is_karabo
+        text = dep.kind == DepKind_Karabo ? string(dep) : ""
+        focus &= isempty(text)
+        edited, new_text = KaraboDepText(label, text, dep_state.karabo_state,
+                                         source_list, device_props;
+                                         device_only, focus)
+        if edited
+            return true, karabo_dependency(new_text)
+        end
+    else
+        text = dep.kind == DepKind_Karabo ? "" : dep.name
+        focus &= isempty(text)
+        edited, new_text = ElidedText(label, text;
+            editable=true, focus,
+            completions=input -> begin
+                prefix = variable_name * "."
+                filtered = filter(v -> v != variable_name && !startswith(v, prefix), variable_names)
+                CompletionResult(filtered, identity, variable_completion_renderer, input, "")
+            end)
+        if edited && !isempty(new_text)
+            return true, Dependency(new_text)
+        end
+    end
+
+    return false, dep
 end

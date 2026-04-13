@@ -147,7 +147,7 @@ end
 
 # Return the string content inside a Karabo string macro literal, i.e. the
 # dependency string without the topic prefix.
-function karabo_dep_content(dep::KaraboDependency)
+function karabo_dep_content(dep::Dependency)
     if occursin(':', dep.source)
         "$(dep.source)[$(dep.property)]"
     else
@@ -155,31 +155,28 @@ function karabo_dep_content(dep::KaraboDependency)
     end
 end
 
-"""
-    replace_karabo_dep(source, variable_name, arg_name, new_dep) -> String
-
-Replace the karabo dependency for a specific argument within a `@Variable`
-definition in the source code. For shorthand variables (`@Variable foo ->
-karabo"..."`), the argument name is `"data"`. Returns the modified source, or
-the original source unchanged if the variable or argument was not found.
-"""
-function replace_karabo_dep(source::String, variable_name::String, arg_name::String, new_dep::KaraboDependency)
-    tree = parseall(SyntaxNode, source; ignore_errors=true)
-    var_node = find_variable_node(tree, variable_name)
-    if isnothing(var_node)
-        @warn "Could not find @Variable definition for '$(variable_name)'"
-        return source
+# Convert a Dependency to its source code representation.
+function dep_to_source(dep::Dependency)
+    if dep.kind == DepKind_Karabo
+        content = karabo_dep_content(dep)
+        if isnothing(dep.topic)
+            "karabo\"$(content)\""
+        else
+            "karabo\"$(dep.topic)//$(content)\""
+        end
+    else
+        dep.name
     end
+end
 
-    # Find -> nodes where the left side matches arg_name. For shorthand
-    # variables the arg name in the AST is the variable name itself.
+# Find the arrow node for a specific argument in a @Variable definition.
+function find_arg_arrow(var_node::SyntaxNode, variable_name::String, arg_name::String)
     arrow_nodes = find_nodes(var_node) do node
         kind(node) == K"->" || return false
         cs = children(node)
         isnothing(cs) && return false
 
         lhs = cs[1]
-        # The LHS can be a tuple node (shorthand) or a bare identifier
         if kind(lhs) == K"tuple"
             tuple_cs = children(lhs)
             !isnothing(tuple_cs) && !isempty(tuple_cs) &&
@@ -189,49 +186,112 @@ function replace_karabo_dep(source::String, variable_name::String, arg_name::Str
         end
     end
 
-    if isempty(arrow_nodes)
+    return isempty(arrow_nodes) ? nothing : arrow_nodes[1]
+end
+
+"""
+    replace_dep(source, variable_name, arg_name, new_dep) -> String
+
+Replace the dependency for a specific argument within a `@Variable` definition
+in the source code. Works for both Karabo and variable dependencies by replacing
+the entire RHS of the arrow expression. Returns the modified source, or the
+original source unchanged if the variable or argument was not found.
+"""
+function replace_dep(source::String, variable_name::String, arg_name::String, new_dep::Dependency)
+    tree = parseall(SyntaxNode, source; ignore_errors=true)
+    var_node = find_variable_node(tree, variable_name)
+    if isnothing(var_node)
+        @warn "Could not find @Variable definition for '$(variable_name)'"
+        return source
+    end
+
+    arrow = find_arg_arrow(var_node, variable_name, arg_name)
+    if isnothing(arrow)
         @warn "No argument '$(arg_name)' found in @Variable definition for '$(variable_name)'"
         return source
     end
 
-    # Find the karabo literal on the right side of the arrow
-    arrow = arrow_nodes[1]
     rhs = children(arrow)[2]
-    karabo_nodes = find_nodes(rhs) do n
-        kind(n) == K"macrocall" && any(children(n)) do c
-            is_leaf(c) && kind(c) == K"StringMacroName" && c.val == Symbol("@karabo_str") # in XfaEngine.Context._KARABO_MACRO_NAMES
+    br = byte_range(rhs)
+    return source[1:first(br)-1] * dep_to_source(new_dep) * source[last(br)+1:end]
+end
+
+# Find the KaraboBridge(...) call node assigned to `bridge_name` in the AST.
+function find_bridge_call(tree::SyntaxNode, bridge_name::String)
+    for node in find_nodes(n -> kind(n) == K"=", tree)
+        cs = children(node)
+        isnothing(cs) || length(cs) < 2 && continue
+
+        lhs, rhs = cs[1], cs[2]
+        if is_leaf(lhs) && lhs.val == Symbol(bridge_name) &&
+           kind(rhs) == K"call" && !isempty(children(rhs)) &&
+           is_leaf(children(rhs)[1]) && children(rhs)[1].val == :KaraboBridge
+            return rhs
         end
     end
+    return nothing
+end
 
-    if isempty(karabo_nodes)
-        @warn "No karabo dependency found for argument '$(arg_name)' in @Variable '$(variable_name)'"
+# Add or replace the `address` keyword argument in a KaraboBridge constructor
+# call assigned to `bridge_name`.
+function replace_bridge_address(source::String, bridge_name::String, new_address::String)
+    tree = parseall(SyntaxNode, source; ignore_errors=true)
+    call_node = find_bridge_call(tree, bridge_name)
+    if isnothing(call_node)
+        @warn "Could not find KaraboBridge assignment for '$(bridge_name)'"
         return source
     end
 
-    br = byte_range(karabo_nodes[1])
-    new_literal = if isnothing(new_dep.topic)
-        "karabo\"$(karabo_dep_content(new_dep))\""
-    else
-        "karabo\"$(new_dep.topic)//$(karabo_dep_content(new_dep))\""
+    # Look for an existing `parameters` node (the kwargs after `;`)
+    params_node = nothing
+    for c in children(call_node)
+        if kind(c) == K"parameters"
+            params_node = c
+            break
+        end
     end
-    return source[1:first(br)-1] * new_literal * source[last(br)+1:end]
+
+    if !isnothing(params_node)
+        # Find the address= kwarg inside the parameters node
+        address_node = nothing
+        for c in children(params_node)
+            if kind(c) == K"=" && !isempty(children(c)) &&
+               is_leaf(children(c)[1]) && children(c)[1].val == :address
+                address_node = c
+                break
+            end
+        end
+
+        if !isnothing(address_node)
+            # Replace just the address kwarg value
+            br = byte_range(address_node)
+            return source[1:first(br)-1] * "address=\"$(new_address)\"" * source[last(br)+1:end]
+        else
+            # Parameters exist but no address kwarg — append it
+            br = byte_range(params_node)
+            return source[1:last(br)] * ", address=\"$(new_address)\"" * source[last(br)+1:end]
+        end
+    else
+        # No kwargs at all — insert before the closing paren
+        call_end = last(byte_range(call_node))
+        return source[1:call_end-1] * "; address=\"$(new_address)\"" * source[call_end:end]
+    end
 end
 
-function rename_karabo_dep(state, variable_name::String, arg_name::String, new_dep::KaraboDependency)
+function set_bridge_address(state, bridge_name::String, new_address::String)
     client = state.client
     source = client.context.source
 
     if isempty(source)
-        @error "No context source available for renaming"
+        @error "No context source available for editing"
         return
     end
 
-    new_source = replace_karabo_dep(source, variable_name, arg_name, new_dep)
+    new_source = replace_bridge_address(source, bridge_name, new_address)
     if new_source == source
         return
     end
 
-    # Write modified file back to server
     if client.embedded_engine
         write(client.context_path, new_source)
     else
@@ -240,6 +300,31 @@ function rename_karabo_dep(state, variable_name::String, arg_name::String, new_d
         end
     end
 
-    # Reload the context
+    load_context(state)
+end
+
+# Replace a dependency (Karabo or variable) in the source code and reload.
+function rename_dep(state, variable_name::String, arg_name::String, old_dep::Dependency, new_dep::Dependency)
+    client = state.client
+    source = client.context.source
+
+    if isempty(source)
+        @error "No context source available for editing"
+        return
+    end
+
+    new_source = replace_dep(source, variable_name, arg_name, new_dep)
+    if new_source == source
+        return
+    end
+
+    if client.embedded_engine
+        write(client.context_path, new_source)
+    else
+        open(client.context_path, client.sftp; write=true) do f
+            write(f, new_source)
+        end
+    end
+
     load_context(state)
 end

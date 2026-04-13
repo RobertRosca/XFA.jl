@@ -60,6 +60,13 @@ end
 
 KaraboDepTextState() = KaraboDepTextState(-1, nothing, nothing)
 
+mutable struct DepTextState
+    is_karabo::Bool
+    karabo_state::KaraboDepTextState
+end
+
+DepTextState(is_karabo::Bool) = DepTextState(is_karabo, KaraboDepTextState())
+
 mutable struct KbdintPromptState
     msg::String
     display::Bool
@@ -255,8 +262,12 @@ EngineLog(message::String, extra_details::Maybe{String}=nothing) = EngineLog(tim
     # indicates that the source name appears in more than one topic.
     source_list::Vector{SourceInfo} = SourceInfo[]
 
-    # KaraboDepText widget state, keyed by dependency ID
+    # KaraboDepText widget state, keyed by dependency ID (used for Parameter{KaraboDevice})
     karabo_dep_states::Dict{Int, KaraboDepTextState} = Dict{Int, KaraboDepTextState}()
+    # DepText widget state, keyed by dependency ID
+    dep_text_states::Dict{Int, DepTextState} = Dict{Int, DepTextState}()
+    # Variable names available for autocompletion (including subvariable outputs)
+    variable_names::Vector{String} = String[]
     source_properties::Dict{Tuple{String, String}, DeviceProperties} = Dict{Tuple{String, String}, DeviceProperties}()
     device_schema_requests::Dict{Tuple{String, String}, Int} = Dict{Tuple{String, String}, Int}()
 

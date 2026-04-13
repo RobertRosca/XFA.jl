@@ -18,7 +18,6 @@ using HTTP: HTTP, WebSockets
 using XfaEngine: EngineState, getavailableport
 using Dates: Dates, unix2datetime, @dateformat_str
 include("states.jl")
-include("imgui_helpers.jl")
 
 using Printf: @sprintf
 using TOML: TOML
@@ -27,7 +26,10 @@ using CRC32c: crc32c
 using Serialization
 using XfaEngine.Protocol
 using XfaEngine: XfaEngine, Protocol
-using XfaEngine.Context: KaraboDependency, Dependency, Parameter, KaraboDevice
+using XfaEngine.Context: Dependency, DependencyKind, DepKind_Variable, DepKind_Karabo, DepKind_Group,
+    karabo_dependency, Parameter, KaraboDevice
+
+include("imgui_helpers.jl")
 include("state_inspector.jl")
 include("client.jl")
 include("context_edit.jl")
@@ -100,7 +102,7 @@ end
 
 function draw_parameter_widget(name, param::Parameter{Int})
     int32_value = Int32(param.value)
-    @c ig.InputInt(name, &int32_value)
+    @c ig.InputInt("##$(name)", &int32_value)
     param.value = Int(int32_value)
 
     return false, nothing
@@ -141,6 +143,34 @@ function draw_parameter_widget(name, param::Parameter{KaraboDevice})
         return true, new_device
     end
 
+    return false, nothing
+end
+
+# Draw a dependency editor (type selector + autocomplete text field).
+# Returns (edited::Bool, new_dep::Dependency). Used for both dependency pins
+# and Parameter{Dependency} widgets.
+function draw_dep_editor(label, dep::Dependency, dep_id::Integer;
+                         device_only::Bool=false, variable_name::String="")
+    client = state[].client
+    dep_state = get!(client.dep_text_states, Int(dep_id)) do
+        DepTextState(dep.kind == DepKind_Karabo)
+    end
+    device_props = if isnothing(dep_state.karabo_state.device)
+        DeviceProperties()
+    else
+        get_source_properties(client, dep_state.karabo_state.device)
+    end
+    DepText(label, dep, dep_state, client.source_list, device_props,
+            client.variable_names; device_only, variable_name)
+end
+
+function draw_parameter_widget(name, param::Parameter{Dependency})
+    dep = param.value
+    dep_id = node_hash(param.name)
+    edited, new_dep = draw_dep_editor("param-dep-$(param.name)", dep, dep_id)
+    if edited
+        return true, new_dep
+    end
     return false, nothing
 end
 
@@ -292,28 +322,18 @@ function draw_variable(name, var_data)
             continue
         end
 
-        pin_shape = dep isa KaraboDependency ? ImNodes.ImNodesPinShape_TriangleFilled : ImNodes.ImNodesPinShape_CircleFilled
+        dep_ts = get!(client.dep_text_states, dep_id) do
+            DepTextState(dep isa Dependency && dep.kind == DepKind_Karabo)
+        end
+        pin_shape = dep_ts.is_karabo ? ImNodes.ImNodesPinShape_TriangleFilled : ImNodes.ImNodesPinShape_CircleFilled
 
         ImNodes.BeginInputAttribute(dep_id, pin_shape)
-        if dep isa KaraboDependency
-            ig.TextDisabled("Karabo")
-            ig.SameLine()
-            dep_state = get!(client.karabo_dep_states, dep_id, KaraboDepTextState())
-            device_props = if isnothing(dep_state.device)
-                DeviceProperties()
-            else
-                get_source_properties(client, dep_state.device)
+        disable_dep = client.context.pipeline_status ∉ (PipelineStatus_Stopped, PipelineStatus_Started)
+        @Disabled disable_dep begin
+            edited, new_dep = draw_dep_editor("dep-$(dep_id)", dep, dep_id; variable_name=name)
+            if edited
+                @guiasync rename_dep(state[], name, arg_name, dep, new_dep)
             end
-            disable_dep = client.context.pipeline_status ∉ (PipelineStatus_Stopped, PipelineStatus_Started)
-            @Disabled disable_dep begin
-                edited, new_text = KaraboDepText("dep-$(dep_id)", string(dep), dep_state,
-                                                client.source_list, device_props)
-                if edited
-                    @guiasync rename_karabo_dep(state[], name, arg_name, KaraboDependency(new_text))
-                end
-            end
-        else
-            ig.Text(arg_name)
         end
         ImNodes.EndInputAttribute()
     end
@@ -337,7 +357,6 @@ function draw_variable(name, var_data)
         output_name = isempty(label) ? name : "$(name).$(label)"
         ImNodes.BeginOutputAttribute(output_id, ImNodes.ImNodesPinShape_CircleFilled)
 
-        ig.Indent(min_node_width - ig.CalcTextSize(label).x)
         typestr = get_variable_typeinfo(output_name)
         if !isempty(typestr)
             label = isempty(label) ? typestr : "$(label) - $(typestr)"
@@ -1084,5 +1103,5 @@ function main(; test_engine=nothing)
     return t, gui_state
 end
 
-precompile(main, ())
-precompile(draw_gui, ())
+# precompile(main, ())
+# precompile(draw_gui, ())

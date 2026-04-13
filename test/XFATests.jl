@@ -13,7 +13,8 @@ using ReTest
 using ImGuiTestEngine
 import ImGuiTestEngine as te
 import CImGui as ig
-using XfaEngine.Context: KaraboDependency, @karabo_str
+using XFA.XfaEngine.Context: Dependency, DepKind_Karabo, DepKind_Variable, DepKind_Subvariable,
+    karabo_dependency, @karabo_str
 
 # Set up the backend for CImGui
 import GLFW
@@ -126,7 +127,7 @@ end
         source = """
         @Variable foo -> karabo"A/B.prop"
         """
-        @test XFA.replace_karabo_dep(source, "foo", "data", karabo"C/D.prop") == """
+        @test XFA.replace_dep(source, "foo", "data", karabo"C/D.prop") == """
         @Variable foo -> karabo"C/D.prop"
         """
 
@@ -136,7 +137,7 @@ end
             return x
         end
         """
-        @test XFA.replace_karabo_dep(source, "bar", "x", karabo"C/D.prop") == """
+        @test XFA.replace_dep(source, "bar", "x", karabo"C/D.prop") == """
         @Variable function bar(x -> karabo"C/D.prop")
             return x
         end
@@ -147,7 +148,7 @@ end
         @Variable foo -> karabo"A/B.prop"
         @Variable bar -> karabo"A/B.prop"
         """
-        @test XFA.replace_karabo_dep(source, "foo", "data", karabo"C/D.prop") == """
+        @test XFA.replace_dep(source, "foo", "data", karabo"C/D.prop") == """
         @Variable foo -> karabo"C/D.prop"
         @Variable bar -> karabo"A/B.prop"
         """
@@ -157,14 +158,14 @@ end
         @Variable foo -> karabo"A/B.prop"
         """
         @test_logs (:warn, r"Could not find @Variable") begin
-            @test XFA.replace_karabo_dep(source, "nonexistent", "data", karabo"C/D.prop") == source
+            @test XFA.replace_dep(source, "nonexistent", "data", karabo"C/D.prop") == source
         end
 
         # Rename fast data sources
         source = """
         @Variable foo -> karabo"A/B:output[x]"
         """
-        @test XFA.replace_karabo_dep(source, "foo", "data", karabo"C/D:daqOutput[y]") == """
+        @test XFA.replace_dep(source, "foo", "data", karabo"C/D:daqOutput[y]") == """
         @Variable foo -> karabo"C/D:daqOutput[y]"
         """
 
@@ -175,7 +176,7 @@ end
             1
         end
         """
-        @test XFA.replace_karabo_dep(source, "energy", "energy", karabo"foo.bar") == """
+        @test XFA.replace_dep(source, "energy", "energy", karabo"foo.bar") == """
         @Variable function energy(energy -> karabo"foo.bar",
                                   flux -> karabo"SA2_XTD1_XGM/XGM/DOOCS.pulseEnergy.photonFlux")
             1
@@ -186,7 +187,7 @@ end
         source = """
         @Variable foo -> karabo"A/B.prop"
         """
-        @test XFA.replace_karabo_dep(source, "foo", "data", karabo"MID//C/D.prop") == """
+        @test XFA.replace_dep(source, "foo", "data", karabo"MID//C/D.prop") == """
         @Variable foo -> karabo"MID//C/D.prop"
         """
 
@@ -194,8 +195,30 @@ end
         source = """
         @Variable foo -> karabo"MID//A/B.prop"
         """
-        @test XFA.replace_karabo_dep(source, "foo", "data", karabo"SA2//C/D.newprop") == """
+        @test XFA.replace_dep(source, "foo", "data", karabo"SA2//C/D.newprop") == """
         @Variable foo -> karabo"SA2//C/D.newprop"
+        """
+
+        # Karabo → Variable, Variable → Karabo, Subvariable → Karabo
+        source = """
+        @Variable function baz(x -> karabo"A/B.prop", y -> other_var, z -> foo.half)
+            1
+        end
+        """
+        @test XFA.replace_dep(source, "baz", "x", Dependency("my_var")) == """
+        @Variable function baz(x -> my_var, y -> other_var, z -> foo.half)
+            1
+        end
+        """
+        @test XFA.replace_dep(source, "baz", "y", karabo"C/D.prop") == """
+        @Variable function baz(x -> karabo"A/B.prop", y -> karabo"C/D.prop", z -> foo.half)
+            1
+        end
+        """
+        @test XFA.replace_dep(source, "baz", "z", karabo"E/F.prop") == """
+        @Variable function baz(x -> karabo"A/B.prop", y -> other_var, z -> karabo"E/F.prop")
+            1
+        end
         """
     end
 
@@ -243,6 +266,32 @@ end
         @Variable baz -> karabo"A/B.prop"
         @Variable bar -> karabo"C/D.prop"
         """
+    end
+
+    @testset "Set bridge address" begin
+        # Add address to a KaraboBridge with no kwargs
+        source = """
+        bridge = KaraboBridge(KaraboDevice("TOPIC", "name"))
+        """
+        @test XFA.replace_bridge_address(source, "bridge", "tcp://foo:1234") == """
+        bridge = KaraboBridge(KaraboDevice("TOPIC", "name"); address="tcp://foo:1234")
+        """
+
+        # Replace existing address kwarg
+        source = """
+        bridge = KaraboBridge(KaraboDevice("TOPIC", "name"); address="tcp://old:5555")
+        """
+        @test XFA.replace_bridge_address(source, "bridge", "tcp://new:1234") == """
+        bridge = KaraboBridge(KaraboDevice("TOPIC", "name"); address="tcp://new:1234")
+        """
+
+        # Bridge not found returns source unchanged
+        source = """
+        bridge = KaraboBridge(KaraboDevice("TOPIC", "name"))
+        """
+        @test_logs (:warn, r"Could not find KaraboBridge.*") begin
+            @test XFA.replace_bridge_address(source, "other", "tcp://foo:1234") == source
+        end
     end
 end
 
