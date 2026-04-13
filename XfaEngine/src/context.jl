@@ -1,6 +1,8 @@
 module Context
 
-export @karabo_str, @Variable, @Input, @Group, @add_subvariable, Parameter, tryset, KaraboDevice
+export @karabo_str, @Variable, @Input, @Group, @add_subvariable, Parameter, tryset, KaraboDevice,
+    Dependency, DependencyKind, DepKind_Variable, DepKind_Subvariable, DepKind_Karabo, DepKind_Group, DepKind_GroupParameter,
+    karabo_dependency, subvariable_dependency, group_dependency, group_parameter_dependency
 
 import Base.ScopedValues: @with
 
@@ -115,13 +117,13 @@ end
 Finds all external dependencies (i.e. from Karabo) required by the context.
 """
 function external_dependencies(ctx::XfaContext; per_variable=false)
-    deps_per_variable = Dict{String, Vector{KaraboDependency}}()
-    all_deps = KaraboDependency[]
+    deps_per_variable = Dict{String, Vector{Dependency}}()
+    all_deps = Dependency[]
 
     for (name, deps) in ctx.dag
         for (_, dep) in deps
-            if dep isa KaraboDependency
-                deps_vec = get!(deps_per_variable, name, KaraboDependency[])
+            if dep.kind == DepKind_Karabo
+                deps_vec = get!(deps_per_variable, name, Dependency[])
                 push!(deps_vec, dep)
                 push!(all_deps, dep)
             end
@@ -134,7 +136,7 @@ end
 # Returns the group object for an input, or nothing if it has no group.
 function get_input_group(ctx::XfaContext, input_name)
     for (_, dep) in ctx.inputs[input_name]
-        if dep isa GroupDependency
+        if dep isa Dependency && dep.kind == DepKind_Group
             return ctx.groups[dep.name]
         end
     end
@@ -201,16 +203,16 @@ function build_dep_routing(ctx::XfaContext)
 end
 
 # Returns the name used to match a dependency against a variable name.
-# For most dependencies this is the full string, but for SubvariableDependency
-# it's the parent name since subvariables share their parent's channel.
-dep_variable_name(x) = string(x)
-dep_variable_name(x::SubvariableDependency) = x.parent
+# For most dependencies this is the full string, but for subvariable
+# dependencies it's the parent name since subvariables share their parent's
+# channel.
+dep_variable_name(dep::Dependency) = dep.kind == DepKind_Subvariable ? dep.parent : dep.name
 
-function find_downstream_neighbours(ctx::XfaContext, dep_name, T::DataType)
+function find_downstream_neighbours(ctx::XfaContext, dep_name, kind::DependencyKind)
     neighbours = Set{String}()
     for (var_name, deps) in ctx.dag
         for (_, dep) in deps
-            if dep isa T && dep_variable_name(dep) == dep_name
+            if dep isa Dependency && dep.kind == kind && dep_variable_name(dep) == dep_name
                 push!(neighbours, var_name)
             end
         end
@@ -258,9 +260,14 @@ function to_dict(ctx::XfaContext)
         end
     end
 
+    parameters = Dict{String, Parameter}()
+    for (name, param) in ctx.parameters
+        parameters[name] = Parameter(; name=param.name, value=param.value, set_by_user=param.set_by_user)
+    end
+
     return Dict("dag" => ctx.dag,
                 "subvariables" => ctx.subvariables,
-                "parameters" => ctx.parameters,
+                "parameters" => parameters,
                 "inputs" => inputs,
                 "groups" => groups,
                 "origins" => origins,
@@ -284,8 +291,9 @@ function topological_sort(dag)
     # - All group object arguments are removed
     internal_dag = Dict{String, Vector{String}}()
     for (name, deps) in dag
-        internal_dag[name] = [x isa SubvariableDependency ? x.parent : string(x) for x in values(deps)
-                              if !(x isa KaraboDependency) && !(x isa Parameter) && !(x isa GroupDependency)]
+        internal_dag[name] = [x isa Dependency && x.kind == DepKind_Subvariable ? x.parent : string(x)
+                              for x in values(deps)
+                              if !(x isa Dependency && x.kind ∈ (DepKind_Karabo, DepKind_Group)) && !(x isa Parameter)]
     end
 
     sorted_graph = String[]
@@ -325,22 +333,22 @@ function execute_variables(ctx::XfaContext, inputs::Dict)
         # Build up the argument list
         args = []
         for dep in values(ctx.dag[name])
-            dep_key = string(dep)
-
-            if dep isa KaraboDependency
+            if dep isa Parameter
+                push!(args, ctx.parameters[string(dep)].value)
+            elseif dep.kind == DepKind_Karabo
+                dep_key = dep.name
                 if haskey(inputs, dep_key)
                     push!(args, inputs[dep_key])
                 end
-            elseif dep isa Dependency
+            elseif dep.kind == DepKind_Variable
+                dep_key = dep.name
                 if haskey(results, dep_key)
                     push!(args, results[dep_key])
                 end
-            elseif dep isa Parameter
-                push!(args, ctx.parameters[dep_key].value)
-            elseif dep isa GroupDependency
-                push!(args, ctx.groups[dep.struct_name])
+            elseif dep.kind == DepKind_Group
+                push!(args, ctx.groups[dep.name])
             else
-                throw(XfaContextException("Unrecognized dependency type: $(typeof(dep))"))
+                throw(XfaContextException("Unrecognized dependency kind: $(dep.kind)"))
             end
         end
 
@@ -439,7 +447,7 @@ end
 function stream_external_dependency(name, input_neighbour, downstream_neighbours)
     channel = input_neighbour.channel
 
-    dep = KaraboDependency(name)
+    dep = karabo_dependency(name)
     property_value = dep.property * ".value"
 
     try
@@ -499,12 +507,12 @@ function stream_variable(name, stream_output, upstream, downstream, deps)
 
             # Build args from deps, extracting subvariable values as needed
             for (i, (arg_name, dep)) in enumerate(deps)
-                if dep isa GroupDependency
+                if dep.kind == DepKind_Group
                     args[i] = upstream[dep.name]
-                elseif dep isa SubvariableDependency
-                    args[i] = matched_data[dep.parent].subvariables[string(dep)]
+                elseif dep.kind == DepKind_Subvariable
+                    args[i] = matched_data[dep.parent].subvariables[dep.name]
                 else
-                    args[i] = matched_data[string(dep)].data
+                    args[i] = matched_data[dep.name].data
                 end
             end
 
@@ -628,10 +636,11 @@ function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50)
         group = nothing
         if !isempty(deps)
             first_arg = first(keys(deps))
-            if deps[first_arg] isa GroupDependency
-                group = ctx.groups[deps[first_arg].name]
+            first_dep = deps[first_arg]
+            if first_dep isa Dependency && first_dep.kind == DepKind_Group
+                group = ctx.groups[first_dep.name]
             else
-                error("Couldn't schedule input '$(name)', it has a non-group dependency: $(deps[1])")
+                error("Couldn't schedule input '$(name)', it has a non-group dependency: $(first_dep)")
             end
         end
 
@@ -665,7 +674,7 @@ function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50)
         input_neighbour = Neighbour(input_name, input_channel)
 
         downstream_neighbours = Dict{String, RemoteChannel}()
-        for neighbour in find_downstream_neighbours(ctx, dep_name, KaraboDependency)
+        for neighbour in find_downstream_neighbours(ctx, dep_name, DepKind_Karabo)
             downstream_neighbours[neighbour] = RemoteChannel()
         end
         ctx.external_dependency_channels[dep_name] = downstream_neighbours
@@ -686,28 +695,30 @@ function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50)
         for dep in values(ctx.dag[name])
             dep_name = string(dep)
 
-            if dep isa KaraboDependency
+            if dep isa Parameter
+                continue
+            elseif dep.kind == DepKind_Karabo
                 args[dep_name] = ctx.external_dependency_channels[dep_name][name]
-            elseif dep isa SubvariableDependency
+            elseif dep.kind == DepKind_Subvariable
                 if !haskey(args, dep.parent)
                     args[dep.parent] = ctx.variable_channels[dep.parent][name]
                 end
-            elseif dep isa Dependency
+            elseif dep.kind == DepKind_Variable
                 args[dep_name] = ctx.variable_channels[dep_name][name]
-            elseif dep isa GroupDependency
+            elseif dep.kind == DepKind_Group
                 args[dep.name] = ctx.groups[dep.name]
             else
-                throw(XfaContextException("Unrecognized dependency type: $(typeof(dep))"))
+                throw(XfaContextException("Unrecognized dependency kind: $(dep.kind)"))
             end
         end
 
         # Find downstream variables, including those that depend on our
         # subvariables.
         downstream = Dict{String, RemoteChannel}()
-        for neighbour in find_downstream_neighbours(ctx, name, Dependency)
+        for neighbour in find_downstream_neighbours(ctx, name, DepKind_Variable)
             downstream[neighbour] = RemoteChannel()
         end
-        for neighbour in find_downstream_neighbours(ctx, name, SubvariableDependency)
+        for neighbour in find_downstream_neighbours(ctx, name, DepKind_Subvariable)
             if !haskey(downstream, neighbour)
                 downstream[neighbour] = RemoteChannel()
             end
@@ -918,7 +929,7 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr})
     # Associate variables with their group types
     for (group_struct, group) in group_types
         for (func, deps) in merge(all_variables, ctx_inputs)
-            if !isempty(deps) && deps[1][2] isa GroupDependency && deps[1][2].type == group_struct
+            if !isempty(deps) && deps[1][2] isa Dependency && deps[1][2].kind == DepKind_Group && deps[1][2].group_type == group_struct
                 push!(group.variables, func)
             end
         end
@@ -953,7 +964,7 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr})
 
         # If it's a group dependency, we don't schedule it yet. That's done at
         # the end only for the instantiated group structs.
-        if length(deps) > 0 && deps[1][2] isa GroupDependency
+        if length(deps) > 0 && deps[1][2] isa Dependency && deps[1][2].kind == DepKind_Group
             continue
         end
 
@@ -982,18 +993,17 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr})
 
             dag_deps = _get_deps(variable_func, parameters)
 
-            # Replace the GroupDependency that originally contained the group
-            # type name, with a GroupDependency that names the instatiated
-            # group.
+            # Replace the group dependency that originally contained the group
+            # type name, with one that names the instantiated group.
             argument_names = collect(keys(dag_deps))
-            arg_idx = findfirst(key -> dag_deps[key] == GroupDependency(group_type),
+            arg_idx = findfirst(key -> dag_deps[key] == group_dependency(group_type),
                                 argument_names)
-            dag_deps[argument_names[arg_idx]] = GroupDependency(group_name, group_type)
+            dag_deps[argument_names[arg_idx]] = group_dependency(group_name, group_type)
 
-            # Resolve GroupParameterDependency entries by looking up the
-            # parameter value from the instantiated group.
+            # Resolve GroupParameter dependencies by looking up the parameter
+            # value from the instantiated group.
             for (arg_name, dep) in dag_deps
-                if dep isa GroupParameterDependency
+                if dep isa Dependency && dep.kind == DepKind_GroupParameter
                     param_field = Symbol(dep.parameter)
                     if !hasfield(group_type, param_field) || !(fieldtype(group_type, param_field) <: Parameter)
                         throw(XfaContextException("'$(dep.parameter)' is not a Parameter field of $(nameof(group_type))"))
@@ -1002,8 +1012,8 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr})
                     if isnothing(param.value)
                         throw(XfaContextException("Parameter '$(dep.parameter)' of group '$(group_name)' has no value"))
                     end
-                    if !(param.value isa AbstractDependency)
-                        throw(XfaContextException("Parameter '$(dep.parameter)' of group '$(group_name)' must hold a Dependency or KaraboDependency value"))
+                    if !(param.value isa Dependency)
+                        throw(XfaContextException("Parameter '$(dep.parameter)' of group '$(group_name)' must hold a Dependency value"))
                     end
                     dag_deps[arg_name] = param.value
                 end
@@ -1020,7 +1030,7 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr})
             # if any are actually group variables instead of subvariables.
             for var_deps in values(dag)
                 for i in eachindex(var_deps)
-                    if var_deps[i] == SubvariableDependency(group_name, func_name)
+                    if var_deps[i] == subvariable_dependency(group_name, func_name)
                         var_deps[i] = Dependency(group_var_name)
                     end
                 end
@@ -1045,14 +1055,14 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr})
             input_name = string(nameof(input_func))
 
             if length(deps) == 1
-                input_group_type = deps[1][2].type
+                input_group_type = deps[1][2].group_type
                 if input_group_type === group_type
                     group_input_name = "$group_name.$input_name"
                     new_deps = OrderedDict(deps)
-                    # Similarly to variables, we replace the GroupDependency
+                    # Similarly to variables, we replace the group dependency
                     # that contained the group type name with one that contains
                     # the instantiated name.
-                    new_deps[first(keys(new_deps))] = GroupDependency(group_name, group_type)
+                    new_deps[first(keys(new_deps))] = group_dependency(group_name, group_type)
                     inputs[group_input_name] = new_deps
                     functions[group_input_name] = input_func
                 end
@@ -1061,7 +1071,7 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr})
     end
 
     for (func, deps) in ctx_inputs
-        if isempty(deps) || !(deps[1][2] isa GroupDependency)
+        if isempty(deps) || !(deps[1][2] isa Dependency && deps[1][2].kind == DepKind_Group)
             name = string(nameof(func))
             throw(XfaContextException("'$(name)' must belong to a Group to be a valid Input"))
         end
@@ -1071,8 +1081,8 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr})
     topological_sort(dag)
 
     ctx_subvariables = Dict{String, Vector{String}}()
-    for func in keys(ctx_variables)
-        ctx_subvariables[string(nameof(func))] = variable_subvariables(func)
+    for name in keys(dag)
+        ctx_subvariables[name] = variable_subvariables(functions[name])
     end
 
     global worker_state = WorkerState(; dag_functions=functions, current_ctx_module=ctx_module, parameters)
@@ -1115,11 +1125,11 @@ function _get_deps(func, parameters)
     final_deps = OrderedDict()
 
     for (arg_name, dep) in variable_dependencies(func)
-        if !(dep isa AbstractDependency)
+        if !(dep isa Dependency)
             throw(ArgumentError("Dependency of type '$(typeof(dep))' is not allowed"))
         end
 
-        if dep isa Dependency && haskey(parameters, dep.name)
+        if dep.kind == DepKind_Variable && haskey(parameters, dep.name)
             dep = parameters[dep.name]
         end
 

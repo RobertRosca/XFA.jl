@@ -6,45 +6,55 @@ struct XfaExecutionException <: Exception
     msg::String
 end
 
-abstract type AbstractDependency end
+@enum DependencyKind begin
+    DepKind_Variable
+    DepKind_Subvariable
+    DepKind_Karabo
+    DepKind_Group
+    DepKind_GroupParameter
+end
 
-struct Dependency <: AbstractDependency
+@kwdef struct Dependency
+    kind::DependencyKind
     name::String
+
+    # Karabo-specific
+    topic::Union{String, Nothing} = nothing
+    source::Union{String, Nothing} = nothing
+    property::Union{String, Nothing} = nothing
+
+    # Subvariable-specific
+    parent::Union{String, Nothing} = nothing
+
+    # Group-specific
+    group_type::Union{DataType, Nothing} = nothing
+
+    # GroupParameter-specific
+    group_type_name::Union{String, Nothing} = nothing
+    parameter::Union{String, Nothing} = nothing
 end
 
 Base.string(dep::Dependency) = dep.name
 
-struct SubvariableDependency <: AbstractDependency
-    parent::String
-    name::String
-end
+# Variable dependency
+Dependency(name::String) = Dependency(kind=DepKind_Variable, name=name)
 
-Base.string(dep::SubvariableDependency) = "$(dep.parent).$(dep.name)"
+# Subvariable dependency
+subvariable_dependency(parent::String, name::String) = Dependency(kind=DepKind_Subvariable, name="$parent.$name", parent=parent)
 
-struct GroupDependency <: AbstractDependency
-    name::Union{String, Nothing} # Name of the argument in the function signature
-    type::DataType
-end
+# Group dependency
+group_dependency(type::DataType) = Dependency(kind=DepKind_Group, name="", group_type=type)
+group_dependency(::Nothing, type::DataType) = group_dependency(type)
+group_dependency(name::String, type::DataType) = Dependency(kind=DepKind_Group, name=name, group_type=type)
 
-GroupDependency(type::DataType) = GroupDependency(nothing, type)
-
-# Represents a dependency that comes from a group parameter. This is used
-# when a group variable's argument references one of its group's Parameter
-# fields (e.g. `@Variable foo(::MyGroup, data -> MyGroup.data_param)`).
-# At load time this is resolved to the actual dependency value held by the
-# parameter.
-struct GroupParameterDependency <: AbstractDependency
-    group_type::String
-    parameter::String
-end
-
-struct KaraboDependency <: AbstractDependency
-    topic::Union{String, Nothing}
-    source::String
-    property::String
-end
-
-KaraboDependency(source::AbstractString, property::AbstractString) = KaraboDependency(nothing, source, property)
+# GroupParameter dependency: used when a group variable's argument references
+# one of its group's Parameter fields (e.g. `@Variable foo(::MyGroup, data ->
+# MyGroup.data_param)`). At load time this is resolved to the actual dependency
+# value held by the parameter.
+group_parameter_dependency(group_type::String, parameter::String) = Dependency(kind=DepKind_GroupParameter,
+                                                                               name="$group_type.$parameter",
+                                                                               group_type_name=group_type,
+                                                                               parameter=parameter)
 
 struct FunctionArgument
     name::String
@@ -55,7 +65,32 @@ const slow_data_re = r"^(\S+?)\.([\w|\.]+)$"
 const fast_data_re = r"^(\S+):(\S+)\[(\S+)\]$"
 const topic_prefix_re = r"^(\w+)//(.+)$"
 
-function KaraboDependency(str::AbstractString)
+# Compute the string representation for a Karabo dependency
+function _karabo_dep_string(topic, source, property)
+    device_str = if occursin(':', source)
+        "$(source)[$(property)]"
+    else
+        "$(source).$(property)"
+    end
+
+    if isnothing(topic)
+        return device_str
+    else
+        return "$(topic)//$(device_str)"
+    end
+end
+
+# Karabo dependency constructors
+karabo_dependency(source::AbstractString, property::AbstractString) = karabo_dependency(nothing, source, property)
+
+function karabo_dependency(topic::Union{AbstractString, Nothing}, source::AbstractString, property::AbstractString)
+    name = _karabo_dep_string(topic, source, property)
+    Dependency(kind=DepKind_Karabo, name=name,
+               topic=isnothing(topic) ? nothing : String(topic),
+               source=String(source), property=String(property))
+end
+
+function karabo_dependency(str::AbstractString)
     topic = nothing
     m = match(topic_prefix_re, str)
     if !isnothing(m)
@@ -65,29 +100,15 @@ function KaraboDependency(str::AbstractString)
 
     m = match(slow_data_re, str)
     if !isnothing(m)
-        return KaraboDependency(topic, m.captures[1], m.captures[2])
+        return karabo_dependency(topic, m.captures[1], m.captures[2])
     end
 
     m = match(fast_data_re, str)
     if !isnothing(m)
-        return KaraboDependency(topic, "$(m.captures[1]):$(m.captures[2])", m.captures[3])
+        return karabo_dependency(topic, "$(m.captures[1]):$(m.captures[2])", m.captures[3])
     end
 
     throw(ArgumentError("'$(str)' is not a valid Karabo device property"))
-end
-
-function Base.string(kp::KaraboDependency)
-    device_str = if occursin(':', kp.source)
-        "$(kp.source)[$(kp.property)]"
-    else
-        "$(kp.source).$(kp.property)"
-    end
-
-    if isnothing(kp.topic)
-        return device_str
-    else
-        return "$(kp.topic)//$(device_str)"
-    end
 end
 
 """
@@ -98,7 +119,7 @@ Example usage:
     karabo"SA2_XTD1_XGM/XGM/DOOCS:output[data.intensityTD]"
 """
 macro karabo_str(str)
-    Expr(:call, :KaraboDependency, esc(Base.Meta.parse("\"$(escape_string(str))\"")))
+    Expr(:call, :karabo_dependency, esc(Base.Meta.parse("\"$(escape_string(str))\"")))
 end
 
 
@@ -116,14 +137,14 @@ function _parse_function_args(args; is_input=false)
                         if @capture(value, head_.tail_)
                             if !isnothing(group_type_name) && "$head" == group_type_name
                                 # Group parameter reference: e.g. MyGroup.data_param
-                                value = :(Context.GroupParameterDependency($("$head"), $("$tail")))
+                                value = :(Context.group_parameter_dependency($("$head"), $("$tail")))
                             else
                                 # Subvariable reference: e.g. var.subvar
-                                value = :(Context.SubvariableDependency($("$head"), $("$tail")))
+                                value = :(Context.subvariable_dependency($("$head"), $("$tail")))
                             end
                         elseif !isnothing(group_type_name)
                             throw(ArgumentError("Dependencies of @Group @Variable's must refer to a group parameter (e.g. $(group_type_name).<parameter>) or a subvariable of another group variable, got: $(value)"))
-                        elseif value isa AbstractDependency || @capture(value, @karabo_str _)
+                        elseif value isa Dependency || @capture(value, @karabo_str _)
                             # Keep as-is
                         elseif value isa Symbol
                             value = :(Context.Dependency($("$value")))
@@ -143,7 +164,7 @@ function _parse_function_args(args; is_input=false)
                             # If the first argument has a type and no explicit
                             # dependency, then we assume it belongs to a group.
                             group_type_name = "$T"
-                            push!(dependencies, :(($arg_name_expr, Context.GroupDependency($T))))
+                            push!(dependencies, :(($arg_name_expr, Context.group_dependency($T))))
                         else
                             # Otherwise it's just a regular function argument
                             push!(dependencies, :(($arg_name_expr, Context.FunctionArgument($arg_name_expr, $T))))
@@ -244,7 +265,7 @@ function _variable(ctx_module, expr, side_effects)
         # Strip quote nodes etc
         value = MacroTools.unblock(value)
 
-        if value isa KaraboDependency || (value isa Expr && @capture(value, @karabo_str _))
+        if (value isa Dependency && value.kind == DepKind_Karabo) || (value isa Expr && @capture(value, @karabo_str _))
             function_expr = quote
                 function $name(data -> $value)
                     return data
@@ -336,21 +357,21 @@ macro Variable(expr)
     _variable(__module__, expr, true)
 end
 
-mutable struct Parameter{T, F, G}
+@kwdef mutable struct Parameter{T}
     name::String
     value::Union{T, Nothing}
-    set_by_user::Bool
+    set_by_user::Bool = false
 
-    update_handler::F
-    initializer::G
+    update_handler::Union{Function, Nothing} = nothing
+    initializer::Union{Function, Nothing} = nothing
 end
 
 function Base.:(==)(one::Parameter{T}, two::Parameter{T}) where T
     one.name == two.name && one.value == two.value && one.set_by_user == two.set_by_user
 end
 
-Parameter(name::String, value) = Parameter(name, value, false, nothing, nothing)
-Parameter(value) = Parameter("", value, false, nothing, nothing)
+Parameter(name::String, value) = Parameter(; name, value)
+Parameter(value) = Parameter(; name="", value)
 
 function Parameter(f::Base.Callable, value)
     if !isnothing(f) && !applicable(f, value)
@@ -388,7 +409,7 @@ function _input(ctx_module, expr, side_effects)
     if @capture(expr, function name_(args__) body_ end)
         dependencies, new_args = _parse_function_args(args; is_input=true)
         if length(new_args) == 2
-            if isempty(dependencies) || !@capture(dependencies[1], (_, Context.GroupDependency(_)))
+            if isempty(dependencies) || !@capture(dependencies[1], (_, Context.group_dependency(_)))
                 throw(XfaContextException("The first argument of a two-argument @Input must be a @Group"))
             end
         elseif length(new_args) != 1

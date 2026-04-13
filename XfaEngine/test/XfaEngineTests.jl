@@ -13,8 +13,10 @@ using HTTP: HTTP, WebSockets
 using OrderedCollections: OrderedDict as OD
 
 using XfaEngine: XfaEngine, Context, KaraboBridge, Protocol
-using XfaEngine.Context: @Variable, @karabo_str, VariableData, Dependency, KaraboDependency,
-    GroupDependency, GroupParameterDependency, SubvariableDependency, XfaContextException, Parameter, FunctionArgument, KaraboDevice
+using XfaEngine.Context: @Variable, @karabo_str, VariableData, Dependency, DependencyKind,
+    DepKind_Variable, DepKind_Subvariable, DepKind_Karabo, DepKind_Group, DepKind_GroupParameter,
+    karabo_dependency, subvariable_dependency, group_dependency, group_parameter_dependency,
+    XfaContextException, Parameter, FunctionArgument, KaraboDevice
 using XfaEngine.KaraboBridge: KaraboBridgeClient, KaraboBridgeServer, ThreadsafeSocket
 
 
@@ -353,27 +355,27 @@ end
     @test length(Context.match_train(tm, VariableData(3, "foo.baz", 1))) == 1
 end
 
-@testset "KaraboDependency" begin
-    @test karabo"foo.bar" == KaraboDependency("foo", "bar")
-    @test karabo"foo.bar.baz" == KaraboDependency("foo", "bar.baz")
-    @test karabo"foo:output[bar]" == KaraboDependency("foo:output", "bar")
-    @test karabo"foo:channel_1.output[bar]" == KaraboDependency("foo:channel_1.output", "bar")
+@testset "karabo_dependency" begin
+    @test karabo"foo.bar" == karabo_dependency("foo", "bar")
+    @test karabo"foo.bar.baz" == karabo_dependency("foo", "bar.baz")
+    @test karabo"foo:output[bar]" == karabo_dependency("foo:output", "bar")
+    @test karabo"foo:channel_1.output[bar]" == karabo_dependency("foo:channel_1.output", "bar")
 
-    @test_throws ArgumentError KaraboDependency("foo")
-    @test_throws ArgumentError KaraboDependency("foo.bar[]")
-    @test_throws ArgumentError KaraboDependency("foo:[bar]")
+    @test_throws ArgumentError karabo_dependency("foo")
+    @test_throws ArgumentError karabo_dependency("foo.bar[]")
+    @test_throws ArgumentError karabo_dependency("foo:[bar]")
 
     # Topic macros
-    @test karabo"MID//foo.bar" == KaraboDependency("MID", "foo", "bar")
-    @test karabo"SA2//foo:output[bar]" == KaraboDependency("SA2", "foo:output", "bar")
+    @test karabo"MID//foo.bar" == karabo_dependency("MID", "foo", "bar")
+    @test karabo"SA2//foo:output[bar]" == karabo_dependency("SA2", "foo:output", "bar")
 
     # Parsing from string with topic
-    @test KaraboDependency("MID//foo.bar") == KaraboDependency("MID", "foo", "bar")
-    @test KaraboDependency("SA2//foo:output[bar]") == KaraboDependency("SA2", "foo:output", "bar")
+    @test karabo_dependency("MID//foo.bar") == karabo_dependency("MID", "foo", "bar")
+    @test karabo_dependency("SA2//foo:output[bar]") == karabo_dependency("SA2", "foo:output", "bar")
 
     # Round trip
-    @test KaraboDependency(string(karabo"MID//foo.bar")) == karabo"MID//foo.bar"
-    @test KaraboDependency(string(karabo"SA2//foo:output[bar]")) == karabo"SA2//foo:output[bar]"
+    @test karabo_dependency(string(karabo"MID//foo.bar")) == karabo"MID//foo.bar"
+    @test karabo_dependency(string(karabo"SA2//foo:output[bar]")) == karabo"SA2//foo:output[bar]"
 end
 
 # Helper module that defines variables for reference tests, defined in
@@ -431,7 +433,7 @@ end
 
     # And their dependencies should have been marked
     for name in expected_variables
-        @test ctx.dag[name] == OD("data" => KaraboDependency(name, "data"))
+        @test ctx.dag[name] == OD("data" => karabo_dependency(name, "data"))
     end
     @test Context.external_dependencies(ctx; per_variable=true) == Dict("foo" => [karabo"foo.data"],
                                                                         "bar" => [karabo"bar.data"],
@@ -483,7 +485,7 @@ end
     """)
     @test Set(keys(ctx.functions)) == Set(["foo", "quux"])
     @test ctx.subvariables["foo"] == ["foo.bar"]
-    @test ctx.dag["quux"] == OD("data" => SubvariableDependency("foo", "bar"))
+    @test ctx.dag["quux"] == OD("data" => subvariable_dependency("foo", "bar"))
 
     # Test loading from a file
     ctx_code = raw"""
@@ -618,7 +620,7 @@ end
     x = Context.MockInput()
     """)
     @test isempty(ctx.dag)
-    @test ctx.inputs["x.bridge"] == Dict("_" => GroupDependency("x", Context.MockInput))
+    @test ctx.inputs["x.bridge"] == Dict("_" => group_dependency("x", Context.MockInput))
 
     # And a input function that's part of a group
     ctx = Context.load_from_string(raw"""
@@ -673,7 +675,7 @@ end
     foo_group = Foo(Parameter(42))
     """)
     group_type = only(filter(x -> nameof(x) == :Foo, keys(ctx.group_types)))
-    @test ctx.dag == Dict("foo_group.foo" => OD("data" => Context.GroupDependency("foo_group", group_type)))
+    @test ctx.dag == Dict("foo_group.foo" => OD("data" => group_dependency("foo_group", group_type)))
     @test ctx.parameters == Dict("foo_group.bar" => Parameter("foo_group.bar", 42))
 
     # Test that the struct can be used as a dependency
@@ -698,10 +700,10 @@ end
     @test_throws ArgumentError Context._variable(@__MODULE__, :(function bar(::Foo, data -> karabo"motor1.pos") data end), false)
     @test_throws ArgumentError Context._variable(@__MODULE__, :(function bar(::Foo, data -> some_var) data end), false)
 
-    # Test GroupParameterDependency resolution
+    # Test group parameter dependency resolution
     ctx = Context.load_from_string(raw"""
     @Group mutable struct Foo
-        source::Parameter{Context.KaraboDependency}
+        source::Parameter{Dependency}
     end
 
     @Variable function foo(group::Foo, data -> Foo.source)
@@ -710,7 +712,7 @@ end
 
     foo_group = Foo(Parameter(karabo"motor1.pos"))
     """)
-    @test ctx.dag["foo_group.foo"] == OD("group" => GroupDependency("foo_group", only(filter(x -> nameof(x) == :Foo, keys(ctx.group_types)))),
+    @test ctx.dag["foo_group.foo"] == OD("group" => group_dependency("foo_group", only(filter(x -> nameof(x) == :Foo, keys(ctx.group_types)))),
                                          "data" => karabo"motor1.pos")
 
     # Test that referencing a non-existent parameter throws
@@ -752,7 +754,7 @@ end
         @test Context.topological_sort(dag) == ["camera"]
 
         # Subvariables should be ignored too
-        dag = Dict("camera" => [], "foo" => [SubvariableDependency("camera", "bar")])
+        dag = Dict("camera" => [], "foo" => [subvariable_dependency("camera", "bar")])
         @test Context.topological_sort(dag) == ["camera", "foo"]
 
         # Test that sorting actually works
@@ -937,7 +939,7 @@ end
 
         @Group struct Foo
             x::Parameter{Int}
-            source::Parameter{Context.KaraboDependency}
+            source::Parameter{Dependency}
         end
 
         @Variable function bar(group::Foo, data -> Foo.source)
