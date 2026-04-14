@@ -664,15 +664,15 @@ end
 
     # Test instantiating a group
     ctx = Context.load_from_string(raw"""
-    @Group struct Foo
-        bar::Parameter{Int}
+    @Group @kwdef struct Foo
+        bar::Parameter{Int} = Parameter(42)
     end
 
     @Variable function foo(data::Foo)
         data.bar
     end
 
-    foo_group = Foo(Parameter(42))
+    foo_group = Foo()
     """)
     group_type = only(filter(x -> nameof(x) == :Foo, keys(ctx.group_types)))
     @test ctx.dag == Dict("foo_group.foo" => OD("data" => group_dependency("foo_group", group_type)))
