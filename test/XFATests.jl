@@ -222,6 +222,50 @@ end
         """
     end
 
+    @testset "Change group dependency" begin
+        source = """
+        my_group = MyGroup(; x=Parameter(karabo"A/B.prop"), y=Parameter(Dependency("energy")))
+        """
+
+        # Karabo → different Karabo
+        @test XFA.replace_dep(source, "my_group", "x", karabo"E/F.prop") == """
+        my_group = MyGroup(; x=Parameter(karabo"E/F.prop"), y=Parameter(Dependency("energy")))
+        """
+
+        # Variable → Karabo
+        @test XFA.replace_dep(source, "my_group", "y", karabo"C/D.prop") == """
+        my_group = MyGroup(; x=Parameter(karabo"A/B.prop"), y=Parameter(karabo"C/D.prop"))
+        """
+
+        # Karabo → Variable
+        @test XFA.replace_dep(source, "my_group", "x", Dependency("my_var")) == """
+        my_group = MyGroup(; x=Parameter(Dependency("my_var")), y=Parameter(Dependency("energy")))
+        """
+
+        # Only affects the targeted group instance
+        source = """
+        g1 = MyGroup(; x=Parameter(karabo"A/B.prop"))
+        g2 = MyGroup(; x=Parameter(karabo"A/B.prop"))
+        """
+        @test XFA.replace_dep(source, "g1", "x", karabo"E/F.prop") == """
+        g1 = MyGroup(; x=Parameter(karabo"E/F.prop"))
+        g2 = MyGroup(; x=Parameter(karabo"A/B.prop"))
+        """
+
+        # Add a new kwarg to a group with no kwargs
+        source = """
+        my_group = MyGroup()
+        """
+        @test XFA.replace_dep(source, "my_group", "x", karabo"A/B.prop") == """
+        my_group = MyGroup(; x=Parameter(karabo"A/B.prop"))
+        """
+
+        # Unknown group returns source unchanged
+        @test_logs (:warn, r"Could not find") begin
+            @test XFA.replace_dep(source, "nonexistent", "x", karabo"C/D.prop") == source
+        end
+    end
+
     @testset "Rename variable" begin
         # Rename shorthand variable
         source = """
