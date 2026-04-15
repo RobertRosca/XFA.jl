@@ -1046,7 +1046,7 @@ end
         """)
         Context.run(ctx) do
             @test take!(ctx.stream_output).data == 0
-            Context.change_parameter(Parameter("x", 1))
+            Context.change_parameter(ctx, Parameter("x", 1))
             notify(Context.worker_state.current_ctx_module.next_input)
             @test take!(ctx.stream_output).data == 1
             @test Context.worker_state.current_ctx_module.x_side_effect == 1
@@ -1074,7 +1074,7 @@ end
         """)
         Context.run(ctx) do
             @test take!(ctx.stream_output) == VariableData(42, "foo", 10)
-            Context.change_parameter(Parameter("g.x", 5))
+            Context.change_parameter(ctx, Parameter("g.x", 5))
             @test ctx.groups["g"].handler_received_value == 10
             @test ctx.groups["g"].x[] == 5
         end

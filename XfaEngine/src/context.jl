@@ -372,7 +372,7 @@ end
 
 TrainData(tid, data) = TrainData(UInt64(tid), data)
 
-function change_parameter(new_param::Parameter)
+function change_parameter(ctx::XfaContext, new_param::Parameter)
     pause_pipeline() do
         ctx_param = worker_state.parameters[new_param.name]
         if !isnothing(ctx_param.update_handler)
@@ -380,9 +380,9 @@ function change_parameter(new_param::Parameter)
                 # If the parameter belongs to a group (name is "group.field"),
                 # pass the group object to the handler along with the new value.
                 dot_idx = findfirst('.', new_param.name)
-                group = if !isnothing(dot_idx) && !isnothing(current_ctx)
+                group = if !isnothing(dot_idx)
                     group_name = new_param.name[1:dot_idx-1]
-                    current_ctx.groups[group_name]
+                    ctx.groups[group_name]
                 else
                     nothing
                 end

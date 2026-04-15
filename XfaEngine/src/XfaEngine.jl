@@ -175,7 +175,7 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
         Protocol.server_send(ws, Ack(); reply_to)
     elseif msg isa ChangeParameter
         param = msg.parameter
-        Context.change_parameter(param)
+        Context.change_parameter(state.ctx, param)
         @info "ChangeParameter of $(param.name) to $(param.value)"
         Protocol.server_send(ws, Ack(); reply_to)
     elseif msg isa Start
