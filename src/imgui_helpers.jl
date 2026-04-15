@@ -323,6 +323,8 @@ function ElidedText(label::AbstractString, text::AbstractString;
         state.edit = ElidedEditState_WantEdit
     end
 
+    min_width = ig.CalcTextSize("m").x * 13  # minimum clickable width
+
     if editable && state.edit != ElidedEditState_NoEdit
         just_started = state.edit == ElidedEditState_WantEdit
         if just_started
@@ -330,7 +332,7 @@ function ElidedText(label::AbstractString, text::AbstractString;
             state.edit = ElidedEditState_Edit
             state.selected_idx = 1
         end
-        ig.SetNextItemWidth(ig.CalcTextSize(text).x + 40)
+        ig.SetNextItemWidth(max(min_width, ig.CalcTextSize(text).x + 40))
         edited, new_text = SafeInputText("##elided-$(label)"; current_text=text, reset=just_started,
                                          callback, user_data)
         lost_focus = !just_started && ig.IsItemDeactivated() && !ig.IsItemActive()
@@ -369,7 +371,6 @@ function ElidedText(label::AbstractString, text::AbstractString;
             padding = ImVec2(2, 2)
             cursor = ig.GetCursorPos()
             ig.SetCursorPos(ImVec2(cursor.x, cursor.y - padding.y))
-            min_width = ig.CalcTextSize("m").x * 5  # minimum clickable width
             ig.InvisibleButton("##elided-btn-$(label)", ImVec2(max(text_size.x, min_width) + 2 * padding.x, text_size.y + 2 * padding.y))
             hovered = ig.IsItemHovered()
             clicked = ig.IsItemClicked()
@@ -623,8 +624,10 @@ function KaraboDepText(label, text, dep_state::KaraboDepTextState,
             cursor = device_only ? -1 : dep_state.cursor_pos
             items, formatter, query = dep_completions(input, cursor,
                                                       source_list, device_props)
-            renderer = items isa Vector{SourceInfo} ? source_completion_renderer : property_completion_renderer
-            source = @something(dep_state.device, "")
+            is_source_list = items isa Vector{SourceInfo}
+            renderer = is_source_list ? source_completion_renderer : property_completion_renderer
+            mode = is_source_list ? "devices" : "properties"
+            source = "karabo:$(mode):" * @something(dep_state.device, "")
             CompletionResult(items, formatter, renderer, query, source)
         end)
 
@@ -729,7 +732,7 @@ function DepText(label, dep::Dependency, dep_state::DepTextState,
             completions=input -> begin
                 prefix = variable_name * "."
                 filtered = filter(v -> v != variable_name && !startswith(v, prefix), variable_names)
-                CompletionResult(filtered, identity, variable_completion_renderer, input, "")
+                CompletionResult(filtered, identity, variable_completion_renderer, input, "variable")
             end)
         if edited && !isempty(new_text)
             return true, Dependency(new_text)
