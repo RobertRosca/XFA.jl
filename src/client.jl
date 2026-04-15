@@ -355,6 +355,7 @@ function build_context_state(state, ctx_info)
         ctx_state[name]["parameters"] = Dict{String, Any}()
 
         # Add dependencies from group member variables as inputs on the group node
+        dep_param_names = Set{String}()
         for (var_name, deps) in ctx_info["dag"]
             if !group_filter(var_name)
                 continue
@@ -368,6 +369,7 @@ function build_context_state(state, ctx_info)
                 end
                 attr_id = node_hash("$(var_name).dependencies.$(arg_name => dep)")
                 push!(ctx_state[name]["dependencies"], (attr_id, arg_name => dep))
+                push!(dep_param_names, arg_name)
             end
         end
 
@@ -399,6 +401,8 @@ function build_context_state(state, ctx_info)
         for (param_name, param) in ctx_info["parameters"]
             if group_filter(param_name)
                 stripped_name = chopprefix(param_name, "$(name).")
+                # Skip parameters that are already shown as dependency inputs
+                stripped_name in dep_param_names && continue
                 ctx_state[name]["parameters"][stripped_name] = param
             end
         end
