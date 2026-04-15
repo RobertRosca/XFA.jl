@@ -645,6 +645,7 @@ end
 @testset "@Group" begin
     @test_throws ArgumentError Context._group(@__MODULE__, "foo", false)
     @test_throws ArgumentError Context._group(@__MODULE__, :(1 + 1), false)
+    @test_throws ArgumentError Context._group(@__MODULE__, :(@kwdef struct Foo end), false)
 
     ctx = Context.load_from_string(raw"""
     @Group struct Foo end
@@ -664,7 +665,7 @@ end
 
     # Test instantiating a group
     ctx = Context.load_from_string(raw"""
-    @Group @kwdef struct Foo
+    @Group struct Foo
         bar::Parameter{Int} = Parameter(42)
     end
 
@@ -678,6 +679,26 @@ end
     @test ctx.dag == Dict("foo_group.foo" => OD("data" => group_dependency("foo_group", group_type)))
     @test ctx.parameters == Dict("foo_group.bar" => Parameter("foo_group.bar", 42))
 
+    # Test that @kwdef groups accept raw values for Parameter fields,
+    # and that handlers from the default are preserved.
+    ctx = Context.load_from_string(raw"""
+    handler_called = Ref(false)
+    @Group mutable struct Bar
+        x::Parameter{Int} = Parameter(0) do _; handler_called[] = true end
+        y::Parameter{Int}
+        z::Int = 5
+    end
+
+    bar = Bar(; y=10)
+    """)
+    bar = ctx.groups["bar"]
+    @test bar.x[] == 0 && bar.y[] == 10 && bar.z == 5
+    @test !isnothing(bar.x.update_handler)
+    @invokelatest bar.x.update_handler(99)
+    @test invokelatest() do
+        Context.worker_state.current_ctx_module.handler_called[]
+    end
+
     # Test that the struct can be used as a dependency
     ctx = Context.load_from_string(raw"""
     @Group struct Foo
@@ -688,7 +709,7 @@ end
         data.value
     end
 
-    foo_group = Foo(2π)
+    foo_group = Foo(; value=2π)
 
     @Variable function bar(data -> foo_group.foo)
         data
@@ -710,7 +731,7 @@ end
         data
     end
 
-    foo_group = Foo(Parameter(karabo"motor1.pos"))
+    foo_group = Foo(; source=karabo"motor1.pos")
     """)
     @test ctx.dag["foo_group.foo"] == OD("group" => group_dependency("foo_group", only(filter(x -> nameof(x) == :Foo, keys(ctx.group_types)))),
                                          "data" => karabo"motor1.pos")
@@ -731,9 +752,9 @@ end
     ctx = Context.load_from_string("""
     Base.include(@__MODULE__, "$(helper_file_path)")
 
-    bridge = KaraboBridge(KaraboDevice("MATCHER"))
+    bridge = KaraboBridge(; trainmatcher=KaraboDevice("MATCHER"))
 
-    foo = DummyVariables.Foo(Parameter(1))
+    foo = DummyVariables.Foo(; bar=1)
     """)
     @test haskey(ctx.inputs, "bridge.stream")
     @test ctx.functions["bridge.stream"] === Context.stream
@@ -946,7 +967,7 @@ end
             return group.x[] + data
         end
 
-        foo = Foo(Parameter(1), Parameter(karabo"motor1.pos"))
+        foo = Foo(; x=1, source=karabo"motor1.pos")
         """)
         @test "foo.x" ∈ keys(ctx.parameters)
         @test "foo.source" ∈ keys(ctx.parameters)
@@ -995,7 +1016,7 @@ end
             put!(output, (0, Dict("foo" => Dict("x" => foo.x))))
         end
 
-        foo = Foo(42)
+        foo = Foo(; x=42)
 
         @Variable bar -> karabo"foo.x"
         """)
@@ -1059,7 +1080,7 @@ end
         end
         i = Context.MockInput()
 
-        @Group @kwdef mutable struct MyGroup
+        @Group mutable struct MyGroup
             handler_received_value::Int = 0
             x::Parameter{Int} = Parameter(10) do group, value
                 group.handler_received_value = value * 2
@@ -1163,7 +1184,7 @@ end
         KaraboBridge.startbridge(bridge_server)
 
         ctx = Context.load_from_string("""
-        bridge = KaraboBridge(KaraboDevice("MATCHER"); sources=["foo.x"])
+        bridge = KaraboBridge(; trainmatcher=KaraboDevice("MATCHER"), sources=["foo.x"])
         bridge._mock_sources = String[]
         bridge.manual_configuration[] = true
         bridge.address[] = "$(address)"
@@ -1209,7 +1230,7 @@ end
 
 @testset "Serialization" begin
     ctx = Context.load_from_string(raw"""
-        bridge = KaraboBridge(KaraboDevice(""))
+        bridge = KaraboBridge(; trainmatcher=KaraboDevice(""))
         bridge._mock_sources = String[]
 
         period = Parameter(2π)

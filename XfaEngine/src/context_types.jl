@@ -373,8 +373,16 @@ end
 Parameter(name::String, value) = Parameter(; name, value)
 Parameter(value) = Parameter(; name="", value)
 
+# Used by @Group to allow passing raw values for Parameter fields
+_wrap_param(val::Parameter) = val
+_wrap_param(val) = Parameter(val)
+# Merge a raw value into a default Parameter, preserving handlers
+_wrap_param(val::Parameter, ::Parameter) = val
+_wrap_param(val, default::Parameter) = Parameter(default.name, val, default.set_by_user,
+                                                  default.update_handler, default.initializer)
+
 function Parameter(f::Base.Callable, value)
-    if !isnothing(f) && !applicable(f, value) && !applicable(f, nothing, value)
+    if !isnothing(f) && !any(m -> m.nargs in (2, 3), methods(f))
         throw(ArgumentError("Parameter update handler must be either `nothing` or a callable that takes one argument (value) or two arguments (group, value)"))
     end
 
@@ -449,43 +457,72 @@ function Base.:(==)(x::Group, y::Group)
     x.type === y.type && x.parameters == y.parameters && x.variables == y.variables
 end
 
+# Generate a struct definition and keyword constructor for @Group structs.
+# Raw values passed for Parameter{T} fields are automatically wrapped, preserving
+# any handlers from the default Parameter if one exists.
+function _kwdef_group(name, struct_expr, fields)
+    is_mutable = struct_expr.args[1]
+
+    parsed = []
+    for field in fields
+        default = nothing
+        if @capture(field, lhs_ = rhs_)
+            default = rhs
+            field = lhs
+        end
+
+        if @capture(field, fname_::ftype_)
+            is_param = @capture(ftype, Parameter{_})
+        elseif field isa Symbol
+            fname = field
+            is_param = false
+        else
+            continue
+        end
+
+        push!(parsed, (; name=fname, default, is_param, typed_field=field))
+    end
+
+    struct_fields = [f.typed_field for f in parsed]
+    struct_def = Expr(:struct, is_mutable, name, Expr(:block, struct_fields...))
+
+    kwargs = [isnothing(f.default) ? f.name : Expr(:kw, f.name, f.default)
+              for f in parsed]
+    wrap_stmts = [if !isnothing(f.default)
+                      :($(f.name) = Context._wrap_param($(f.name), $(f.default)))
+                  else
+                      :($(f.name) = Context._wrap_param($(f.name)))
+                  end
+                  for f in parsed if f.is_param]
+    field_names = [f.name for f in parsed]
+
+    ctor = if isempty(parsed)
+        nothing
+    else
+        :(function $name(; $(kwargs...))
+            $(wrap_stmts...)
+            $name($(field_names...))
+        end)
+    end
+
+    return struct_def, ctor
+end
+
 function _group(ctx_module, expr, side_effects)
     if !(expr isa Expr)
         throw(ArgumentError("Must pass an Expr to @Group"))
     end
 
-    # Strip @kwdef if present, but preserve it in the output expression
-    inner_expr = if expr.head == :macrocall && expr.args[1] == Symbol("@kwdef")
-        expr.args[end]
-    else
-        expr
+    if expr.head == :macrocall && expr.args[1] == Symbol("@kwdef")
+        throw(ArgumentError("@kwdef is not needed with @Group, keyword constructors are generated automatically"))
     end
 
-    if @capture(inner_expr, struct name_ fields__ end) || @capture(inner_expr, mutable struct name_ fields__ end)
-        # # Look through the fields for parameters
-        # param_fields = []
-        # new_fields = [if @capture(field, field_name_::Parameter{T_})
-        #                   push!(param_fields, field_name)
-        #                   :($field_name::$T)
-        #               else
-        #                   field
-        #               end
-        #               for field in fields]
-
-        # new_expr = quote
-        #     struct $name
-        #         $(new_fields...)
-        #     end
-
-        #     if $side_effects
-        #         Context.registered_groups[$name] = $param_fields
-        #     end
-
-        #     $name
-        # end
+    if @capture(expr, struct name_ fields__ end) || @capture(expr, mutable struct name_ fields__ end)
+        struct_def, ctor = _kwdef_group(name, expr, fields)
 
         new_expr = quote
-            $(expr)
+            $struct_def
+            $ctor
 
             if $side_effects
                 Context.group_fields(::Type{$name}) = []

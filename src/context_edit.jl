@@ -169,7 +169,7 @@ function dep_to_source(dep::Dependency)
     end
 end
 
-# Convert a Dependency to source code for use inside a Parameter() call.
+# Convert a Dependency to source code for use as a group constructor kwarg value.
 # Variable deps need to be wrapped in Dependency("...") since they can't
 # appear as bare identifiers inside a constructor kwarg.
 function parameter_dep_to_source(dep::Dependency)
@@ -206,9 +206,8 @@ end
 Replace the dependency for a specific argument within a `@Variable` definition
 or a group constructor call in the source code. Works for both Karabo and
 variable dependencies by replacing the entire RHS of the arrow expression (for
-variables) or the argument inside `Parameter(...)` (for group kwargs). Returns
-the modified source, or the original source unchanged if the variable or
-argument was not found.
+variables) or the kwarg value (for group kwargs). Returns the modified source,
+or the original source unchanged if the variable or argument was not found.
 """
 function replace_dep(source::String, variable_name::String, arg_name::String, new_dep::Dependency)
     tree = parseall(SyntaxNode, source; ignore_errors=true)
@@ -228,7 +227,13 @@ function replace_dep(source::String, variable_name::String, arg_name::String, ne
     end
 
     # Fall back to group constructor kwarg
-    return replace_group_dep(source, tree, variable_name, arg_name, new_dep)
+    new_source = replace_constructor_kwarg(source, variable_name, arg_name,
+                                           parameter_dep_to_source(new_dep);
+                                           warn=false)
+    if new_source == source
+        @warn "Could not find @Variable definition or group assignment for '$(variable_name)'"
+    end
+    return new_source
 end
 
 # Find an assignment node `name = SomeConstructor(...)` in the AST.
@@ -245,13 +250,19 @@ function find_assignment_call(tree::SyntaxNode, name::String)
     return isempty(assignments) ? nothing : assignments[1]
 end
 
-# Replace a dependency inside a group constructor's keyword argument.
-# Handles patterns like: `my_group = Foo(; x=Parameter(karabo"A/B.prop"))`
-function replace_group_dep(source::String, tree::SyntaxNode, group_name::String,
-                           kwarg_name::String, new_dep::Dependency)
-    assign_node = find_assignment_call(tree, group_name)
+# Replace a keyword argument value in a constructor call assigned to `var_name`.
+# Handles patterns like: `my_group = Foo(; x=old_value)`
+# If the kwarg doesn't exist, it is appended. If there are no kwargs at all,
+# a new parameter section is inserted.
+function replace_constructor_kwarg(source::String, var_name::String,
+                                   kwarg_name::String, new_value::String;
+                                   warn::Bool=true)
+    tree = parseall(SyntaxNode, source; ignore_errors=true)
+    assign_node = find_assignment_call(tree, var_name)
     if isnothing(assign_node)
-        @warn "Could not find @Variable definition or group assignment for '$(group_name)'"
+        if warn
+            @warn "Could not find constructor assignment for '$(var_name)'"
+        end
         return source
     end
 
@@ -266,7 +277,7 @@ function replace_group_dep(source::String, tree::SyntaxNode, group_name::String,
         end
     end
 
-    new_kwarg = "$(kwarg_name)=Parameter($(parameter_dep_to_source(new_dep)))"
+    new_kwarg = "$(kwarg_name)=$(new_value)"
 
     if isnothing(params_node)
         # No kwargs at all — insert before the closing paren
@@ -274,7 +285,7 @@ function replace_group_dep(source::String, tree::SyntaxNode, group_name::String,
         return source[1:call_end-1] * "; $(new_kwarg)" * source[call_end:end]
     end
 
-    # Find the kwarg matching arg_name
+    # Find the kwarg matching kwarg_name
     kwarg_node = nothing
     for c in children(params_node)
         if kind(c) == K"=" && !isempty(children(c)) &&
@@ -290,111 +301,21 @@ function replace_group_dep(source::String, tree::SyntaxNode, group_name::String,
         return source[1:last(br)] * ", $(new_kwarg)" * source[last(br)+1:end]
     end
 
-    # The RHS should be Parameter(...) - find the dependency argument inside it
+    # Replace the entire RHS of the kwarg with the new value
     rhs = children(kwarg_node)[2]
-    dep_node = find_dep_in_parameter(rhs)
-
-    if isnothing(dep_node)
-        @warn "Could not find dependency inside Parameter() for kwarg '$(kwarg_name)' in '$(group_name)'"
-        return source
-    end
-
-    br = byte_range(dep_node)
-    return source[1:first(br)-1] * parameter_dep_to_source(new_dep) * source[last(br)+1:end]
+    br = byte_range(rhs)
+    return source[1:first(br)-1] * new_value * source[last(br)+1:end]
 end
 
-# Find the dependency node inside a Parameter(...) call. The dependency can be:
-# - karabo"..." (a macrocall)
-# - Dependency("name") (a call)
-# - a bare identifier (variable name)
-function find_dep_in_parameter(node::SyntaxNode)
-    if kind(node) != K"call"
-        return nothing
-    end
-
-    cs = children(node)
-    (isnothing(cs) || isempty(cs)) && return nothing
-
-    # Check this is a Parameter call
-    name_node = cs[1]
-    if !(is_leaf(name_node) && name_node.val == :Parameter)
-        return nothing
-    end
-
-    # The dependency is the first positional argument (skip the function name
-    # and any parameters/kwargs node)
-    for c in cs[2:end]
-        if kind(c) != K"parameters"
-            return c
-        end
-    end
-
-    return nothing
+# Replace a dependency inside a group constructor's keyword argument.
+# Handles patterns like: `my_group = Foo(; x=karabo"A/B.prop")`
+function replace_group_dep(source::String, group_name::String,
+                           kwarg_name::String, new_dep::Dependency)
+    replace_constructor_kwarg(source, group_name, kwarg_name,
+                              parameter_dep_to_source(new_dep))
 end
 
-# Find the KaraboBridge(...) call node assigned to `bridge_name` in the AST.
-function find_bridge_call(tree::SyntaxNode, bridge_name::String)
-    for node in find_nodes(n -> kind(n) == K"=", tree)
-        cs = children(node)
-        isnothing(cs) || length(cs) < 2 && continue
-
-        lhs, rhs = cs[1], cs[2]
-        if is_leaf(lhs) && lhs.val == Symbol(bridge_name) &&
-           kind(rhs) == K"call" && !isempty(children(rhs)) &&
-           is_leaf(children(rhs)[1]) && children(rhs)[1].val == :KaraboBridge
-            return rhs
-        end
-    end
-    return nothing
-end
-
-# Add or replace the `address` keyword argument in a KaraboBridge constructor
-# call assigned to `bridge_name`.
-function replace_bridge_address(source::String, bridge_name::String, new_address::String)
-    tree = parseall(SyntaxNode, source; ignore_errors=true)
-    call_node = find_bridge_call(tree, bridge_name)
-    if isnothing(call_node)
-        @warn "Could not find KaraboBridge assignment for '$(bridge_name)'"
-        return source
-    end
-
-    # Look for an existing `parameters` node (the kwargs after `;`)
-    params_node = nothing
-    for c in children(call_node)
-        if kind(c) == K"parameters"
-            params_node = c
-            break
-        end
-    end
-
-    if !isnothing(params_node)
-        # Find the address= kwarg inside the parameters node
-        address_node = nothing
-        for c in children(params_node)
-            if kind(c) == K"=" && !isempty(children(c)) &&
-               is_leaf(children(c)[1]) && children(c)[1].val == :address
-                address_node = c
-                break
-            end
-        end
-
-        if !isnothing(address_node)
-            # Replace just the address kwarg value
-            br = byte_range(address_node)
-            return source[1:first(br)-1] * "address=\"$(new_address)\"" * source[last(br)+1:end]
-        else
-            # Parameters exist but no address kwarg — append it
-            br = byte_range(params_node)
-            return source[1:last(br)] * ", address=\"$(new_address)\"" * source[last(br)+1:end]
-        end
-    else
-        # No kwargs at all — insert before the closing paren
-        call_end = last(byte_range(call_node))
-        return source[1:call_end-1] * "; address=\"$(new_address)\"" * source[call_end:end]
-    end
-end
-
-function set_bridge_address(state, bridge_name::String, new_address::String)
+function set_group_param(state, var_name::String, kwarg_name::String, new_value::String)
     client = state.client
     source = client.context.source
 
@@ -403,7 +324,7 @@ function set_bridge_address(state, bridge_name::String, new_address::String)
         return
     end
 
-    new_source = replace_bridge_address(source, bridge_name, new_address)
+    new_source = replace_constructor_kwarg(source, var_name, kwarg_name, new_value)
     if new_source == source
         return
     end

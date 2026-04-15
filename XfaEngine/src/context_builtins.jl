@@ -18,20 +18,15 @@ function KaraboDevice(str::AbstractString)
 end
 
 @Group mutable struct KaraboBridge
-    manual_configuration::Parameter{Bool}
+    manual_configuration::Parameter{Bool} = Parameter(false)
     trainmatcher::Parameter{KaraboDevice}
-    address::Parameter{String}
+    address::Parameter{String} = Parameter("")
 
-    sources::Vector{String}
+    sources::Vector{String} = String[]
 
     # Internal field for testing: when set, get_sources() returns this
     # instead of querying the WebProxy.
-    _mock_sources::Union{Vector{String}, Nothing}
-end
-
-function KaraboBridge(device::KaraboDevice; sources=String[], address="")
-    KaraboBridge(Parameter(false), Parameter(device),
-                 Parameter(address), sources, nothing)
+    _mock_sources::Union{Vector{String}, Nothing} = nothing
 end
 
 input_topic(bridge::KaraboBridge) = let t = bridge.trainmatcher[].topic; isempty(t) ? nothing : t end
