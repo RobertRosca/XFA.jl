@@ -291,52 +291,55 @@ function draw_variable(name, var_data)
     ig.PushID(name)
     ImNodes.BeginNode(var_data["id"])
 
-    # Draw titlebar
-    ImNodes.BeginNodeTitleBar()
-    edited, new_name = ElidedText("var-name-$(name)", name; editable=true)
-    if edited
-        @guiasync rename_variable(state[], name, new_name)
-    end
-    ImNodes.EndNodeTitleBar()
-
-    # Draw custom content
-    origin = var_data["origin"]
-    gui_state = get(client.variable_gui_states, name, nothing)
-    new_gui_state = draw_variable_content(Val(Symbol(origin)), name, var_data, gui_state)
-    if !isnothing(new_gui_state) && !haskey(client.variable_gui_states, name)
-        client.variable_gui_states[name] = new_gui_state
-    end
-
-    if var_data["draw_parameters"]
-        draw_parameters(var_data)
-    end
-
-    ig.Dummy(min_node_width, 20)
-
-    # Draw dependencies
-    deps = var_data["dependencies"]
-    for (dep_id, dep_pair) in deps
-        arg_name, dep = dep_pair
-        # Don't draw pins for parameters
-        if dep isa Parameter
-            continue
+    disable_node = client.context.pipeline_status ∉ (PipelineStatus_Stopped, PipelineStatus_Started)
+    @Disabled disable_node begin
+        # Draw titlebar
+        ImNodes.BeginNodeTitleBar()
+        edited, new_name = ElidedText("var-name-$(name)", name; editable=true)
+        if edited
+            @guiasync rename_variable(state[], name, new_name)
+        end
+        ImNodes.EndNodeTitleBar()
+        # Draw custom content
+        origin = var_data["origin"]
+        gui_state = get(client.variable_gui_states, name, nothing)
+        new_gui_state = draw_variable_content(Val(Symbol(origin)), name, var_data, gui_state)
+        if !isnothing(new_gui_state) && !haskey(client.variable_gui_states, name)
+            client.variable_gui_states[name] = new_gui_state
         end
 
-        dep_ts = get!(client.dep_text_states, dep_id) do
-            DepTextState(dep isa Dependency && dep.kind == DepKind_Karabo)
+        if var_data["draw_parameters"]
+            draw_parameters(var_data)
         end
-        pin_shape = dep_ts.is_karabo ? ImNodes.ImNodesPinShape_TriangleFilled : ImNodes.ImNodesPinShape_CircleFilled
 
-        ImNodes.BeginInputAttribute(dep_id, pin_shape)
-        disable_dep = client.context.pipeline_status ∉ (PipelineStatus_Stopped, PipelineStatus_Started)
-        @Disabled disable_dep begin
+        ig.Dummy(min_node_width, 20)
+
+        # Draw dependencies
+        deps = var_data["dependencies"]
+        for (dep_id, dep_pair) in deps
+            arg_name, dep = dep_pair
+            # Don't draw pins for parameters
+            if dep isa Parameter
+                continue
+            end
+
+            dep_ts = get!(client.dep_text_states, dep_id) do
+                DepTextState(dep isa Dependency && dep.kind == DepKind_Karabo)
+            end
+            pin_shape = dep_ts.is_karabo ? ImNodes.ImNodesPinShape_TriangleFilled : ImNodes.ImNodesPinShape_CircleFilled
+
+            ImNodes.BeginInputAttribute(dep_id, pin_shape)
+            if var_data["type"] == :group
+                ig.Text(arg_name * ":")
+                ig.SameLine()
+            end
             edited, new_dep = draw_dep_editor("dep-$(dep_id)", dep, dep_id; variable_name=name)
             if edited
                 @guiasync rename_dep(state[], name, arg_name, dep, new_dep)
             end
+            ImNodes.EndInputAttribute()
         end
-        ImNodes.EndInputAttribute()
-    end
+    end # @Disabled
 
     ig.Dummy(min_node_width, 10)
 
