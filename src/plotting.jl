@@ -382,9 +382,12 @@ function upload_data!(h::GPUHeatmap, data::AbstractMatrix)
 
     # Upload raw data to the single-channel data texture
     glBindTexture(GL_TEXTURE_2D, h.data_tex)
-    # Julia matrices are column-major; GL reads column-major too, so we pass
-    # cols as width and rows as height.
-    glTexImage2D(GL_TEXTURE_2D, 0, internal_fmt, cols, rows, 0, pixel_fmt, pixel_type, gpu_data)
+    # Julia matrices are column-major: each column of `rows` elements is
+    # contiguous in memory.  OpenGL reads row-major (width elements per
+    # scanline), so we pass rows as width so that each texture row reads
+    # exactly one Julia column.  The resulting texture is the transpose of
+    # the matrix: texture pixel (x, y) = data[x+1, y+1].
+    glTexImage2D(GL_TEXTURE_2D, 0, internal_fmt, rows, cols, 0, pixel_fmt, pixel_type, gpu_data)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
@@ -392,12 +395,12 @@ function upload_data!(h::GPUHeatmap, data::AbstractMatrix)
     glBindTexture(GL_TEXTURE_2D, 0)
 
     # Resize the RGBA output texture and re-attach to FBO when dimensions change
-    if h.width != cols || h.height != rows
-        h.width = cols
-        h.height = rows
+    if h.width != rows || h.height != cols
+        h.width = rows
+        h.height = cols
 
         glBindTexture(GL_TEXTURE_2D, h.output_tex)
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, cols, rows, 0, GL_RGBA, GL_UNSIGNED_BYTE, C_NULL)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, rows, cols, 0, GL_RGBA, GL_UNSIGNED_BYTE, C_NULL)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
@@ -661,20 +664,25 @@ function draw_plot(plot::Plot, store, was_updated)
             plot_flags = plot.fixed_aspect[] ? ImPlot.ImPlotFlags_Equal : ImPlot.ImPlotFlags_None
             if ImPlot.BeginPlot(plot.id, ImVec2(plot_width, plot_size.y), plot_flags)
                 tex_ref = ig.ImTextureRef(ig.ImTextureID(gpu.output_tex))
+                # Texture pixel (x, y) = data[x+1, y+1] due to the
+                # column-major → row-major transpose in upload_data!.
+                # Plot x-axis spans the first dimension (rows) and
+                # y-axis spans the second dimension (cols), flipped so
+                # that data[1,j] is at the top.
                 ImPlot.PlotImage("", tex_ref,
-                                 ImPlot.ImPlotPoint(0, rows),
-                                 ImPlot.ImPlotPoint(cols, 0))
+                                 ImPlot.ImPlotPoint(0, cols),
+                                 ImPlot.ImPlotPoint(rows, 0))
 
                 # Show pixel coordinates and intensity when hovering
                 if ImPlot.IsPlotHovered()
                     mouse = ImPlot.GetPlotMousePos()
-                    col = floor(Int, mouse.x) + 1
-                    row = rows - floor(Int, mouse.y)
-                    if 1 <= col <= rows && 1 <= row <= cols
-                        val = data[col, row]
+                    i = floor(Int, mouse.x) + 1
+                    j = cols - floor(Int, mouse.y)
+                    if 1 <= i <= rows && 1 <= j <= cols
+                        val = data[i, j]
                         ImPlot.AnnotationClamped(mouse.x, mouse.y,
                                                  ImVec2(10, -10),
-                                                 "[$col, $row] $val")
+                                                 "[$i, $j] $val")
                     end
                 end
 
