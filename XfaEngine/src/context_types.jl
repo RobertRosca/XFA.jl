@@ -374,8 +374,8 @@ Parameter(name::String, value) = Parameter(; name, value)
 Parameter(value) = Parameter(; name="", value)
 
 function Parameter(f::Base.Callable, value)
-    if !isnothing(f) && !applicable(f, value)
-        throw(ArgumentError("Parameter update handler must be either `nothing` or a callable that takes a single argument"))
+    if !isnothing(f) && !applicable(f, value) && !applicable(f, nothing, value)
+        throw(ArgumentError("Parameter update handler must be either `nothing` or a callable that takes one argument (value) or two arguments (group, value)"))
     end
 
     Parameter("", value, false, f, nothing)

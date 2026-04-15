@@ -377,7 +377,21 @@ function change_parameter(new_param::Parameter)
         ctx_param = worker_state.parameters[new_param.name]
         if !isnothing(ctx_param.update_handler)
             try
-                ctx_param.update_handler(new_param.value)
+                # If the parameter belongs to a group (name is "group.field"),
+                # pass the group object to the handler along with the new value.
+                dot_idx = findfirst('.', new_param.name)
+                group = if !isnothing(dot_idx) && !isnothing(current_ctx)
+                    group_name = new_param.name[1:dot_idx-1]
+                    current_ctx.groups[group_name]
+                else
+                    nothing
+                end
+
+                if !isnothing(group)
+                    ctx_param.update_handler(group, new_param.value)
+                else
+                    ctx_param.update_handler(new_param.value)
+                end
             catch ex
                 @error "Exception in update handler for parameter '$(ctx_param.name)'" exception=ex
             end

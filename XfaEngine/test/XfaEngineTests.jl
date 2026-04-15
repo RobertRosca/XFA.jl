@@ -1051,6 +1051,33 @@ end
             @test take!(ctx.stream_output).data == 1
             @test Context.worker_state.current_ctx_module.x_side_effect == 1
         end
+
+        # Test that group parameter update handlers receive the group object
+        ctx = Context.load_from_string(raw"""
+        @Input function input(::Context.MockInput, output)
+            put!(output, (42, Dict("motor1" => Dict("pos" => 1))))
+        end
+        i = Context.MockInput()
+
+        @Group @kwdef mutable struct MyGroup
+            handler_received_value::Int = 0
+            x::Parameter{Int} = Parameter(10) do group, value
+                group.handler_received_value = value * 2
+            end
+        end
+
+        g = MyGroup()
+
+        @Variable function foo(_ -> karabo"motor1.pos")
+            return g.x[]
+        end
+        """)
+        Context.run(ctx) do
+            @test take!(ctx.stream_output) == VariableData(42, "foo", 10)
+            Context.change_parameter(Parameter("g.x", 5))
+            @test ctx.groups["g"].handler_received_value == 10
+            @test ctx.groups["g"].x[] == 5
+        end
     end
 
     @testset "Multiple inputs" begin
