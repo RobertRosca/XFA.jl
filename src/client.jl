@@ -551,16 +551,19 @@ function collect_properties!(props, prefix, node::Dict, target::PropertyList=pro
 end
 
 # Store or update a VariableStore for a given variable/subvariable.
-function store_variable_data!(client, name, tid, data)
+function store_variable_data!(client, variable::VariableData)
+    data = variable.data
+    name = variable.name
+
     if !haskey(client.variable_data, name)
         if data isa Number
             values = CircularBuffer{Float64}(SCALAR_BUFFER_CAPACITY)
             tids = CircularBuffer{Int}(SCALAR_BUFFER_CAPACITY)
             push!(values, data)
-            push!(tids, tid)
-            client.variable_data[name] = VariableStore(values, tids)
+            push!(tids, variable.tid)
+            client.variable_data[name] = VariableStore(; data=values, scalar_tids=tids)
         elseif data isa AbstractArray
-            client.variable_data[name] = VariableStore(data)
+            client.variable_data[name] = VariableStore(; data)
         else
             @error "Unsupported variable type: $(typeof(data))"
             return
@@ -568,6 +571,39 @@ function store_variable_data!(client, name, tid, data)
     end
 
     store = client.variable_data[name]
+    store.title = if !isnothing(variable.title)
+        variable.title
+    elseif data isa DimArray
+        DD.label(data)
+    else
+        name
+    end
+    store.x_axis = variable.x_axis
+    store.y_axis = variable.y_axis
+    store.unit = variable.unit
+    store.fixed_aspect = variable.fixed_aspect
+    # if name == "foo.correlate"
+    #     @info variable.fixed_aspect
+    # end
+
+    # Use explicit labels if provided, otherwise derive from DimArray or data type
+    store.xlabel = if !isnothing(variable.xlabel)
+        variable.xlabel
+    elseif data isa DimArray
+        DD.label(DD.dims(data)[1])
+    elseif data isa Number
+        "trainId"
+    else
+        ""
+    end
+    store.ylabel = if !isnothing(variable.ylabel)
+        variable.ylabel
+    elseif data isa DimArray
+        DD.label(data)
+    else
+        ""
+    end
+
     type = if data isa Number
         VariableType_Scalar
     elseif data isa AbstractVector
@@ -577,7 +613,7 @@ function store_variable_data!(client, name, tid, data)
     else
         VariableType_Unknown
     end
-    push!(store.updates, (tid, data, type))
+    push!(store.updates, (variable.tid, data, type))
 
     ts = store.update_timestamps
     push!(ts, time())
@@ -653,10 +689,10 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
         client.context.pipeline_status = msg.is_running ? PipelineStatus_Started : PipelineStatus_Stopped
     elseif msg isa TrainData
         for variable in msg.variables
-            store_variable_data!(client, variable.name, variable.tid, variable.data)
+            store_variable_data!(client, variable)
 
-            for (subvar_name, subvar_data) in variable.subvariables
-                store_variable_data!(client, subvar_name, variable.tid, subvar_data)
+            for subvar in values(variable.subvariables)
+                store_variable_data!(client, subvar)
             end
         end
     elseif msg isa ParameterChanged

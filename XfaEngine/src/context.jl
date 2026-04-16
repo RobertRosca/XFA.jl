@@ -419,6 +419,17 @@ function input_wrapper(name, group, channel)
     end
 end
 
+function wrap_result(result, tid, name; subvariables=Dict{String, Any}())
+    if result isa VariableData
+        VariableData(; tid, name, data=result.data, subvariables,
+                     title=result.title, x_axis=result.x_axis, y_axis=result.y_axis,
+                     xlabel=result.xlabel, ylabel=result.ylabel, unit=result.unit,
+                     fixed_aspect=result.fixed_aspect)
+    else
+        VariableData(; tid, name, data=result, subvariables)
+    end
+end
+
 function maybe_send_output(channel, data::VariableData)
     # Semi-arbitrarily set a threshold of 30MB, which is just under twice the
     # size of a Float32 2k camera.
@@ -524,7 +535,7 @@ function stream_variable(name, stream_output, upstream, downstream, deps)
                 if dep.kind == DepKind_Group
                     args[i] = upstream[dep.name]
                 elseif dep.kind == DepKind_Subvariable
-                    args[i] = matched_data[dep.parent].subvariables[dep.name]
+                    args[i] = matched_data[dep.parent].subvariables[dep.name].data
                 else
                     args[i] = matched_data[dep.name].data
                 end
@@ -553,8 +564,13 @@ function stream_variable(name, stream_output, upstream, downstream, deps)
                 continue
             end
 
+            # Wrap subvariable values in VariableData
+            for (subvar_name, subvar_value) in subvar_values
+                subvar_values[subvar_name] = wrap_result(subvar_value, tid, subvar_name)
+            end
+
             # Send output
-            out = VariableData(tid, name, out, subvar_values)
+            out = wrap_result(out, tid, name; subvariables=subvar_values)
             maybe_send_output(stream_output, out)
             putall!(values(downstream), out)
             @debug "Pushed output from '$(name)' to: $(keys(downstream))"
@@ -867,9 +883,7 @@ function load_from_string(ctx_str::AbstractString)
     ctx_module = Module(Symbol(:XfaContext, gensym()))
     init_expr = quote
         using XfaEngine.Context
-        import XfaEngine.Context: Parameter, KaraboBridge, Meta
-
-        # _xfa_parameters = Parameter[]
+        using XfaEngine.Context: VariableData, Parameter, KaraboBridge, Meta
     end
     @eval ctx_module $init_expr
 

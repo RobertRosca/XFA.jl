@@ -27,7 +27,7 @@ using Serialization
 using XfaEngine.Protocol
 using XfaEngine: XfaEngine, Protocol
 using XfaEngine.Context: Dependency, DependencyKind, DepKind_Variable, DepKind_Karabo, DepKind_Group,
-    karabo_dependency, Parameter, KaraboDevice
+    karabo_dependency, Parameter, KaraboDevice, VariableData
 
 include("imgui_helpers.jl")
 include("state_inspector.jl")

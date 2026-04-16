@@ -590,13 +590,11 @@ function draw_plot(plot::Plot, store, was_updated)
     ig.SetNextWindowSize((800, 500), ig.ImGuiCond_FirstUseEver)
 
     data = store.data
-    if ig.Begin(plot.id, plot.open)
+    if ig.Begin("$(store.title)##$(plot.id)", plot.open)
         plot.dock_id = ig.GetWindowDockID()
         is_dimarray = data isa DimArray
         is_scalar = data isa CircularBuffer
-        data_dims = is_dimarray ? DD.dims(data) : nothing
-        xlabel = is_dimarray ? DD.label(data_dims[1]) : is_scalar ? "trainId" : ""
-        label = is_dimarray ? DD.label(data) : plot.name
+        label = store.title
 
         apply_autoscale(plot)
 
@@ -607,7 +605,7 @@ function draw_plot(plot::Plot, store, was_updated)
         if no_data
             ig.Text("Array has length 0, nothing to plot")
         elseif data isa AbstractVector
-            if ImPlot.BeginPlot(plot.id, xlabel, "", plot_size)
+            if ImPlot.BeginPlot(store.title, store.xlabel, store.ylabel, plot_size)
                 if is_scalar
                     tids = store.scalar_tids_cache
                     vals = store.scalar_data_cache
@@ -640,6 +638,8 @@ function draw_plot(plot::Plot, store, was_updated)
             needs_initial_upload = isnothing(plot.gpu_heatmap)
             if needs_initial_upload
                 plot.gpu_heatmap = GPUHeatmap()
+                plot.fixed_aspect[] = store.fixed_aspect
+                @info store.fixed_aspect
             end
             gpu = plot.gpu_heatmap
 
@@ -662,16 +662,23 @@ function draw_plot(plot::Plot, store, was_updated)
             plot_width = max(plot_size.x - colorbar_width, 100)
 
             plot_flags = plot.fixed_aspect[] ? ImPlot.ImPlotFlags_Equal : ImPlot.ImPlotFlags_None
-            if ImPlot.BeginPlot(plot.id, ImVec2(plot_width, plot_size.y), plot_flags)
+            if ImPlot.BeginPlot(store.title, ImVec2(plot_width, plot_size.y), plot_flags)
+                ImPlot.SetupAxes(store.xlabel, store.ylabel)
                 tex_ref = ig.ImTextureRef(ig.ImTextureID(gpu.output_tex))
                 # Texture pixel (x, y) = data[x+1, y+1] due to the
                 # column-major → row-major transpose in upload_data!.
                 # Plot x-axis spans the first dimension (rows) and
                 # y-axis spans the second dimension (cols), flipped so
                 # that data[1,j] is at the top.
+                has_x_axis = !isnothing(store.x_axis)
+                has_y_axis = !isnothing(store.y_axis)
+                x_min = has_x_axis ? first(store.x_axis) : 0
+                x_max = has_x_axis ? last(store.x_axis) : rows
+                y_min = has_y_axis ? first(store.y_axis) : 0
+                y_max = has_y_axis ? last(store.y_axis) : cols
                 ImPlot.PlotImage("", tex_ref,
-                                 ImPlot.ImPlotPoint(0, cols),
-                                 ImPlot.ImPlotPoint(rows, 0))
+                                 ImPlot.ImPlotPoint(x_min, y_min),
+                                 ImPlot.ImPlotPoint(x_max, y_max))
 
                 # Show pixel coordinates and intensity when hovering
                 if ImPlot.IsPlotHovered()

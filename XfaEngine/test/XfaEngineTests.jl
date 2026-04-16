@@ -1002,8 +1002,38 @@ end
             push!(results, take!(ctx.stream_output))
         end
         @test length(results) == 2
-        @test results[1] == VariableData(0, "foo", 10, Dict{String, Any}("foo.half" => 5.0))
+        @test results[1] == VariableData(0, "foo", 10, Dict{String, Any}("foo.half" => VariableData(0, "foo.half", 5.0)))
         @test results[2] == VariableData(0, "bar", 6.0)
+
+        # Test that returning a VariableData from a variable function overwrites
+        # tid, name, and subvariables but preserves metadata fields.
+        ctx = Context.load_from_string(raw"""
+        @Input function input(::Context.MockInput, output)
+            put!(output, (5, Dict("motor1" => Dict("pos" => 10))))
+        end
+        x = Context.MockInput()
+
+        @Variable function foo(data -> karabo"motor1.pos")
+            @add_subvariable("half", data / 2)
+            return VariableData(; data=data * 2, xlabel="my x", ylabel="my y",
+                                x_axis=[1.0, 2.0, 3.0], y_axis=[1, 2, 3],
+                                title="Foo", unit="j")
+        end
+        """)
+        Context.run(ctx) do
+            @test timedwait(() -> !isopen(ctx.stream_output), 5) == :ok
+        end
+        result = take!(ctx.stream_output)
+        @test result.tid == 5
+        @test result.name == "foo"
+        @test result.data == 20
+        @test result.subvariables == Dict{String, Any}("foo.half" => VariableData(5, "foo.half", 5.0))
+        @test result.xlabel == "my x"
+        @test result.ylabel == "my y"
+        @test result.x_axis == [1.0, 2.0, 3.0]
+        @test result.y_axis == [1, 2, 3]
+        @test result.title == "Foo"
+        @test result.unit == "j"
 
         # Test input groups
         ctx = Context.load_from_string(raw"""

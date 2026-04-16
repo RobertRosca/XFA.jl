@@ -142,35 +142,34 @@ end
 
 const SCALAR_BUFFER_CAPACITY = 10_000
 
-mutable struct VariableStore
-    const updates::Channel
+@kwdef mutable struct VariableStore
+    const updates::Channel = Channel(100)
     data::Union{Vector, Matrix, DimVector, DimMatrix, CircularBuffer}
-    type::VariableType
+    type::VariableType = VariableType_Unknown
 
     # This field is only used for non-scalar data. Scalar data is stored as a
     # CircularBuffer with a parallel CircularBuffer for train IDs.
-    trainId::Int
+    trainId::Int = -1
 
     # Train IDs for scalar data, parallel to `data` when it's a CircularBuffer
-    scalar_tids::Maybe{CircularBuffer{Int}}
+    scalar_tids::Maybe{CircularBuffer{Int}} = nothing
 
     # Contiguous caches for plotting scalar CircularBuffer data
-    const scalar_data_cache::Vector{Float64}
-    const scalar_tids_cache::Vector{Float64}
+    const scalar_data_cache::Vector{Float64} = Float64[]
+    const scalar_tids_cache::Vector{Float64} = Float64[]
 
     # Timestamps of recent updates for computing average rate (updates/sec)
-    const update_timestamps::Vector{Float64}
-    update_rate::Float64
-end
+    const update_timestamps::Vector{Float64} = Float64[]
+    update_rate::Float64 = 0.0
 
-function VariableStore(data)
-    VariableStore(Channel(100), data, VariableType_Unknown, -1, nothing,
-                  Float64[], Float64[], Float64[], 0.0)
-end
-
-function VariableStore(data::CircularBuffer, tids::CircularBuffer{Int})
-    VariableStore(Channel(100), data, VariableType_Unknown, -1, tids,
-                  Float64[], Float64[], Float64[], 0.0)
+    # Metadata from VariableData
+    title::String = ""
+    x_axis::Maybe{AbstractVector} = nothing
+    y_axis::Maybe{AbstractVector} = nothing
+    xlabel::String = ""
+    ylabel::String = ""
+    unit::Maybe{String} = nothing
+    fixed_aspect::Bool = false
 end
 
 @kwdef mutable struct ContextState
