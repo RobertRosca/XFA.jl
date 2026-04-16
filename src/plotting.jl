@@ -179,12 +179,12 @@ function create_heatmap_context()
     # the matrix appears at the top of the image.
     #   Each vertex: (x, y, u, v)
     quad_vertices = Float32[
-        -1, -1, 0, 1,  # bottom-left
-         1, -1, 1, 1,  # bottom-right
-        -1,  1, 0, 0,  # top-left
-         1, -1, 1, 1,  # bottom-right
-         1,  1, 1, 0,  # top-right
-        -1,  1, 0, 0,  # top-left
+        -1, -1, 0, 0,  # bottom-left
+         1, -1, 1, 0,  # bottom-right
+        -1,  1, 0, 1,  # top-left
+         1, -1, 1, 0,  # bottom-right
+         1,  1, 1, 1,  # top-right
+        -1,  1, 0, 1,  # top-left
     ]
 
     vao_ref = Ref{GLuint}(0)
@@ -668,8 +668,7 @@ function draw_plot(plot::Plot, store, was_updated)
                 # Texture pixel (x, y) = data[x+1, y+1] due to the
                 # column-major → row-major transpose in upload_data!.
                 # Plot x-axis spans the first dimension (rows) and
-                # y-axis spans the second dimension (cols), flipped so
-                # that data[1,j] is at the top.
+                # y-axis spans the second dimension (cols).
                 has_x_axis = !isnothing(store.x_axis)
                 has_y_axis = !isnothing(store.y_axis)
                 x_min = has_x_axis ? first(store.x_axis) : 0
@@ -683,8 +682,8 @@ function draw_plot(plot::Plot, store, was_updated)
                 # Show pixel coordinates and intensity when hovering
                 if ImPlot.IsPlotHovered()
                     mouse = ImPlot.GetPlotMousePos()
-                    i = floor(Int, mouse.x) + 1
-                    j = cols - floor(Int, mouse.y)
+                    i = has_x_axis ? floor(Int, (mouse.x - x_min) / (x_max - x_min) * rows) + 1 : floor(Int, mouse.x) + 1
+                    j = has_y_axis ? floor(Int, (mouse.y - y_min) / (y_max - y_min) * cols) + 1 : floor(Int, mouse.y) + 1
                     if 1 <= i <= rows && 1 <= j <= cols
                         val = data[i, j]
                         ImPlot.AnnotationClamped(mouse.x, mouse.y,
