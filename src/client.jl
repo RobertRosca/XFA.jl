@@ -306,6 +306,53 @@ function disconnect_engine(state, shutdown_engine)
     # Note that we use setfield!() here to bypass the locking, which would
     # otherwise cause locking mismatches.
     setfield!(state, :client, ClientState(load_settings()))
+
+# Restart the engine by shutting it down, waiting for it to die, and then
+# re-initializing it. The SSH session is kept alive.
+function restart_engine(state)
+    client = state.client
+    if client.status ∉ (RemoteStatus_Connected, RemoteStatus_Initializing)
+        @warn "The engine has status $(client.status), it's not valid to restart in that state"
+        return
+    end
+
+    client.status = RemoteStatus_Disconnecting
+
+    # Send the shutdown message
+    if !isnothing(client.websocket) && !WebSockets.isclosed(client.websocket)
+        send(client, Shutdown())
+        timedwait(() -> WebSockets.isclosed(client.websocket), 10)
+    end
+
+    # Wait for the engine process to die
+    pid = Int(client.worker_info["1"]["pid"])
+    if client.embedded_engine
+        if !isnothing(client.engine)
+            notify(client.engine.stop_event)
+            wait(client.engine.stop_task)
+        end
+        rm("worker-info.toml"; force=true)
+    else
+        session = client.ssh_hops[end].session
+        run("for i in \$(seq 1 20); do kill -0 $(pid) 2>/dev/null || break; sleep 0.5; done", session; wait=true)
+    end
+
+    # Close the websocket and forwarder but keep SSH alive
+    if !isnothing(client.websocket)
+        close(client.websocket)
+    end
+    if !isnothing(client.ws_forwarder)
+        close(client.ws_forwarder)
+    end
+
+    client.websocket = nothing
+    client.ws_forwarder = nothing
+    client.worker_info = Dict()
+    client.engine = nothing
+    empty!(client.variable_data)
+
+    # Re-initialize the engine
+    initialize_engine(state)
 end
 
 # Create a Int32 hash to use for ImNodes
@@ -616,9 +663,6 @@ function store_variable_data!(client, variable::VariableData)
     store.y_axis = variable.y_axis
     store.unit = variable.unit
     store.fixed_aspect = variable.fixed_aspect
-    # if name == "foo.correlate"
-    #     @info variable.fixed_aspect
-    # end
 
     # Use explicit labels if provided, otherwise derive from DimArray or data type
     store.xlabel = if !isnothing(variable.xlabel)
@@ -780,7 +824,7 @@ function handle_server(state)
             # because the server is running locally or because it's running remotely
             # and we've forwarded the port. Connecting to open servers is not
             # support for the moment.
-            WebSockets.open("ws://localhost:$(port)") do ws
+            WebSockets.open("ws://localhost:$(port)"; suppress_close_error=true) do ws
                 client.websocket = ws
 
                 # The first messages we receive are our client ID and engine directory
@@ -849,8 +893,10 @@ function handle_server(state)
 
         # Call the shutdown function to ensure that the tunnel is killed too
         disconnect_engine(state, false)
-    else
-        # Otherwise we've disconnected normally
+    elseif client.status != RemoteStatus_Disconnecting
+        # Otherwise we've disconnected normally. Don't overwrite
+        # RemoteStatus_Disconnecting since disconnect_engine() manages
+        # that transition.
         client.status = RemoteStatus_Unconnected
     end
 end

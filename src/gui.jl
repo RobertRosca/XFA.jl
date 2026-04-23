@@ -914,6 +914,14 @@ function draw_gui()
                 end
             end
 
+            ig.SameLine()
+
+            @Disabled client.status != RemoteStatus_Connected begin
+                if ig.Button("Restart")
+                    @guiasync restart_engine(state[])
+                end
+            end
+
             ig.Dummy(0, 20)
             if client.status == RemoteStatus_Disconnecting
                 Spinner("Disconnecting...")
