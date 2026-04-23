@@ -330,7 +330,8 @@ function draw_variable(name, var_data)
     @Disabled disable_node begin
         # Draw titlebar
         ImNodes.BeginNodeTitleBar()
-        edited, new_name = ElidedText("var-name-$(name)", name; editable=true)
+        edited, new_name = ElidedText("var-name-$(name)", name; editable=true,
+                                      validator=variable_name_validator(name))
         if edited
             @guiasync rename_variable(state[], name, new_name)
         end

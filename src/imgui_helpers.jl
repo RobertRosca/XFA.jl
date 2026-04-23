@@ -59,7 +59,7 @@ function EditableComboBox(label, text, completions;
 end
 
 function SafeInputText(label; max_len=127, hint="", current_text="", password=false, reset=false,
-                       callback=C_NULL, user_data=C_NULL)
+                       callback=C_NULL, user_data=C_NULL, validator=nothing)
     id = ig.GetID(label)
     if !haskey(safe_input_text_cache, id) || reset
         safe_input_text_cache[id] = SafeInputTextState(max_len, current_text)
@@ -82,13 +82,24 @@ function SafeInputText(label; max_len=127, hint="", current_text="", password=fa
     end
 
     modified = unsafe_string(pointer(state.buffer)) != current_text
+    validation_error = if !isnothing(validator) && modified
+        validator(unsafe_string(pointer(state.buffer)))
+    else
+        nothing
+    end
 
-    if modified
+    if !isnothing(validation_error)
+        ig.PushStyleColor(ig.ImGuiCol_FrameBg, ig.IM_COL32(180, 40, 40, 255))
+    elseif modified
         ig.PushStyleColor(ig.ImGuiCol_FrameBg, ig.IM_COL32(143, 98, 0, 255))
     end
     ret = ig.InputTextWithHint(label, hint, pointer(state.buffer), length(state.buffer),
                                flags, callback, user_data)
-    if modified
+    if !isnothing(validation_error)
+        ig.PopStyleColor()
+        ig.Text(validation_error)
+        ret = false
+    elseif modified
         ig.PopStyleColor()
     end
 
@@ -316,7 +327,8 @@ function ElidedText(label::AbstractString, text::AbstractString;
                     completions=nothing,
                     completion_text::Function=string,
                     completion_renderer::Function=default_completion_renderer,
-                    callback=C_NULL, user_data=C_NULL)
+                    callback=C_NULL, user_data=C_NULL,
+                    validator=nothing)
     id = ig.GetID(label)
     state = get!(ElidedTextState, elided_text_states, id)
     if focus && state.edit == ElidedEditState_NoEdit
@@ -334,7 +346,7 @@ function ElidedText(label::AbstractString, text::AbstractString;
         end
         ig.SetNextItemWidth(max(min_width, ig.CalcTextSize(text).x + 40))
         edited, new_text = SafeInputText("##elided-$(label)"; current_text=text, reset=just_started,
-                                         callback, user_data)
+                                         callback, user_data, validator)
         lost_focus = !just_started && ig.IsItemDeactivated() && !ig.IsItemActive()
 
         # Draw autocomplete popup if completions are provided
@@ -741,3 +753,19 @@ function DepText(label, dep::Dependency, dep_state::DepTextState,
 
     return false, dep
 end
+
+function variable_name_validator(new_name, current_name)
+    client = state[].client
+
+    if isempty(new_name)
+        "Name cannot be empty"
+    elseif !Meta.isidentifier(new_name)
+        "'$(new_name)' is not a valid Julia identifier"
+    elseif new_name ∈ client.variable_names && new_name != current_name
+        "A variable named '$(new_name)' already exists"
+    else
+        nothing
+    end
+end
+
+variable_name_validator(current_name) = Base.Fix2(variable_name_validator, current_name)
