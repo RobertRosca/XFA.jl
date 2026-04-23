@@ -102,11 +102,11 @@ function draw_parameter_widget(name, param::Parameter{Float64})
 end
 
 function draw_parameter_widget(name, param::Parameter{Int})
-    int32_value = Int32(param.value)
-    @c ig.InputInt("##$(name)", &int32_value)
-    param.value = Int(int32_value)
+    int32_ref = Ref(Int32(param.value))
+    ret = ig.InputInt("##$(name)", int32_ref)
+    param.value = Int(int32_ref[])
 
-    return false, nothing
+    return ret, param.value
 end
 
 function draw_parameter_widget(name, param::Parameter{String})
