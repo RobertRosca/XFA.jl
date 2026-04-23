@@ -175,16 +175,20 @@ function create_heatmap_context()
     colormap_tex = colormap_tex_ref[]
 
     # Build a fullscreen quad: two triangles covering [-1,1] in clip space.
-    # UV is flipped vertically (v=1 at bottom, v=0 at top) so that row 0 of
-    # the matrix appears at the top of the image.
+    # UVs are transposed (u↔v swapped) so that the first matrix dim maps to
+    # the vertical axis and the second to the horizontal, matching matplotlib
+    # (data[1,1] at top-left, data[rows,cols] at bottom-right). The data texture
+    # is uploaded as-is (Julia-column-major → texture scanline), so the shader
+    # samples data_tex(v, u) to get data[i=u_in_pixels+1, j=v_in_pixels+1]
+    # effectively transposed here via the UV swap.
     #   Each vertex: (x, y, u, v)
     quad_vertices = Float32[
         -1, -1, 0, 0,  # bottom-left
-         1, -1, 1, 0,  # bottom-right
-        -1,  1, 0, 1,  # top-left
-         1, -1, 1, 0,  # bottom-right
+         1, -1, 0, 1,  # bottom-right
+        -1,  1, 1, 0,  # top-left
+         1, -1, 0, 1,  # bottom-right
          1,  1, 1, 1,  # top-right
-        -1,  1, 0, 1,  # top-left
+        -1,  1, 1, 0,  # top-left
     ]
 
     vao_ref = Ref{GLuint}(0)
@@ -394,13 +398,15 @@ function upload_data!(h::GPUHeatmap, data::AbstractMatrix)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
     glBindTexture(GL_TEXTURE_2D, 0)
 
-    # Resize the RGBA output texture and re-attach to FBO when dimensions change
-    if h.width != rows || h.height != cols
-        h.width = rows
-        h.height = cols
+    # Resize the RGBA output texture and re-attach to FBO when dimensions change.
+    # Output is the visually-oriented image (width=cols, height=rows) — the quad
+    # UVs transpose the input while rendering.
+    if h.width != cols || h.height != rows
+        h.width = cols
+        h.height = rows
 
         glBindTexture(GL_TEXTURE_2D, h.output_tex)
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, rows, cols, 0, GL_RGBA, GL_UNSIGNED_BYTE, C_NULL)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, cols, rows, 0, GL_RGBA, GL_UNSIGNED_BYTE, C_NULL)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
@@ -639,7 +645,6 @@ function draw_plot(plot::Plot, store, was_updated)
             if needs_initial_upload
                 plot.gpu_heatmap = GPUHeatmap()
                 plot.fixed_aspect[] = store.fixed_aspect
-                @info store.fixed_aspect
             end
             gpu = plot.gpu_heatmap
 
@@ -665,16 +670,15 @@ function draw_plot(plot::Plot, store, was_updated)
             if ImPlot.BeginPlot(store.title, ImVec2(plot_width, plot_size.y), plot_flags)
                 ImPlot.SetupAxes(store.xlabel, store.ylabel)
                 tex_ref = ig.ImTextureRef(ig.ImTextureID(gpu.output_tex))
-                # Texture pixel (x, y) = data[x+1, y+1] due to the
-                # column-major → row-major transpose in upload_data!.
-                # Plot x-axis spans the first dimension (rows) and
-                # y-axis spans the second dimension (cols).
+                # Matplotlib convention: first dim = row (vertical, top→bottom),
+                # second dim = col (horizontal, left→right). data[1,1] at plot
+                # top-left; data[rows,cols] at plot bottom-right.
                 has_x_axis = !isnothing(store.x_axis)
                 has_y_axis = !isnothing(store.y_axis)
                 x_min = has_x_axis ? first(store.x_axis) : 0
-                x_max = has_x_axis ? last(store.x_axis) : rows
+                x_max = has_x_axis ? last(store.x_axis) : cols
                 y_min = has_y_axis ? first(store.y_axis) : 0
-                y_max = has_y_axis ? last(store.y_axis) : cols
+                y_max = has_y_axis ? last(store.y_axis) : rows
                 ImPlot.PlotImage("", tex_ref,
                                  ImPlot.ImPlotPoint(x_min, y_min),
                                  ImPlot.ImPlotPoint(x_max, y_max))
@@ -682,8 +686,8 @@ function draw_plot(plot::Plot, store, was_updated)
                 # Show pixel coordinates and intensity when hovering
                 if ImPlot.IsPlotHovered()
                     mouse = ImPlot.GetPlotMousePos()
-                    i = has_x_axis ? floor(Int, (mouse.x - x_min) / (x_max - x_min) * rows) + 1 : floor(Int, mouse.x) + 1
-                    j = has_y_axis ? floor(Int, (mouse.y - y_min) / (y_max - y_min) * cols) + 1 : floor(Int, mouse.y) + 1
+                    j = floor(Int, (mouse.x - x_min) / (x_max - x_min) * cols) + 1
+                    i = floor(Int, (y_max - mouse.y) / (y_max - y_min) * rows) + 1
                     if 1 <= i <= rows && 1 <= j <= cols
                         val = data[i, j]
                         ImPlot.AnnotationClamped(mouse.x, mouse.y,
