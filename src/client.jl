@@ -203,7 +203,7 @@ function initialize_engine(state)
     julia_module_prefix = if is_local
         "true"
     else
-        "source /etc/profile.d/modules.sh; SASE=0 module load exfel julia/202502 > /dev/null 2>&1"
+        "source /etc/profile.d/modules.sh; SASE=0 module load exfel julia/202601 > /dev/null 2>&1"
     end
 
     bootstrap_process = nothing
