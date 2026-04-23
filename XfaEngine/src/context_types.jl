@@ -34,6 +34,16 @@ end
     parameter::Union{String, Nothing} = nothing
 end
 
+function Base.show(io::IO, dep::Dependency)
+    if dep.kind == DepKind_Karabo
+        print(io, "karabo\"$(dep.name)\"")
+    elseif dep.kind ∈ (DepKind_Variable, DepKind_Subvariable)
+        print(io, Dependency, "(\"$(dep.name)\")")
+    else
+        print(io, Dependency, "(kind=$(dep.kind), name=$(dep.name))")
+    end
+end
+
 Base.string(dep::Dependency) = dep.name
 
 # Variable dependency
