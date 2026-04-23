@@ -14,6 +14,12 @@ import OrderedCollections: OrderedDict
 import DimensionalData as DD
 import ..XfaEngine
 
+include("circular_channel.jl")
+
+# Factory for RemoteChannels carrying per-train variable data. Oldest items
+# are overwritten when a consumer falls behind; drops are counted per channel.
+variable_channel() = RemoteChannel(() -> CircularChannel{VariableData}(100))
+
 # Trait functions for dispatch-based metadata registration.
 # Overloaded by @Variable, @Input, and @Group macros for each
 # function/type they define, enabling Revise compatibility.
@@ -369,13 +375,6 @@ function execute_variables(ctx::XfaContext, inputs::Dict)
     return results
 end
 
-struct TrainData{T}
-    tid::UInt64
-    data::T
-end
-
-TrainData(tid, data) = TrainData(UInt64(tid), data)
-
 function change_parameter(ctx::XfaContext, new_param::Parameter)
     pause_pipeline() do
         ctx_param = worker_state.parameters[new_param.name]
@@ -462,7 +461,7 @@ function stream_input(name, channel, downstream_neighbours)
         while isopen(channel) || isready(channel)
             tid, sources = take!(channel)
 
-            putall!(values(downstream_neighbours), TrainData(tid, sources))
+            putall!(values(downstream_neighbours), VariableData(; tid=Int(tid), data=sources))
             @debug "Pushed input data from '$(name)' to: $(keys(downstream_neighbours))"
         end
     catch ex
@@ -667,7 +666,7 @@ function pause_pipeline(f::Function)
 end
 
 function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50)
-    ctx.stream_output = RemoteChannel(() -> Channel(100))
+    ctx.stream_output = variable_channel()
     ctx.events_channel = RemoteChannel(() -> Channel(100))
     ctx.output_forwarder_task = Threads.@spawn ctx.forwarder(ctx.stream_output)
     errormonitor(ctx.output_forwarder_task)
@@ -707,7 +706,7 @@ function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50)
         for dep in external_dependencies(ctx)
             dep_name = string(dep)
             if get(ctx.dep_to_input, dep_name, nothing) == name
-                downstream_neighbours[dep_name] = RemoteChannel()
+                downstream_neighbours[dep_name] = variable_channel()
             end
         end
         ctx.input_variable_channels[name] = downstream_neighbours
@@ -726,7 +725,7 @@ function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50)
 
         downstream_neighbours = Dict{String, RemoteChannel}()
         for neighbour in find_downstream_neighbours(ctx, dep_name, DepKind_Karabo)
-            downstream_neighbours[neighbour] = RemoteChannel()
+            downstream_neighbours[neighbour] = variable_channel()
         end
         ctx.external_dependency_channels[dep_name] = downstream_neighbours
 
@@ -767,11 +766,11 @@ function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50)
         # subvariables.
         downstream = Dict{String, RemoteChannel}()
         for neighbour in find_downstream_neighbours(ctx, name, DepKind_Variable)
-            downstream[neighbour] = RemoteChannel()
+            downstream[neighbour] = variable_channel()
         end
         for neighbour in find_downstream_neighbours(ctx, name, DepKind_Subvariable)
             if !haskey(downstream, neighbour)
-                downstream[neighbour] = RemoteChannel()
+                downstream[neighbour] = variable_channel()
             end
         end
         ctx.variable_channels[name] = downstream

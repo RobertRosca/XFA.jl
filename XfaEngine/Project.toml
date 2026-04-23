@@ -4,6 +4,7 @@ version = "0.1.0"
 authors = ["JamesWrigley <james.wrigley@xfel.eu>"]
 
 [deps]
+DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
 DimensionalData = "0703355e-b756-11e9-17c0-8b28908087d0"
 DistributedNext = "fab6aee4-877b-4bac-a744-3eca44acbb6f"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
@@ -21,6 +22,7 @@ TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 ZMQ = "c2297ded-f4af-51ae-bb23-16f91089e4e1"
 
 [compat]
+DataStructures = "0.19.4"
 DimensionalData = "0.30"
 DistributedNext = "1.0.0"
 RemoteREPL = "0.3.0"

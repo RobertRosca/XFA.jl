@@ -11,12 +11,13 @@ using ReTest: @testset, @test, @test_throws, @test_logs
 using ZMQ: ZMQ
 using HTTP: HTTP, WebSockets
 using OrderedCollections: OrderedDict as OD
+using DataStructures: CircularBuffer, capacity
 
 using XfaEngine: XfaEngine, Context, KaraboBridge, Protocol
 using XfaEngine.Context: @Variable, @karabo_str, VariableData, Dependency, DependencyKind,
     DepKind_Variable, DepKind_Subvariable, DepKind_Karabo, DepKind_Group, DepKind_GroupParameter,
     karabo_dependency, subvariable_dependency, group_dependency, group_parameter_dependency,
-    XfaContextException, Parameter, FunctionArgument, KaraboDevice
+    XfaContextException, Parameter, FunctionArgument, KaraboDevice, CircularChannel, drop_count
 using XfaEngine.KaraboBridge: KaraboBridgeClient, KaraboBridgeServer, ThreadsafeSocket
 
 
@@ -91,6 +92,63 @@ function temp_engine(f::Function; log=Logging.global_logger())
             wait(state.stop_task)
         end
     end
+end
+
+@testset "CircularChannel" begin
+    # Basic FIFO behaviour when within capacity
+    c = CircularChannel{Int}(3)
+    @test isopen(c) && !isready(c)
+    put!(c, 1)
+    put!(c, 2)
+    @test isready(c) && drop_count(c) == 0
+    @test take!(c) == 1 && take!(c) == 2
+    @test !isready(c)
+
+    # Overwrite-oldest when full: 5 puts into capacity 3 → drops=2, remaining 3,4,5
+    for i in 1:5
+        put!(c, i)
+    end
+    @test drop_count(c) == 2
+    @test [take!(c) for _ in 1:3] == [3, 4, 5]
+
+    # take! blocks until put! and is woken by notify.
+    c = CircularChannel{Int}(2)
+    t = Threads.@spawn take!(c)
+    @test timedwait(() -> istaskstarted(t), 10) == :ok
+    put!(c, 42)
+    @test fetch(t) == 42
+
+    # close() drains remaining items then errors; put! on closed also errors.
+    c = CircularChannel{Int}(2)
+    put!(c, 7)
+    close(c)
+    @test !isopen(c)
+    @test take!(c) == 7
+    @test_throws InvalidStateException take!(c)
+    @test_throws InvalidStateException put!(c, 1)
+
+    # close() wakes blocked waiters with InvalidStateException.
+    c = CircularChannel{Int}(1)
+    t = Threads.@spawn try
+        take!(c)
+    catch ex
+        ex
+    end
+    @test timedwait(() -> istaskstarted(t), 10) == :ok
+    close(c)
+    @test fetch(t) isa InvalidStateException
+
+    # Multiple consumers: each put! is delivered to exactly one take!.
+    # Capacity >= n ensures no drops, so every consumer receives an item.
+    n = 50
+    c = CircularChannel{Int}(n)
+    consumers = [Threads.@spawn(take!(c)) for _ in 1:n]
+    for i in 1:n
+        put!(c, i)
+    end
+    taken = sort(fetch.(consumers))
+    @test drop_count(c) == 0
+    @test taken == collect(1:n)
 end
 
 @testset "Engine" begin
@@ -1287,6 +1345,42 @@ end
         end
         @test take!(ctx.stream_output) == VariableData(0, "motor_pos", 42)
     end
+end
+
+@testset "Pipeline drops" begin
+    # With a slow downstream variable, a fast producer should not block: items
+    # are dropped in the variable channel rather than stalling upstream. Produce
+    # many more trains than the channel capacity (100) and check that the slow
+    # consumer processed fewer than were produced while the pipeline still ran
+    # to completion.
+    ctx = Context.load_from_string("""
+    n_trains::Int = 500
+    processed::Int = 0
+
+    @Input function input(::Context.MockInput, output)
+        for tid in 1:n_trains
+            put!(output, (tid, Dict("motor" => Dict("pos" => tid))))
+        end
+    end
+    x = Context.MockInput()
+
+    @Variable function slow(data -> karabo"motor.pos")
+        sleep(0.005)
+        global processed += 1
+        return data
+    end
+    """)
+    Context.run(ctx) do
+        @test timedwait(() -> !isopen(ctx.stream_output), 10) == :ok
+    end
+
+    mod = Context.worker_state.current_ctx_module
+    n_processed = mod.processed[]
+    @test 0 < n_processed < mod.n_trains
+
+    # We should have stored the last 100 elements
+    outputs = [x.data for x in ctx.stream_output]
+    @test outputs == 401:500
 end
 
 @testset "Context builtins" begin
