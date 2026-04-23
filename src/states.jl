@@ -67,6 +67,14 @@ end
 
 DepTextState(is_karabo::Bool) = DepTextState(is_karabo, KaraboDepTextState())
 
+abstract type AbstractParameterState end
+
+mutable struct OptionalDimsState <: AbstractParameterState
+    all_dims::Bool
+    pending_text::String
+end
+OptionalDimsState(param::Parameter{OptionalDims}) = OptionalDimsState(isempty(param.value.dims), "")
+
 mutable struct KbdintPromptState
     msg::String
     display::Bool
@@ -261,6 +269,8 @@ EngineLog(message::String, extra_details::Maybe{String}=nothing) = EngineLog(tim
     # indicates that the source name appears in more than one topic.
     source_list::Vector{SourceInfo} = SourceInfo[]
 
+    # Parameter widget states, keyed by parameter name
+    parameter_states::Dict{String, AbstractParameterState} = Dict{String, AbstractParameterState}()
     # KaraboDepText widget state, keyed by dependency ID (used for Parameter{KaraboDevice})
     karabo_dep_states::Dict{Int, KaraboDepTextState} = Dict{Int, KaraboDepTextState}()
     # DepText widget state, keyed by dependency ID

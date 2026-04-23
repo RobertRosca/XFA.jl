@@ -17,6 +17,7 @@ using LibSSH: LibSSH as ssh
 using HTTP: HTTP, WebSockets
 using XfaEngine: EngineState, getavailableport
 using Dates: Dates, unix2datetime, @dateformat_str
+using XfaEngine.Context: Parameter, OptionalDims
 include("states.jl")
 
 using Printf: @sprintf
@@ -27,7 +28,7 @@ using Serialization
 using XfaEngine.Protocol
 using XfaEngine: XfaEngine, Protocol
 using XfaEngine.Context: Dependency, DependencyKind, DepKind_Variable, DepKind_Karabo, DepKind_Group,
-    karabo_dependency, Parameter, KaraboDevice, VariableData
+    karabo_dependency, Parameter, KaraboDevice, VariableData, OptionalDims
 
 include("imgui_helpers.jl")
 include("state_inspector.jl")
@@ -114,6 +115,40 @@ end
 
 function draw_parameter_widget(name, param::Parameter{Vector{String}})
     ig.Text("Vector{String}")
+
+    return false, nothing
+end
+
+function draw_parameter_widget(name, param::Parameter{OptionalDims})
+    ps = state[].client.parameter_states[param.name]::OptionalDimsState
+
+    checkbox_changed = @c ig.Checkbox("All##$(name)", &ps.all_dims)
+    if checkbox_changed
+        if ps.all_dims
+            return true, OptionalDims()
+        end
+    end
+
+    if !ps.all_dims
+        current = join(param.value.dims, ", ")
+        text = isempty(ps.pending_text) ? current : ps.pending_text
+        if ps.pending_text == current
+            ps.pending_text = ""
+        end
+        ig.SetNextItemWidth(ig.GetContentRegionAvail().x)
+        edited, new_text = SafeInputText("##dims_$(name)"; current_text=text)
+
+        if edited || checkbox_changed
+            ps.pending_text = new_text
+            parts = [strip(s) for s in split(new_text, ","; keepempty=false)]
+            dims = try
+                Int[parse(Int, p) for p in parts]
+            catch
+                String[parts...]
+            end
+            return true, OptionalDims(dims)
+        end
+    end
 
     return false, nothing
 end

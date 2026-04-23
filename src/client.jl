@@ -525,6 +525,12 @@ function build_context_state(state, ctx_info)
     sort!(var_names)
     state.client.variable_names = var_names
 
+    for (param_name, param) in ctx_info["parameters"]
+        if param isa Parameter{OptionalDims}
+            state.client.parameter_states[param_name] = OptionalDimsState(param)
+        end
+    end
+
     return ctx_state
 end
 

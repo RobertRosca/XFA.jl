@@ -59,6 +59,11 @@ group_parameter_dependency(group_type::String, parameter::String) = Dependency(k
 abstract type AbstractPostprocessor end
 function default_name end
 
+struct OptionalDims
+    dims::Union{Vector{Int}, Vector{String}}
+end
+OptionalDims() = OptionalDims(Int[])
+
 struct FunctionArgument
     name::String
     type::Union{Nothing, Type}
