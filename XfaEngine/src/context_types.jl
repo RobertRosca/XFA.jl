@@ -56,6 +56,9 @@ group_parameter_dependency(group_type::String, parameter::String) = Dependency(k
                                                                                group_type_name=group_type,
                                                                                parameter=parameter)
 
+abstract type AbstractPostprocessor end
+function default_name end
+
 struct FunctionArgument
     name::String
     type::Union{Nothing, Type}
@@ -225,13 +228,17 @@ function _variable_reference(new_name, ref_expr, side_effects)
         deps_code = :(Context.variable_dependencies(::typeof($new_name)) = Context.variable_dependencies($orig_func_expr))
     end
 
-    # Build subvariable registration code, remapping names if renamed.
-    # When names match the replace is a no-op.
+    # Build subvariable and postprocessor registration code, remapping
+    # names if renamed. When names match the replace is a no-op.
     orig_name_str = string(_ref_basename(ref_expr))
     new_name_str = string(new_name)
     subvars_code = quote
         Context.variable_subvariables(::typeof($new_name)) = [replace(s, $orig_name_str => $new_name_str, count=1)
                                                               for s in Context.variable_subvariables($orig_func_expr)]
+    end
+    postprocessors_code = quote
+        Context.variable_postprocessors(::typeof($new_name)) = [(replace(pp[1], $orig_name_str => $new_name_str, count=1), pp[2])
+                                                                for pp in Context.variable_postprocessors($orig_func_expr)]
     end
 
     return esc(quote
@@ -243,6 +250,7 @@ function _variable_reference(new_name, ref_expr, side_effects)
             Context.variable_origin(::typeof($new_name)) = $orig_func_expr
             $deps_code
             $subvars_code
+            $postprocessors_code
         end
     end)
 end
@@ -286,14 +294,23 @@ function _variable(ctx_module, expr, side_effects)
         # Extract dependency information
         dependencies, new_args = _parse_function_args(args)
 
-        # Look through the body for @add_subvariable calls to register them.
-        # Only toplevel calls are allowed. Note that we capture the macro name
-        # and check it explicitly because MacroTools doesn't handle the
-        # underscore in the name properly.
+        # Look through the body for @add_subvariable and @postprocess
+        # calls to register them. Only toplevel calls are allowed. Note that
+        # we capture the macro name and check it explicitly because MacroTools
+        # doesn't handle the underscore in the name properly.
         subvariables = String[]
-        for body_expr in body.args
+        postprocessors = []  # (name_expr, pp_expr) tuples
+        postprocessor_indices = Int[]
+        for (i, body_expr) in enumerate(body.args)
             if @capture(body_expr, @macroname_(subvar_name_, _)) && macroname == Symbol("@add_subvariable")
                 push!(subvariables, "$(func_name).$(subvar_name)")
+            elseif @capture(body_expr, @macroname_(pp_name_, pp_expr_)) && macroname == Symbol("@postprocess")
+                push!(postprocessors, (pp_name, pp_expr))
+                push!(subvariables, "$(func_name).$(pp_name)")
+                push!(postprocessor_indices, i)
+            elseif @capture(body_expr, @macroname_(pp_expr_)) && macroname == Symbol("@postprocess")
+                push!(postprocessors, (nothing, pp_expr))
+                push!(postprocessor_indices, i)
             end
         end
 
@@ -307,6 +324,20 @@ function _variable(ctx_module, expr, side_effects)
             body_expr
         end
 
+        # Strip @postprocess calls from the body (they're metadata, not runtime code)
+        deleteat!(body.args, postprocessor_indices)
+
+        # Build the postprocessors expression. Each entry evaluates the
+        # constructor once, then resolves the name — either from the
+        # explicit string or via default_name() for the one-arg form.
+        func_name_str = "$func_name"
+        postprocessors_expr = Expr(:vect,
+            [:(let _pp = $(pp_expr)
+                   _name = $(isnothing(name) ? :(Context.default_name(_pp)) : "$name")
+                   ("$($(func_name_str)).$(_name)", _pp)
+               end)
+             for (name, pp_expr) in postprocessors]...)
+
         # Combine all the dependency expressions into a vector expr, which will
         # get interpolated/evaluated properly.
         dependencies_expr = Expr(:vect, dependencies...)
@@ -319,6 +350,7 @@ function _variable(ctx_module, expr, side_effects)
             if $side_effects
                 Context.variable_dependencies(::typeof($func_name)) = $dependencies_expr
                 Context.variable_subvariables(::typeof($func_name)) = $subvariables_expr
+                Context.variable_postprocessors(::typeof($func_name)) = $postprocessors_expr
             end
         end
 
@@ -348,6 +380,10 @@ macro add_subvariable(name, value)
             _val
         end
     end)
+end
+
+macro postprocess(args...)
+    error("The @postprocess macro may only be used inside of a @Variable block.")
 end
 
 """
@@ -464,6 +500,7 @@ function _kwdef_group(name, struct_expr, fields)
     is_mutable = struct_expr.args[1]
 
     parsed = []
+    extra_exprs = []
     for field in fields
         default = nothing
         if @capture(field, lhs_ = rhs_)
@@ -477,6 +514,7 @@ function _kwdef_group(name, struct_expr, fields)
             fname = field
             is_param = false
         else
+            push!(extra_exprs, field)
             continue
         end
 
@@ -484,7 +522,7 @@ function _kwdef_group(name, struct_expr, fields)
     end
 
     struct_fields = [f.typed_field for f in parsed]
-    struct_def = Expr(:struct, is_mutable, name, Expr(:block, struct_fields...))
+    struct_def = Expr(:struct, is_mutable, name, Expr(:block, struct_fields..., extra_exprs...))
 
     kwargs = [isnothing(f.default) ? f.name : Expr(:kw, f.name, f.default)
               for f in parsed]

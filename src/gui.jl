@@ -379,6 +379,56 @@ function draw_variable(name, var_data)
         ImNodes.EndOutputAttribute()
     end
 
+    # Draw postprocessors
+    postprocessors = get(var_data, "postprocessors", [])
+    if !isempty(postprocessors)
+        ig.Dummy(min_node_width, 8)
+        ig.TextDisabled("Postprocessors")
+        pp_sep_pos = ig.GetCursorScreenPos()
+        ig.AddLine(draw_list, pp_sep_pos, (pp_sep_pos.x + min_node_width / 2f0, pp_sep_pos.y), gray, 2)
+        ig.Dummy(min_node_width, 2)
+
+        for pp in postprocessors
+            label = pp.display_name * pp.tree_id_suffix
+
+            ImNodes.BeginOutputAttribute(pp.id, ImNodes.ImNodesPinShape_CircleFilled)
+
+            # This child window is here to get around an imnodes limitation that
+            # would make a regular TreeNode extend it's width to the edge of the
+            # screen: https://github.com/Nelarius/imnodes/issues/167
+            ig.PushStyleColor(ig.ImGuiCol_ChildBg, ig.ImVec4(0, 0, 0, 0))
+            node_width = ImNodes.GetNodeDimensions(var_data["id"]).x
+            child_width = max(min_node_width, node_width * 3 / 4)
+            if ig.BeginChild("##pp-$(pp.id)", ImVec2(child_width, 0), ig.ImGuiChildFlags_AutoResizeY, ig.ImGuiWindowFlags_HorizontalScrollbar)
+                expanded = ig.TreeNode(label)
+                if haskey(client.variable_data, pp.name)
+                    typestr = get_variable_typeinfo(pp.name)
+                    if !isempty(typestr)
+                        ig.SameLine()
+                        if ig.SmallButton("$(typestr)$(pp.tree_id_suffix)_plot")
+                            push!(client.plots, Plot(pp.name, client.plot_counter))
+                            client.plot_counter += 1
+                        end
+                    end
+                end
+                if expanded
+                    if isempty(pp.params)
+                        ig.TextDisabled("(no parameters)")
+                    else
+                        for (param_name, param) in pp.params
+                            draw_parameter(param_name, param; min_node_width)
+                        end
+                    end
+                    ig.TreePop()
+                end
+            end
+            ig.EndChild()
+            ig.PopStyleColor()
+
+            ImNodes.EndOutputAttribute()
+        end
+    end
+
     ImNodes.EndNode()
     ig.PopID()
 end

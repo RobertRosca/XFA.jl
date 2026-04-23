@@ -313,10 +313,13 @@ node_hash(x) = reinterpret(Cint, crc32c(x))
 
 function build_context_state(state, ctx_info)
     ctx_state = Dict{String, Any}()
+    empty!(state.client.parameter_states)
 
     group_names = Set(ctx_info["groups"])
     is_group_var(name) = any(startswith(name, "$(g).") for g in group_names)
     group_of(name) = first(g for g in group_names if startswith(name, "$(g)."))
+
+    postprocessors_info = get(ctx_info, "postprocessors", Dict{String, Vector{String}}())
 
     # Build regular (non-group) variable nodes
     for (name, deps) in ctx_info["dag"]
@@ -328,15 +331,40 @@ function build_context_state(state, ctx_info)
 
         ctx_state[name]["dependencies"] = []
         ctx_state[name]["outputs"] = []
+        ctx_state[name]["postprocessors"] = []
         ctx_state[name]["type"] = :variable
         ctx_state[name]["origin"] = ctx_info["origins"][name]
         ctx_state[name]["draw_parameters"] = true
 
-        for (value_name, current_values) in [("dependencies", deps),
-                                             ("outputs", ["", ctx_info["subvariables"][name]...])]
-            for value in current_values
-                attr_id = node_hash("$(name).$(value_name).$(value)")
-                push!(ctx_state[name][value_name], (attr_id, value))
+        for dep_pair in deps
+            attr_id = node_hash("$(name).dependencies.$(dep_pair)")
+            push!(ctx_state[name]["dependencies"], (attr_id, dep_pair))
+        end
+
+        # The variable itself is always the first output
+        push!(ctx_state[name]["outputs"], (node_hash("$(name).outputs."), ""))
+
+        pp_names = Set(get(postprocessors_info, name, String[]))
+        for subvar in ctx_info["subvariables"][name]
+            subvar_id = node_hash("$(name).outputs.$(subvar)")
+            if subvar in pp_names
+                pp_prefix = "$(subvar)."
+                pp_params = Dict{String, Any}()
+                for (param_name, param) in ctx_info["parameters"]
+                    if startswith(param_name, pp_prefix)
+                        pp_params[chopprefix(param_name, pp_prefix)] = param
+                    end
+                end
+                push!(ctx_state[name]["postprocessors"], (
+                    id = subvar_id,
+                    name = subvar,
+                    display_name = chopprefix(subvar, "$(name)."),
+                    tree_id_suffix = "###pp_$(subvar)",
+                    plot_id = "Plot##pp_plot_$(subvar)",
+                    params = pp_params,
+                ))
+            else
+                push!(ctx_state[name]["outputs"], (subvar_id, subvar))
             end
         end
     end
@@ -491,7 +519,7 @@ function build_context_state(state, ctx_info)
     for (name, _) in ctx_info["dag"]
         push!(var_names, name)
         for subvar in ctx_info["subvariables"][name]
-            push!(var_names, "$(name).$(subvar)")
+            push!(var_names, subvar)
         end
     end
     sort!(var_names)

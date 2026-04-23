@@ -392,6 +392,24 @@ end
     end
 end
 
+# Test postprocessors, also in Main for load_from_string access.
+@eval Main module PostprocessorLibrary
+    using Statistics: mean
+    using XfaEngine: Context
+    using XfaEngine.Context: AbstractPostprocessor, Parameter
+
+    struct TestMean <: AbstractPostprocessor end
+    Context.default_name(::TestMean) = "mean"
+    (::TestMean)(data) = mean(data)
+
+    mutable struct TestWindow <: AbstractPostprocessor
+        size::Parameter{Int}
+    end
+    TestWindow(; size=10) = TestWindow(Parameter(size))
+    Context.default_name(::TestWindow) = "window"
+    (w::TestWindow)(data) = data[1:min(end, w.size[])]
+end
+
 @testset "@Variable" begin
     # Smoke test for basic functionality
     ctx = Context.load_from_string("""
@@ -440,7 +458,7 @@ end
                                                                         "baz" => [karabo"baz.data"])
 
     # Test variables depending on each other
-    ctx = Context.load_from_string(raw"""
+    ctx = Context.load_from_string("""
     @Variable foo -> karabo"foo.bar"
 
     @Variable function bar(data -> foo)
@@ -472,7 +490,7 @@ end
                                                              false)
 
     # Test creating a subvariable
-    ctx = Context.load_from_string(raw"""
+    ctx = Context.load_from_string("""
     @Variable function foo(data -> karabo"device.property")
         @add_subvariable("bar", mean(data))
 
@@ -488,7 +506,7 @@ end
     @test ctx.dag["quux"] == OD("data" => subvariable_dependency("foo", "bar"))
 
     # Test loading from a file
-    ctx_code = raw"""
+    ctx_code = """
     @Variable foo -> karabo"foo.bar"
     """
     ctx_from_str = Context.load_from_string(ctx_code)
@@ -555,6 +573,71 @@ end
         @Variable foo -> karabo"foo.bar"
         """)
         @test Set(keys(ctx.functions)) == Set(["my_norm", "foo"])
+    end
+end
+
+@testset "@postprocess" begin
+    # Execution with mixed @add_subvariable and @postprocess
+    ctx = Context.load_from_string("""
+    using Main.PostprocessorLibrary: TestMean, TestWindow
+
+    @Input function input(::Context.MockInput, output)
+        put!(output, (0, Dict("foo" => Dict("bar" => [1, 2, 3]))))
+    end
+    x = Context.MockInput()
+
+    @Variable function foo(data -> karabo"foo.bar")
+        @postprocess(TestWindow(; size=2))
+        @postprocess("avg", TestMean())
+        return data
+    end
+    """)
+    @test Set(ctx.subvariables["foo"]) == Set(["foo.avg", "foo.window"])
+    @test ctx.parameters["foo.window.size"][] == 2
+    @test issetequal(["foo.avg", "foo.window"], keys(ctx.postprocessors))
+    @test ctx.variable_postprocessors["foo"] == ["foo.window", "foo.avg"]
+
+    Context.run(ctx) do
+        @test timedwait(() -> !isopen(ctx.stream_output), 5) == :ok
+    end
+    result = take!(ctx.stream_output)
+    @test result.subvariables["foo.window"] == VariableData(0, "foo.window", [1, 2])
+    @test result.subvariables["foo.avg"] == VariableData(0, "foo.avg", 2.0)
+
+    # Changing a postprocessor parameter should update its value, invoke the
+    # update handler with the postprocessor object, and affect subsequent runs.
+    ctx = Context.load_from_string("""
+    using Main.PostprocessorLibrary: TestWindow
+
+    next_input = Base.Event()
+    param_value = -1
+
+    @Input function input(::Context.MockInput, output)
+        put!(output, (0, Dict("foo" => Dict("bar" => 1:10))))
+        wait(next_input)
+        put!(output, (1, Dict("foo" => Dict("bar" => 1:10))))
+    end
+    i = Context.MockInput()
+
+    @Variable function foo(data -> karabo"foo.bar")
+        @postprocess(TestWindow(Parameter(; name="", value=3, update_handler=(_, value) -> global param_value = value)))
+        return data
+    end
+    """)
+    @test ctx.parameters["foo.window.size"][] == 3
+
+    Context.run(ctx) do
+        r1 = take!(ctx.stream_output)
+        @test r1.subvariables["foo.window"].data == 1:3
+
+        Context.change_parameter(ctx, Parameter("foo.window.size", 5))
+        mod = Context.worker_state.current_ctx_module
+        @test ctx.parameters["foo.window.size"][] == 5
+        @test mod.param_value == 5
+
+        notify(mod.next_input)
+        r2 = take!(ctx.stream_output)
+        @test r2.subvariables["foo.window"].data == 1:5
     end
 end
 
@@ -1260,6 +1343,8 @@ end
 
 @testset "Serialization" begin
     ctx = Context.load_from_string(raw"""
+        using Main.PostprocessorLibrary: TestWindow
+
         bridge = KaraboBridge(; trainmatcher=KaraboDevice(""))
         bridge._mock_sources = String[]
 
@@ -1271,6 +1356,7 @@ end
 
         @Variable function bar(data -> xgm)
             @add_subvariable("max_data", max(data))
+            @postprocess(TestWindow(; size=5))
             mean(data)
         end
         """)
@@ -1282,13 +1368,15 @@ end
                                                               "bar" => OD("data" => Dependency("xgm"))),
                                        "subvariables" => Dict("xgm" => [],
                                                               "foo" => [],
-                                                              "bar" => ["bar.max_data"]),
+                                                              "bar" => ["bar.max_data", "bar.window"]),
+                                       "postprocessors" => Dict("bar" => ["bar.window"]),
                                        "origins" => Dict("xgm" => "xgm",
                                                          "foo" => "foo",
                                                          "bar" => "bar",
                                                          "bridge" => "XfaEngine.Context.KaraboBridge",
                                                          "bridge.stream" => "XfaEngine.Context.stream"),
                                        "parameters" => Dict("period" => Parameter("period", 2π),
+                                                            "bar.window.size" => Parameter("bar.window.size", 5),
                                                             "bridge.address" => Parameter("bridge.address", ""),
                                                             "bridge.trainmatcher" => Parameter("bridge.trainmatcher", KaraboDevice("", "")),
                                                             "bridge.manual_configuration" => Parameter("bridge.manual_configuration", false)),

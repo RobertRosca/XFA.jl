@@ -21,6 +21,7 @@ function variable_dependencies end
 function input_dependencies end
 function group_fields end
 variable_subvariables(_) = String[]
+variable_postprocessors(_) = VariablePostprocessor[]
 
 # Returns the topic served by an input group, or nothing for generic inputs
 input_topic(::Any) = nothing
@@ -74,6 +75,8 @@ end
     groups::Dict{String, Any} = Dict()
     dag::Dict{String, OrderedDict} = Dict()
     subvariables::Dict{String, Vector{String}} = Dict()
+    variable_postprocessors::Dict{String, Vector{String}} = Dict()
+    postprocessors::Dict{String, AbstractPostprocessor} = Dict()
     parameters::Dict{String, Parameter} = Dict()
     exprs::Vector{Expr} = Expr[]
 
@@ -267,6 +270,7 @@ function to_dict(ctx::XfaContext)
 
     return Dict("dag" => ctx.dag,
                 "subvariables" => ctx.subvariables,
+                "postprocessors" => ctx.variable_postprocessors,
                 "parameters" => parameters,
                 "inputs" => inputs,
                 "groups" => groups,
@@ -377,18 +381,9 @@ function change_parameter(ctx::XfaContext, new_param::Parameter)
         ctx_param = worker_state.parameters[new_param.name]
         if !isnothing(ctx_param.update_handler)
             try
-                # If the parameter belongs to a group (name is "group.field"),
-                # pass the group object to the handler along with the new value.
-                dot_idx = findfirst('.', new_param.name)
-                group = if !isnothing(dot_idx)
-                    group_name = new_param.name[1:dot_idx-1]
-                    ctx.groups[group_name]
-                else
-                    nothing
-                end
-
-                if !isnothing(group)
-                    ctx_param.update_handler(group, new_param.value)
+                owner = find_parameter_owner(ctx, new_param.name)
+                if !isnothing(owner)
+                    ctx_param.update_handler(owner, new_param.value)
                 else
                     ctx_param.update_handler(new_param.value)
                 end
@@ -399,6 +394,20 @@ function change_parameter(ctx::XfaContext, new_param::Parameter)
 
         ctx_param.value = new_param.value
     end
+end
+
+# Returns the owning group or postprocessor for a parameter, or nothing for
+# top-level parameters. Owners are passed to update handlers so they can
+# mutate additional state alongside the new value.
+function find_parameter_owner(ctx::XfaContext, param_name::String)
+    dot_idx = findlast('.', param_name)
+    isnothing(dot_idx) && return nothing
+    prefix = param_name[1:dot_idx-1]
+
+    haskey(ctx.postprocessors, prefix) && return ctx.postprocessors[prefix]
+    haskey(ctx.groups, prefix) && return ctx.groups[prefix]
+
+    return nothing
 end
 
 function input_wrapper(name, group, channel)
@@ -506,7 +515,7 @@ function stream_external_dependency(name, input_neighbour, downstream_neighbours
     end
 end
 
-function stream_variable(name, stream_output, upstream, downstream, deps)
+function stream_variable(name, stream_output, upstream, downstream, deps, postprocessors)
     # Initialize the scratch space
     scratch = Dict{String, Any}()
 
@@ -557,11 +566,23 @@ function stream_variable(name, stream_output, upstream, downstream, deps)
                             Meta.name => name,
                             Meta.scratch => scratch,
                             Meta.subvariables => subvar_values,
-                            f(args...))
+                            @invokelatest f(args...))
             catch ex
                 @error "Execution of variable '$(name)' failed" exception=(ex, catch_backtrace())
                 putall!(values(downstream), empty_result)
                 continue
+            end
+
+            # Run postprocessors on the variable output
+            if !isempty(postprocessors)
+                raw_out = out isa VariableData ? out.data : out
+                for (pp_name, pp) in postprocessors
+                    try
+                        subvar_values[pp_name] = pp(raw_out)
+                    catch ex
+                        @error "Postprocessor '$(pp_name)' for variable '$(name)' failed" exception=(ex, catch_backtrace())
+                    end
+                end
             end
 
             # Wrap subvariable values in VariableData
@@ -755,7 +776,11 @@ function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50)
         end
         ctx.variable_channels[name] = downstream
 
-        ctx.variable_tasks[name] = Threads.@spawn stream_variable(name, ctx.stream_output, args, downstream, ctx.dag[name])
+        var_pps = Dict{String, AbstractPostprocessor}(
+            pp_name => ctx.postprocessors[pp_name]
+            for pp_name in get(ctx.variable_postprocessors, name, String[])
+        )
+        ctx.variable_tasks[name] = Threads.@spawn stream_variable(name, ctx.stream_output, args, downstream, ctx.dag[name], var_pps)
         errormonitor(ctx.variable_tasks[name])
     end
 
@@ -868,7 +893,7 @@ function _is_context_method(m::Method)
 end
 
 function _cleanup_context_methods()
-    for f in (variable_dependencies, variable_subvariables, input_dependencies, group_fields)
+    for f in (variable_dependencies, variable_subvariables, variable_postprocessors, input_dependencies, group_fields)
         for m in methods(f)
             if _is_context_method(m)
                 Base.delete_method(m)
@@ -1109,8 +1134,40 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr})
     topological_sort(dag)
 
     ctx_subvariables = Dict{String, Vector{String}}()
+    ctx_postprocessors = Dict{String, AbstractPostprocessor}()
+    ctx_variable_postprocessors = Dict{String, Vector{String}}()
     for name in keys(dag)
         ctx_subvariables[name] = variable_subvariables(functions[name])
+
+        pps = variable_postprocessors(functions[name])
+        if !isempty(pps)
+            ctx_variable_postprocessors[name] = String[]
+
+            # For grouped variables the DAG name (e.g. "my_corr.correlate")
+            # differs from the bare function name used in the trait method
+            # (e.g. "correlate.avg"), so we remap.
+            func_base = string(nameof(functions[name]))
+            for (pp_name, processor) in pps
+                pp_name = replace(pp_name, func_base => name; count=1)
+                ctx_postprocessors[pp_name] = processor
+                push!(ctx_variable_postprocessors[name], pp_name)
+
+                # Add subvariable names that weren't known at macro time
+                # (one-arg @add_postprocessor form using default_name)
+                if pp_name ∉ ctx_subvariables[name]
+                    push!(ctx_subvariables[name], pp_name)
+                end
+
+                # Register Parameter fields from postprocessor instances
+                for field in fieldnames(typeof(processor))
+                    if fieldtype(typeof(processor), field) <: Parameter
+                        param = getproperty(processor, field)
+                        param.name = "$(pp_name).$(field)"
+                        parameters[param.name] = param
+                    end
+                end
+            end
+        end
     end
 
     global worker_state = WorkerState(; dag_functions=functions, current_ctx_module=ctx_module, parameters)
@@ -1119,8 +1176,10 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr})
     end
 
     ctx = XfaContext(; functions, group_types, groups, dag,
-                     subvariables=ctx_subvariables, parameters, exprs,
-                     inputs)
+                     subvariables=ctx_subvariables,
+                     variable_postprocessors=ctx_variable_postprocessors,
+                     postprocessors=ctx_postprocessors,
+                     parameters, exprs, inputs)
     ctx.dep_to_input = build_dep_routing(ctx)
     return ctx
 end
