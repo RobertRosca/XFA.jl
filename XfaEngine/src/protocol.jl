@@ -4,6 +4,7 @@ export AbstractMessage, Ping, Shutdown,
     GetDevices, GetTrainmatchers, SetTopicTrainmatcher, LoadContext, ReviseCode,
     GetDeviceSchema, DeviceSchema,
     GetDeviceProperty, DeviceProperty,
+    GetEngineDir, EngineDir,
     ChangeParameter, Start, Stop,
     SetDebugMode, SetRemoteRepl,
     Pong, AvailableTrainmatchers,
@@ -69,12 +70,18 @@ end
 
 struct GetTrainmatchers <: AbstractMessage end
 
+struct GetEngineDir <: AbstractMessage end
+
 # Messages that the server can send
 struct Pong <: AbstractMessage end
 
 struct AvailableTrainmatchers <: AbstractMessage
     topic_trainmatchers::Dict{String, Vector{Tuple{String, Bool}}}
     defaults::Dict{String, String}
+end
+
+struct EngineDir <: AbstractMessage
+    path::String
 end
 
 struct Started <: AbstractMessage end

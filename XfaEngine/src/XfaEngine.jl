@@ -195,6 +195,8 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
             @error "Error in 'GetDeviceProperty', requested by $(id)" exception=(ex, catch_backtrace())
             Protocol.server_send(ws, DeviceProperty(msg.topic, msg.device, msg.property, ex); reply_to)
         end
+    elseif msg isa GetEngineDir
+        Protocol.server_send(ws, EngineDir(pkgdir(XfaEngine)); reply_to)
     elseif msg isa GetTrainmatchers
         trainmatchers = get_all_trainmatchers(state.webproxies)
         Protocol.server_send(ws, AvailableTrainmatchers(trainmatchers, state.default_trainmatchers); reply_to)
@@ -282,23 +284,9 @@ function handle_client(state::EngineState, id)
     client_state = state.clients[id]
     ws = client_state.websocket
 
-    # Start by sending their identifier and engine directory
+    # Start by sending their identifier
     WebSockets.send(ws, id)
-    WebSockets.send(ws, pkgdir(XfaEngine))
     @info "Connected to new client: $(id) 🙋"
-
-    # Send available trainmatchers with defaults
-    trainmatchers = if !isempty(state.webproxies)
-        try
-            get_all_trainmatchers(state.webproxies)
-        catch ex
-            @warn "Failed to query trainmatchers for client $(id)" exception=(ex, catch_backtrace())
-            Dict{String, Vector{String}}()
-        end
-    else
-        Dict{String, Vector{String}}()
-    end
-    Protocol.server_send(ws, AvailableTrainmatchers(trainmatchers, state.default_trainmatchers))
 
     # If a context is already loaded, send it to the new client
     if !isempty(state.ctx.path)

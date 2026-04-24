@@ -736,6 +736,8 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
                                   for (name, _) in devices]
             client.webproxy_status = RequestStatus_Idle
         end
+    elseif msg isa EngineDir
+        client.remote_engine_dir = msg.path
     elseif msg isa AvailableTrainmatchers
         client.trainmatchers = msg.topic_trainmatchers
         client.trainmatchers_request_status = RequestStatus_Idle
@@ -829,12 +831,12 @@ function handle_server(state)
             WebSockets.open("ws://localhost:$(port)"; suppress_close_error=true) do ws
                 client.websocket = ws
 
-                # The first messages we receive are our client ID and engine directory
+                # The first message we receive is our client ID
                 id = WebSockets.receive(ws)
                 client.client_id = id
-                client.remote_engine_dir = WebSockets.receive(ws)
 
                 client.status = RemoteStatus_Connected
+                send(client, GetEngineDir())
                 get_devices(client)
 
                 for msg_bytes in ws

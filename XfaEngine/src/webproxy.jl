@@ -134,16 +134,24 @@ end
 function get_all_trainmatchers(webproxies::Dict)
     trainmatchers = Dict{String, Vector{Tuple{String, Bool}}}()
 
-    for (topic, wp) in webproxies
-        devices = get_devices(wp; classId="TrainMatcher")
-        whitelisted = try
-            get_property(wp, "karabo/WebProxy/device", "devices")
-        catch ex
-            @warn "Failed to query webproxy whitelist for $topic" exception=(ex, catch_backtrace())
-            String[]
+    try
+        for (topic, wp) in webproxies
+            devices = get_devices(wp; classId="TrainMatcher")
+            whitelisted = try
+                get_property(wp, "karabo/WebProxy/device", "devices")
+            catch ex
+                @warn "Failed to query webproxy whitelist for $topic" exception=(ex, catch_backtrace())
+                String[]
+            end
+            names = sort!(collect(keys(devices)))
+            trainmatchers[topic] = [(name, name in whitelisted) for name in names]
         end
-        names = sort!(collect(keys(devices)))
-        trainmatchers[topic] = [(name, name in whitelisted) for name in names]
+    catch ex
+        if ex isa HTTP.ConnectError
+            @warn "Couldn't get trainmatchers" exception=ex
+        else
+            rethrow()
+        end
     end
 
     return trainmatchers

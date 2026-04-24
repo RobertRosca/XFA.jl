@@ -173,13 +173,19 @@ end
     log = TestLogger()
     temp_engine(; log) do address, stop_event, info_path
         WebSockets.open(address) do ws
-            # Test that we get a valid ID and initial trainmatchers
+            # Test that we get a valid ID (the only thing sent
+            # unsolicited on connect)
             id = WebSockets.receive(ws)
             @test id isa String
             @test length(id) > 5
-            engine_dir = WebSockets.receive(ws)
-            @test engine_dir isa String
-            @test engine_dir == pkgdir(XfaEngine)
+
+            # Engine directory and trainmatchers are now only sent on request
+            Protocol.client_send(ws, Protocol.GetEngineDir())
+            engine_dir_msg = Protocol.receive(ws).msg
+            @test engine_dir_msg isa Protocol.EngineDir
+            @test engine_dir_msg.path == pkgdir(XfaEngine)
+
+            Protocol.client_send(ws, Protocol.GetTrainmatchers())
             @test Protocol.receive(ws).msg isa Protocol.AvailableTrainmatchers
 
             # Test Ping
@@ -246,8 +252,6 @@ end
         temp_engine(; log) do address, stop_event, info_path
             WebSockets.open(address) do ws
                 WebSockets.receive(ws) # client id
-                WebSockets.receive(ws) # engine dir
-                Protocol.receive(ws)   # initial trainmatchers
 
                 # Load a slow-consumer pipeline
                 mktemp() do path, io
@@ -295,10 +299,8 @@ end
     log = TestLogger()
     temp_engine(; log) do address, stop_event, info_path
         WebSockets.open(address) do ws
-            # Consume the client ID, engine dir, and initial trainmatchers
+            # Consume the client ID
             WebSockets.receive(ws)
-            WebSockets.receive(ws)
-            Protocol.receive(ws)
 
             # Test that send always assigns an ID and the server
             # echoes it back as reply_to
