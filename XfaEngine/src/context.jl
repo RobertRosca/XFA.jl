@@ -6,7 +6,7 @@ export @karabo_str, @Variable, @Input, @Group, @add_subvariable, Parameter, trys
 
 import Base.ScopedValues: @with
 
-import DistributedNext: RemoteChannel, remote_do
+using DistributedNext: DistributedNext, RemoteChannel, remote_do, remoteref_id, remotecall_fetch
 
 import MacroTools
 import MacroTools: @capture, postwalk, prettify
@@ -14,11 +14,27 @@ import OrderedCollections: OrderedDict
 import DimensionalData as DD
 import ..XfaEngine
 
+using DataStructures: DataStructures, CircularBuffer, isfull
 include("circular_channel.jl")
 
 # Factory for RemoteChannels carrying per-train variable data. Oldest items
 # are overwritten when a consumer falls behind; drops are counted per channel.
 variable_channel() = RemoteChannel(() -> CircularChannel{VariableData}(100))
+
+struct ChannelStat
+    drops::Int
+    size::Int
+    capacity::Int
+end
+
+# Snapshot of (drops, current size, capacity) for a RemoteChannel-wrapped
+# CircularChannel. Runs on the worker that owns the channel.
+function channel_stat(rc::RemoteChannel)::ChannelStat
+    remotecall_fetch(rc.where, rc) do rc
+        ch = DistributedNext.channel_from_id(remoteref_id(rc))
+        ChannelStat(drop_count(ch), size(ch), DataStructures.capacity(ch))
+    end
+end
 
 # Trait functions for dispatch-based metadata registration.
 # Overloaded by @Variable, @Input, and @Group macros for each
@@ -252,7 +268,9 @@ end
 function to_dict(ctx::XfaContext)
     inputs = Dict{String, Vector{String}}()
     for (name, deps) in ctx.inputs
-        inputs[name] = collect(keys(deps))
+        # Anonymous args (e.g. `::MockInput`) have `nothing` keys; skip those
+        # since they carry no user-visible name.
+        inputs[name] = [k for k in keys(deps) if !isnothing(k)]
     end
 
     groups = sort(collect(keys(ctx.groups)))

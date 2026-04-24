@@ -9,7 +9,7 @@ export AbstractMessage, Ping, Shutdown,
     Pong, AvailableTrainmatchers,
     Started, Stopped, Devices,
     ContextInfo, ParameterChanged, TrainData, RemoteReplState,
-    Ack, Envelope, MessageId, client_send, server_send
+    ChannelStats, Ack, Envelope, MessageId, client_send, server_send
 
 import Serialization: serialize, deserialize
 
@@ -116,6 +116,13 @@ end
 struct RemoteReplState <: AbstractMessage
     enabled::Bool
     port::Int
+end
+
+# Per-channel snapshots keyed by (producer, consumer). Producer is either an
+# external dependency name (e.g. "motor.pos") or a variable name; consumer is
+# always the downstream variable name.
+struct ChannelStats <: AbstractMessage
+    stats::Dict{Tuple{String, String}, Context.ChannelStat}
 end
 
 struct Ack <: AbstractMessage

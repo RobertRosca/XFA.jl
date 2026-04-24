@@ -469,6 +469,16 @@ function draw_variable(name, var_data)
     ig.PopID()
 end
 
+# Link color for a channel-fill ratio (load ∈ [0, 1]). Ramps from muted green
+# (empty) through orange (half-full) to bright red (at capacity). The green
+# ceiling is lowered so idle channels don't glare.
+function link_load_color(load)
+    green_ceiling = 0xa0
+    r = load < 0.5 ? round(UInt8, 0xff * 2 * load) : 0xff
+    g = load < 0.5 ? green_ceiling : round(UInt8, green_ceiling * 2 * (1 - load))
+    return ig.IM_COL32(r, g, 0, 0xff)
+end
+
 function draw_dag()
     client = state[].client
     context = client.context
@@ -547,9 +557,18 @@ function draw_dag()
         ig.PopID()
     end
 
+    channel_stats = context.channel_stats
     for var_data in values(ctx_state)
-        for (link_id, start_id, end_id) in var_data["links"]
-            ImNodes.Link(link_id, start_id, end_id)
+        for link in var_data["links"]
+            stat = get(channel_stats, link.channel_key, nothing)
+            colored = !isnothing(stat) && stat.capacity > 0
+            if colored
+                ig.imnodes_PushColorStyle(ig.ImNodesCol_Link, link_load_color(stat.size / stat.capacity))
+            end
+            ImNodes.Link(link.id, link.start_id, link.end_id)
+            if colored
+                ig.imnodes_PopColorStyle()
+            end
         end
     end
 

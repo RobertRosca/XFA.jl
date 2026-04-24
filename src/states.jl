@@ -180,12 +180,19 @@ const SCALAR_BUFFER_CAPACITY = 10_000
     fixed_aspect::Bool = false
 end
 
+const LinkInfo = @NamedTuple{id::Cint, start_id::Cint, end_id::Cint,
+                              channel_key::Tuple{String, String}}
+
 @kwdef mutable struct ContextState
     context_state::Dict{String, Any} = Dict()
     context_path::String = ""
     source::String = ""
     node_positions::Dict{String, Point2d} = Dict()
     pipeline_status::PipelineStatus = PipelineStatus_Stopped
+
+    # Latest per-channel (drops, size, capacity) snapshot from the engine,
+    # keyed by (producer, consumer). Updated roughly once per second.
+    channel_stats::Dict{Tuple{String, String}, XfaEngine.Context.ChannelStat} = Dict()
 
     lock::ReentrantLock = ReentrantLock()
 end

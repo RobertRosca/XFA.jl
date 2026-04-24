@@ -69,6 +69,8 @@ end
 
     ctx::XfaContext = XfaContext()
 
+    channel_stats_task::Union{Task, Nothing} = nothing
+
     stop_event::Base.Event = Base.Event()
     stop_task::Union{Task, Nothing} = nothing
 end
@@ -77,8 +79,64 @@ current_engine_state::Union{EngineState, Nothing} = nothing
 
 function forward_output(state::EngineState, stream_output)
     for data in stream_output
+        for (id, client) in state.clients
+            try
+                Protocol.server_send(client.websocket, TrainData([data]))
+            catch ex
+                @warn "Couldn't forward data to client '$(id)'" exception=ex
+            end
+        end
+    end
+end
+
+# Periodically broadcast a snapshot of every variable channel's drop count,
+# fill level, and capacity to all connected clients. Used by the GUI to color
+# pipeline edges by load.
+function broadcast_channel_stats(state::EngineState; period=1.0)
+    stats = Dict{Tuple{String, String}, Context.ChannelStat}()
+
+    while !state.stop_event.set
+        sleep(period)
+        # Re-read state.ctx each iteration — LoadContext swaps it for a fresh
+        # XfaContext, so capturing it outside the loop would leave us pinned
+        # to the never-running default context.
+        ctx = state.ctx
+        if !ctx.is_running[] || isempty(state.clients)
+            continue
+        end
+
+        empty!(stats)
+        try
+            # Karabo edges are served by a two-stage channel chain
+            # (input -> extractor -> consumer). Drops may land on either
+            # stage, so sum both into a single edge entry keyed by
+            # (dep_name, consumer); size reflects the downstream stage
+            # since that's what the consumer actually sees queued.
+            for (dep_name, downstream) in ctx.external_dependency_channels
+                input_name = ctx.dep_to_input[dep_name]
+                up = Context.channel_stat(ctx.input_variable_channels[input_name][dep_name])
+                for (consumer, channel) in downstream
+                    ds = Context.channel_stat(channel)
+                    stats[(dep_name, consumer)] = Context.ChannelStat(up.drops + ds.drops, ds.size, ds.capacity)
+                end
+            end
+            for (producer, downstream) in ctx.variable_channels
+                for (consumer, channel) in downstream
+                    stats[(producer, consumer)] = Context.channel_stat(channel)
+                end
+            end
+        catch ex
+            @warn "Failed to gather channel stats" exception=(ex, catch_backtrace())
+            continue
+        end
+
+        msg = Protocol.ChannelStats(stats)
         for client in values(state.clients)
-            Protocol.server_send(client.websocket, TrainData([data]))
+            try
+                Protocol.server_send(client.websocket, msg)
+            catch ex
+                @debug "Failed to send ChannelStats to client" exception=(ex, catch_backtrace())
+            end
         end
     end
 end
@@ -339,6 +397,9 @@ function main(stop_event=Base.Event(); info_path=nothing, wait=true)
 
     @info "Wrote worker information to $(info_path)"
 
+    state.channel_stats_task = Threads.@spawn broadcast_channel_stats(state)
+    errormonitor(state.channel_stats_task)
+
     state.stop_task = Threads.@spawn try
         Base.wait(state.stop_event)
     catch ex
@@ -356,6 +417,7 @@ function main(stop_event=Base.Event(); info_path=nothing, wait=true)
 
     if wait
         Base.wait(state.stop_task)
+        Base.wait(state.channel_stats_task)
     end
 
     return state

@@ -235,6 +235,59 @@ end
     #         run(`$(executable) --project=$(environment) --startup-file=no --color=no $(launcher_script)`)
     #     end
     # end
+
+
+    @testset "Channel stats" begin
+        # End-to-end check that the engine periodically pushes a ChannelStats
+        # message summarising drops/size/capacity for each variable channel.
+        # A slow downstream variable guarantees drops accumulate.
+        log = TestLogger()
+        temp_engine(; log) do address, stop_event, info_path
+            WebSockets.open(address) do ws
+                WebSockets.receive(ws) # client id
+                WebSockets.receive(ws) # engine dir
+                Protocol.receive(ws)   # initial trainmatchers
+
+                # Load a slow-consumer pipeline
+                mktemp() do path, io
+                    write(path, """
+                    @Input function input(::Context.MockInput, output)
+                        for tid in 1:1000
+                            put!(output, (tid, Dict("motor" => Dict("pos" => tid))))
+                        end
+                    end
+                    x = Context.MockInput()
+
+                    @Variable function slow(data -> karabo"motor.pos")
+                        sleep(0.01)
+                        return data
+                    end
+                    """)
+                    Protocol.client_send(ws, Protocol.LoadContext(path))
+                    while !(Protocol.receive(ws).msg isa Protocol.ContextInfo) end
+                end
+
+                Protocol.client_send(ws, Protocol.Start())
+                while !(Protocol.receive(ws).msg isa Protocol.Ack) end
+
+                # Collect messages until we get a ChannelStats with a non-zero
+                # drop count on the (motor.pos, slow) channel, or time out.
+                key = ("motor.pos", "slow")
+                stats = nothing # Context.ChannelStat(0, 0, 0)
+                deadline = time() + 10.0
+                while isnothing(stats) || (time() < deadline && stats.drops == 0)
+                    msg = Protocol.receive(ws).msg
+                    if msg isa Protocol.ChannelStats && msg.stats[key].drops > 0
+                        stats = msg.stats[key]
+                    end
+                end
+
+                @test stats.drops > 0
+                @test stats.capacity == 100
+                @test 0 <= stats.size <= 100
+            end
+        end
+    end
 end
 
 @testset "Message tracking" begin

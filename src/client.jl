@@ -426,7 +426,7 @@ function build_context_state(state, ctx_info)
         ctx_state[name]["type"] = :group
         ctx_state[name]["origin"] = ctx_info["origins"][name]
         ctx_state[name]["draw_parameters"] = true
-        ctx_state[name]["links"] = []
+        ctx_state[name]["links"] = LinkInfo[]
         ctx_state[name]["parameters"] = Dict{String, Any}()
 
         # Add dependencies from group member variables as inputs on the group node
@@ -494,13 +494,13 @@ function build_context_state(state, ctx_info)
             ctx_state[name]["dependencies"] = []
             ctx_state[name]["outputs"] = [(node_hash(name), name)]
             ctx_state[name]["type"] = :input
-            ctx_state[name]["links"] = []
+            ctx_state[name]["links"] = LinkInfo[]
         end
     end
 
     node_dag = Dict(name => String[] for name in keys(ctx_state))
 
-    new_links = []
+    new_links = LinkInfo[]
     for (name, deps) in ctx_info["dag"]
         # Determine which node this variable belongs to
         node_name = is_group_var(name) ? group_of(name) : name
@@ -523,7 +523,7 @@ function build_context_state(state, ctx_info)
                     dep_node = dep.name
                 end
                 link_id = node_hash("$(link_start_id)->$(link_end_id)")
-                push!(new_links, (link_id, link_start_id, link_end_id))
+                push!(new_links, LinkInfo(link_id, link_start_id, link_end_id, (dep.name, name)))
 
                 if dep_node != node_name
                     push!(node_dag[node_name], dep_node)
@@ -532,7 +532,7 @@ function build_context_state(state, ctx_info)
                 input_name = ctx_info["dep_to_input"][dep.name]
                 link_start_id = node_hash(input_name)
                 link_id = node_hash("$(link_start_id)->$(link_end_id)")
-                push!(new_links, (link_id, link_start_id, link_end_id))
+                push!(new_links, LinkInfo(link_id, link_start_id, link_end_id, (dep.name, name)))
 
                 input_node_name = split(input_name, ".")[1]
                 if input_node_name != node_name
@@ -789,6 +789,8 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
                 end
             end
         end
+    elseif msg isa ChannelStats
+        client.context.channel_stats = msg.stats
     elseif msg isa RemoteReplState
         client.remoterepl_mode[] = msg.enabled
         client.remoterepl_status = msg.enabled ? RemoteReplStatus_Running : RemoteReplStatus_Stopped
