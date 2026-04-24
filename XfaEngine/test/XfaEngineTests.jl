@@ -12,6 +12,7 @@ using ZMQ: ZMQ
 using HTTP: HTTP, WebSockets
 using OrderedCollections: OrderedDict as OD
 using DataStructures: CircularBuffer, capacity
+using FHist: bincounts, binedges
 
 using XfaEngine: XfaEngine, Context, KaraboBridge, Protocol
 using XfaEngine.Context: @Variable, @karabo_str, VariableData, Dependency, DependencyKind,
@@ -1437,6 +1438,92 @@ end
 end
 
 @testset "Context builtins" begin
+    @testset "Mean" begin
+        # Reducing over all dims
+        m = Context.Mean()
+        @test m([1.0, 2.0, 3.0, NaN]) == 2.0
+        @test isempty(m.buffer)
+
+        # Reducing over specific dims with dropdims, with a NaN mixed in
+        m = Context.Mean(; dims=(2,))
+        A = [1.0 2.0 3.0; 4.0 NaN 6.0]
+        @test m(A) == [2.0, 5.0]
+        @test !isempty(m.buffer)
+        buf = m.buffer
+
+        # Calling again with matching type/dims reuses the buffer
+        @test m(A .+ 1) == [3.0, 6.0]
+        @test m.buffer === buf
+
+        # Changing dims forces reallocation
+        m.dims[] = Context.OptionalDims([1])
+        @test m(A) == [2.5, 2.0, 4.5]
+        @test m.buffer !== buf
+    end
+
+    @testset "Correlation" begin
+        corr = Context.Correlation(; x=karabo"foo.bar", y=karabo"foo.baz")
+
+        # compute_edges: empty buffer → degenerate [0,0] padded to [-1,1];
+        # positive data → [0, max]; explicit `pulses` picks a subset.
+        @test Context.compute_edges([], [], 10) == -1:0.2:1
+
+        cb1 = CircularBuffer{Float64}([1.0, 2.0])
+        cb2 = CircularBuffer{Float64}([50.0, 100.0])
+        @test Context.compute_edges([cb1], [], 10) == 1:0.1:2
+        @test Context.compute_edges([cb1, cb2], [2], 4) == 50:12.5:100
+        @test Context.compute_edges([cb1, cb2], [], 4) == 1:24.75:100
+
+        # Parameter update handlers should trigger rebuilding
+        for handler in (corr.buffer_size.update_handler, corr.nbins.update_handler, corr.pulses.update_handler)
+            corr.rebuild_histogram = false
+            handler(corr, nothing)
+            @test corr.rebuild_histogram
+        end
+
+        # update_buffer_size resizes existing buffers and invalidates
+        push!(corr.x_buffers, CircularBuffer{Float64}(10))
+        push!(corr.y_buffers, CircularBuffer{Float64}(10))
+        corr.rebuild_histogram = false
+        Context.update_buffer_size(corr, 500)
+        @test capacity(corr.x_buffers[1]) == 500
+        @test capacity(corr.y_buffers[1]) == 500
+        @test corr.rebuild_histogram
+
+        # Scalar inputs allocate a single per-pulse buffer at buffer_size
+        corr = Context.Correlation(; x=karabo"foo.bar", y=karabo"foo.baz")
+        corr.nbins[] = 10
+        corr.buffer_size[] = 50
+        Context.correlate(corr, 1.0, 2.0)
+        @test length(corr.x_buffers) == 1
+        @test capacity(corr.x_buffers[1]) == 50
+        @test binedges(corr.histogram)[1] == -1:0.2:1
+
+        # Vector inputs create one buffer per pulse; shrinking pops the extras
+        corr = Context.Correlation(; x=karabo"foo.bar", y=karabo"foo.baz")
+        Context.correlate(corr, [1.0, 2.0], [10.0, 20.0])
+        @test length(corr.x_buffers) == 2
+        Context.correlate(corr, [3.0], [30.0])
+        @test length(corr.x_buffers) == 1
+
+        # Changing nbins rebuilds the histogram with the new bin count
+        corr = Context.Correlation(; x=karabo"foo.bar", y=karabo"foo.baz")
+        corr.nbins[] = 10
+        Context.correlate(corr, 1.0, 2.0)
+        @test length(binedges(corr.histogram)[1]) == 11
+        corr.nbins[] = 20
+        corr.rebuild_histogram = true
+        Context.correlate(corr, 2.0, 3.0)
+        @test length(binedges(corr.histogram)[1]) == 21
+
+        # `pulses` restricts which pulses contribute to edges and counts
+        corr = Context.Correlation(; x=karabo"foo.bar", y=karabo"foo.baz")
+        corr.pulses[] = [1]
+        Context.correlate(corr, [1.0, 999.0], [2.0, 999.0])
+        @test last(binedges(corr.histogram)[1]) ≤ 1.0
+        @test sum(bincounts(corr.histogram)) == 1
+    end
+
     @testset "KaraboBridge" begin
         port = getavailableport(42000)
         address = "tcp://localhost:$(port)"
