@@ -180,8 +180,12 @@ const SCALAR_BUFFER_CAPACITY = 10_000
     fixed_aspect::Bool = false
 end
 
-const LinkInfo = @NamedTuple{id::Cint, start_id::Cint, end_id::Cint,
-                              channel_key::Tuple{String, String}}
+struct LinkInfo
+    id::Cint
+    start_id::Cint
+    end_id::Cint
+    channel_key::Tuple{String, String}
+end
 
 @kwdef mutable struct ContextState
     context_state::Dict{String, Any} = Dict()
