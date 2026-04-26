@@ -1,21 +1,25 @@
 module Protocol
 
 export AbstractMessage, Ping, Shutdown,
-    GetDevices, GetTrainmatchers, SetTopicTrainmatcher, LoadContext, ReviseCode,
+    GetDevices, GetTrainmatchers, LoadContext, ReviseCode,
     GetDeviceSchema, DeviceSchema,
+    GetDeviceProperty, DeviceProperty,
+    GetEngineDir, EngineDir,
+    GetRoutingRules, SetRoutingRules, RoutingRules,
     ChangeParameter, Start, Stop,
     SetDebugMode, SetRemoteRepl,
     Pong, AvailableTrainmatchers,
     Started, Stopped, Devices,
     ContextInfo, ParameterChanged, TrainData, RemoteReplState,
-    Ack, Envelope, MessageId, client_send, server_send
+    ChannelStats, Ack, Envelope, MessageId, client_send, server_send
 
 import Serialization: serialize, deserialize
 
 import HTTP: WebSockets
 
 import ..Context
-import ..Context: XfaContext, VariableData, Parameter
+using ..Context: XfaContext, VariableData, Parameter
+using ..XfaEngine: RoutingRule
 
 
 abstract type AbstractMessage end
@@ -34,6 +38,12 @@ struct GetDeviceSchema <: AbstractMessage
     name::String
 end
 
+struct GetDeviceProperty <: AbstractMessage
+    topic::String
+    device::String
+    property::String
+end
+
 struct LoadContext <: AbstractMessage
     path::String
 end
@@ -44,9 +54,10 @@ struct ChangeParameter <: AbstractMessage
     parameter::Parameter
 end
 
-struct SetTopicTrainmatcher <: AbstractMessage
-    topic::String
-    trainmatcher::String
+struct GetRoutingRules <: AbstractMessage end
+
+struct SetRoutingRules <: AbstractMessage
+    rules::Vector{RoutingRule}
 end
 
 struct Start <: AbstractMessage end
@@ -62,12 +73,21 @@ end
 
 struct GetTrainmatchers <: AbstractMessage end
 
+struct GetEngineDir <: AbstractMessage end
+
 # Messages that the server can send
 struct Pong <: AbstractMessage end
 
 struct AvailableTrainmatchers <: AbstractMessage
     topic_trainmatchers::Dict{String, Vector{Tuple{String, Bool}}}
-    defaults::Dict{String, String}
+end
+
+struct RoutingRules <: AbstractMessage
+    rules::Vector{RoutingRule}
+end
+
+struct EngineDir <: AbstractMessage
+    path::String
 end
 
 struct Started <: AbstractMessage end
@@ -81,6 +101,13 @@ struct DeviceSchema <: AbstractMessage
     topic::String
     name::String
     schema::Dict{String, Dict}
+end
+
+struct DeviceProperty <: AbstractMessage
+    topic::String
+    device::String
+    property::String
+    value::Any
 end
 
 struct ContextInfo <: AbstractMessage
@@ -102,6 +129,13 @@ end
 struct RemoteReplState <: AbstractMessage
     enabled::Bool
     port::Int
+end
+
+# Per-channel snapshots keyed by (producer, consumer). Producer is either an
+# external dependency name (e.g. "motor.pos") or a variable name; consumer is
+# always the downstream variable name.
+struct ChannelStats <: AbstractMessage
+    stats::Dict{Tuple{String, String}, Context.ChannelStat}
 end
 
 struct Ack <: AbstractMessage

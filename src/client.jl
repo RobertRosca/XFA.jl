@@ -17,6 +17,14 @@ function is_pending(client::ClientState, id::Union{MessageId, Nothing})
     !isnothing(id) && haskey(client.pending_requests, id)
 end
 
+# Send a request to the engine with a callback that will be executed when the
+# response arrives. Returns the message ID.
+function send_with_callback(client::ClientState, msg::AbstractMessage, callback::Function)
+    id = send(client, msg)
+    client.engine_request_callbacks[id] = callback
+    return id
+end
+
 function peekall(buffer::IOBuffer)
     return String(take!(copy(buffer)))
 end
@@ -195,7 +203,7 @@ function initialize_engine(state)
     julia_module_prefix = if is_local
         "true"
     else
-        "source /etc/profile.d/modules.sh; SASE=0 module load exfel julia/202502 > /dev/null 2>&1"
+        "source /etc/profile.d/modules.sh; SASE=0 module load exfel julia/202601 > /dev/null 2>&1"
     end
 
     bootstrap_process = nothing
@@ -300,30 +308,116 @@ function disconnect_engine(state, shutdown_engine)
     setfield!(state, :client, ClientState(load_settings()))
 end
 
+# Restart the engine by shutting it down, waiting for it to die, and then
+# re-initializing it. The SSH session is kept alive.
+function restart_engine(state)
+    client = state.client
+    if client.status ∉ (RemoteStatus_Connected, RemoteStatus_Initializing)
+        @warn "The engine has status $(client.status), it's not valid to restart in that state"
+        return
+    end
+
+    client.status = RemoteStatus_Disconnecting
+
+    # Send the shutdown message
+    if !isnothing(client.websocket) && !WebSockets.isclosed(client.websocket)
+        send(client, Shutdown())
+        timedwait(() -> WebSockets.isclosed(client.websocket), 10)
+    end
+
+    # Wait for the engine process to die
+    pid = Int(client.worker_info["1"]["pid"])
+    if client.embedded_engine
+        if !isnothing(client.engine)
+            notify(client.engine.stop_event)
+            wait(client.engine.stop_task)
+        end
+        rm("worker-info.toml"; force=true)
+    else
+        session = client.ssh_hops[end].session
+        run("for i in \$(seq 1 20); do kill -0 $(pid) 2>/dev/null || break; sleep 0.5; done", session; wait=true)
+    end
+
+    # Close the websocket and forwarder but keep SSH alive
+    if !isnothing(client.websocket)
+        close(client.websocket)
+    end
+    if !isnothing(client.ws_forwarder)
+        close(client.ws_forwarder)
+    end
+
+    client.websocket = nothing
+    client.ws_forwarder = nothing
+    client.worker_info = Dict()
+    client.engine = nothing
+    empty!(client.variable_data)
+
+    # Re-initialize the engine
+    initialize_engine(state)
+end
+
 # Create a Int32 hash to use for ImNodes
 node_hash(x) = reinterpret(Cint, crc32c(x))
 
 function build_context_state(state, ctx_info)
     ctx_state = Dict{String, Any}()
+    empty!(state.client.parameter_states)
 
+    group_names = Set(ctx_info["groups"])
+    is_group_var(name) = any(startswith(name, "$(g).") for g in group_names)
+    group_of(name) = first(g for g in group_names if startswith(name, "$(g)."))
+
+    postprocessors_info = get(ctx_info, "postprocessors", Dict{String, Vector{String}}())
+
+    # Build regular (non-group) variable nodes
     for (name, deps) in ctx_info["dag"]
+        if is_group_var(name)
+            continue
+        end
+
         ctx_state[name] = Dict{String, Any}("id" => node_hash(name))
 
         ctx_state[name]["dependencies"] = []
         ctx_state[name]["outputs"] = []
+        ctx_state[name]["postprocessors"] = []
         ctx_state[name]["type"] = :variable
         ctx_state[name]["origin"] = ctx_info["origins"][name]
         ctx_state[name]["draw_parameters"] = true
 
-        for (value_name, current_values) in [("dependencies", deps),
-                                             ("outputs", ["", ctx_info["subvariables"][name]...])]
-            for value in current_values
-                attr_id = node_hash("$(name).$(value_name).$(value)")
-                push!(ctx_state[name][value_name], (attr_id, value))
+        for dep_pair in deps
+            attr_id = node_hash("$(name).dependencies.$(dep_pair)")
+            push!(ctx_state[name]["dependencies"], (attr_id, dep_pair))
+        end
+
+        # The variable itself is always the first output
+        push!(ctx_state[name]["outputs"], (node_hash("$(name).outputs."), ""))
+
+        pp_names = Set(get(postprocessors_info, name, String[]))
+        for subvar in ctx_info["subvariables"][name]
+            subvar_id = node_hash("$(name).outputs.$(subvar)")
+            if subvar in pp_names
+                pp_prefix = "$(subvar)."
+                pp_params = Dict{String, Any}()
+                for (param_name, param) in ctx_info["parameters"]
+                    if startswith(param_name, pp_prefix)
+                        pp_params[chopprefix(param_name, pp_prefix)] = param
+                    end
+                end
+                push!(ctx_state[name]["postprocessors"], (
+                    id = subvar_id,
+                    name = subvar,
+                    display_name = chopprefix(subvar, "$(name)."),
+                    tree_id_suffix = "###pp_$(subvar)",
+                    plot_id = "Plot##pp_plot_$(subvar)",
+                    params = pp_params,
+                ))
+            else
+                push!(ctx_state[name]["outputs"], (subvar_id, subvar))
             end
         end
     end
 
+    # Build group nodes with member variables folded in as inputs/outputs
     for name in ctx_info["groups"]
         group_filter = startswith("$(name).")
 
@@ -333,18 +427,58 @@ function build_context_state(state, ctx_info)
         ctx_state[name]["type"] = :group
         ctx_state[name]["origin"] = ctx_info["origins"][name]
         ctx_state[name]["draw_parameters"] = true
-        ctx_state[name]["links"] = []
+        ctx_state[name]["links"] = LinkInfo[]
         ctx_state[name]["parameters"] = Dict{String, Any}()
 
+        # Add dependencies from group member variables as inputs on the group node
+        dep_param_names = Set{String}()
+        for (var_name, deps) in ctx_info["dag"]
+            if !group_filter(var_name)
+                continue
+            end
+            for (arg_name, dep) in deps
+                if dep isa Dependency && dep.kind == DepKind_Group
+                    continue
+                end
+                if dep isa Parameter
+                    continue
+                end
+                attr_id = node_hash("$(var_name).dependencies.$(arg_name => dep)")
+                push!(ctx_state[name]["dependencies"], (attr_id, arg_name => dep))
+                push!(dep_param_names, arg_name)
+            end
+        end
+
+        # Add group inputs as outputs
         inputs = filter(group_filter, keys(ctx_info["inputs"]))
         for input_name in inputs
             stripped_name = chopprefix(input_name, "$(name).")
             push!(ctx_state[name]["outputs"], (node_hash(input_name), stripped_name))
         end
 
+        # Add group variables from the DAG as outputs
+        for (var_name, _) in ctx_info["dag"]
+            if !group_filter(var_name)
+                continue
+            end
+            stripped_name = chopprefix(var_name, "$(name).")
+
+            # The variable itself
+            attr_id = node_hash("$(var_name).outputs.")
+            push!(ctx_state[name]["outputs"], (attr_id, stripped_name))
+
+            # Its subvariables
+            for subvar in ctx_info["subvariables"][var_name]
+                subvar_id = node_hash("$(var_name).outputs.$(subvar)")
+                push!(ctx_state[name]["outputs"], (subvar_id, subvar))
+            end
+        end
+
         for (param_name, param) in ctx_info["parameters"]
             if group_filter(param_name)
                 stripped_name = chopprefix(param_name, "$(name).")
+                # Skip parameters that are already shown as dependency inputs
+                stripped_name in dep_param_names && continue
                 ctx_state[name]["parameters"][stripped_name] = param
             end
         end
@@ -361,35 +495,54 @@ function build_context_state(state, ctx_info)
             ctx_state[name]["dependencies"] = []
             ctx_state[name]["outputs"] = [(node_hash(name), name)]
             ctx_state[name]["type"] = :input
-            ctx_state[name]["links"] = []
+            ctx_state[name]["links"] = LinkInfo[]
         end
     end
 
     node_dag = Dict(name => String[] for name in keys(ctx_state))
 
-    new_links = []
+    new_links = LinkInfo[]
     for (name, deps) in ctx_info["dag"]
-        for (i, dep) in enumerate(values(deps))
-            link_end_id = ctx_state[name]["dependencies"][i][1]
+        # Determine which node this variable belongs to
+        node_name = is_group_var(name) ? group_of(name) : name
 
-            if dep isa Dependency
-                link_start_id = ctx_state[dep.name]["outputs"][1][1]
+        for (arg_name, dep) in deps
+            # Skip deps that weren't added as pins
+            if is_group_var(name) && dep isa Dependency && dep.kind == DepKind_Group
+                continue
+            end
+
+            link_end_id = node_hash("$(name).dependencies.$(arg_name => dep)")
+
+            if dep isa Dependency && dep.kind == DepKind_Variable
+                if is_group_var(dep.name)
+                    # Link from the group node's output pin for this variable
+                    link_start_id = node_hash("$(dep.name).outputs.")
+                    dep_node = group_of(dep.name)
+                else
+                    link_start_id = ctx_state[dep.name]["outputs"][1][1]
+                    dep_node = dep.name
+                end
                 link_id = node_hash("$(link_start_id)->$(link_end_id)")
-                push!(new_links, (link_id, link_start_id, link_end_id))
+                push!(new_links, LinkInfo(link_id, link_start_id, link_end_id, (dep.name, name)))
 
-                push!(node_dag[name], dep.name)
-            elseif dep isa KaraboDependency
-                input_name = only(keys(ctx_info["inputs"]))
+                if dep_node != node_name
+                    push!(node_dag[node_name], dep_node)
+                end
+            elseif dep isa Dependency && dep.kind == DepKind_Karabo
+                input_name = ctx_info["dep_to_input"][dep.name]
                 link_start_id = node_hash(input_name)
                 link_id = node_hash("$(link_start_id)->$(link_end_id)")
-                push!(new_links, (link_id, link_start_id, link_end_id))
+                push!(new_links, LinkInfo(link_id, link_start_id, link_end_id, (dep.name, name)))
 
                 input_node_name = split(input_name, ".")[1]
-                push!(node_dag[name], input_node_name)
+                if input_node_name != node_name
+                    push!(node_dag[node_name], input_node_name)
+                end
             end
         end
 
-        ctx_state[name]["links"] = new_links
+        ctx_state[node_name]["links"] = new_links
     end
 
     # positions = NetworkLayout.squaregrid(adj_matrix) .* 200
@@ -407,6 +560,23 @@ function build_context_state(state, ctx_info)
 
     for var_data in values(ctx_state)
         var_data["renaming"] = false
+    end
+
+    # Build variable names list for DepText autocompletion
+    var_names = String[]
+    for (name, _) in ctx_info["dag"]
+        push!(var_names, name)
+        for subvar in ctx_info["subvariables"][name]
+            push!(var_names, subvar)
+        end
+    end
+    sort!(var_names)
+    state.client.variable_names = var_names
+
+    for (param_name, param) in ctx_info["parameters"]
+        if param isa Parameter{OptionalDims}
+            state.client.parameter_states[param_name] = OptionalDimsState(param)
+        end
     end
 
     return ctx_state
@@ -462,6 +632,78 @@ function collect_properties!(props, prefix, node::Dict, target::PropertyList=pro
     end
 end
 
+# Store or update a VariableStore for a given variable/subvariable.
+function store_variable_data!(client, variable::VariableData)
+    data = variable.data
+    name = variable.name
+
+    if !haskey(client.variable_data, name)
+        if data isa Number
+            values = CircularBuffer{Float64}(SCALAR_BUFFER_CAPACITY)
+            tids = CircularBuffer{Int}(SCALAR_BUFFER_CAPACITY)
+            push!(values, data)
+            push!(tids, variable.tid)
+            client.variable_data[name] = VariableStore(; data=values, scalar_tids=tids)
+        elseif data isa AbstractArray
+            client.variable_data[name] = VariableStore(; data)
+        else
+            @error "Unsupported variable type: $(typeof(data))"
+            return
+        end
+    end
+
+    store = client.variable_data[name]
+    store.title = if !isnothing(variable.title)
+        variable.title
+    elseif data isa DimArray
+        DD.label(data)
+    else
+        name
+    end
+    store.x_axis = variable.x_axis
+    store.y_axis = variable.y_axis
+    store.unit = variable.unit
+    store.fixed_aspect = variable.fixed_aspect
+
+    # Use explicit labels if provided, otherwise derive from DimArray or data type
+    store.xlabel = if !isnothing(variable.xlabel)
+        variable.xlabel
+    elseif data isa DimArray
+        DD.label(DD.dims(data)[1])
+    elseif data isa Number
+        "trainId"
+    else
+        ""
+    end
+    store.ylabel = if !isnothing(variable.ylabel)
+        variable.ylabel
+    elseif data isa DimArray
+        DD.label(data)
+    else
+        ""
+    end
+
+    type = if data isa Number
+        VariableType_Scalar
+    elseif data isa AbstractVector
+        VariableType_Vector
+    elseif data isa AbstractArray
+        VariableType_Array
+    else
+        VariableType_Unknown
+    end
+    push!(store.updates, (variable.tid, data, type))
+
+    ts = store.update_timestamps
+    push!(ts, time())
+    if length(ts) > 100
+        popfirst!(ts)
+    end
+    if length(ts) >= 2
+        store.update_rate = 1 / nanmean(diff(ts))
+    end
+end
+
 function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothing)
     client = state.client
 
@@ -493,23 +735,42 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
             client.source_list = [SourceInfo((topic, name, name in ambiguous))
                                   for (topic, devices) in client.device_tree
                                   for (name, _) in devices]
+            sources_by_topic = Dict{String, Vector{SourceInfo}}()
+            for s in client.source_list
+                if !haskey(sources_by_topic, s.topic)
+                    sources_by_topic[s.topic] = SourceInfo[]
+                end
+                push!(sources_by_topic[s.topic], s)
+            end
+            client.sources_by_topic = sources_by_topic
             client.webproxy_status = RequestStatus_Idle
         end
+    elseif msg isa EngineDir
+        client.remote_engine_dir = msg.path
     elseif msg isa AvailableTrainmatchers
-        client.trainmatchers = msg.topic_trainmatchers
-        client.trainmatchers_request_status = RequestStatus_Idle
-
-        # Apply defaults to combo selection indices
-        for (topic, default_tm) in msg.defaults
-            matchers = client.trainmatchers[topic]
-            idx = findfirst(m -> m[1] == default_tm, matchers)
-            if !isnothing(idx)
-                client.trainmatcher_selected_idx[topic] = Ref(Cint(idx - 1))
+        trainmatchers = Dict{String, Vector{String}}()
+        whitelisted = Set{KaraboDevice}()
+        for (topic, ms) in msg.topic_trainmatchers
+            names = String[]
+            for (name, in_whitelist) in ms
+                push!(names, name)
+                if in_whitelist
+                    push!(whitelisted, KaraboDevice(topic, name))
+                end
             end
+            trainmatchers[topic] = names
         end
+        client.trainmatchers = trainmatchers
+        client.whitelisted_trainmatchers = whitelisted
+        client.trainmatchers_request_status = RequestStatus_Idle
+    elseif msg isa RoutingRules
+        client.routing_rules = msg.rules
+        client.routing_rules_request_status = RequestStatus_Idle
     elseif msg isa DeviceSchema
         client.source_properties[(msg.topic, msg.name)] = schema_property_names(msg.schema)
         delete!(client.device_schema_requests, (msg.topic, msg.name))
+    elseif msg isa DeviceProperty
+        nothing
     elseif msg isa ContextInfo
         if msg.info isa Dict
             client.context.context_state = build_context_state(state, msg.info)
@@ -524,41 +785,30 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
         client.context.pipeline_status = msg.is_running ? PipelineStatus_Started : PipelineStatus_Stopped
     elseif msg isa TrainData
         for variable in msg.variables
-            is_new = !haskey(client.variable_data, variable.name)
+            store_variable_data!(client, variable)
 
-            if is_new
-                if variable.data isa Number
-                    array = DimArray([variable.data], (; trainId=[variable.tid]); name=variable.name)
-                    client.variable_data[variable.name] = VariableStore(array)
-                elseif variable.data isa AbstractArray
-                    client.variable_data[variable.name] = VariableStore(variable.data)
-                else
-                    @error "Unsupported variable type: $(typeof(variable.data))"
-                    continue
-                end
-            end
-
-            store = client.variable_data[variable.name]
-            type = if variable.data isa Number
-                VariableType_Scalar
-            elseif variable.data isa AbstractVector
-                VariableType_Vector
-            elseif variable.data isa AbstractArray
-                VariableType_Array
-            else
-                VariableType_Unknown
-            end
-            push!(store.updates, (variable.tid, variable.data, type))
-
-            ts = store.update_timestamps
-            push!(ts, time())
-            if length(ts) > 100
-                popfirst!(ts)
-            end
-            if length(ts) >= 2
-                store.update_rate = 1 / nanmean(diff(ts))
+            for subvar in values(variable.subvariables)
+                store_variable_data!(client, subvar)
             end
         end
+    elseif msg isa ParameterChanged
+        param = msg.parameter
+        # Update the parameter in the context state. Parameter names are
+        # prefixed with the group name (e.g. "bridge.address").
+        parts = split(param.name, "."; limit=2)
+        if length(parts) == 2
+            group, param_name = parts
+            group = String(group)
+            param_name = String(param_name)
+            ctx_state = client.context.context_state
+            if haskey(ctx_state, group) && haskey(ctx_state[group], "parameters")
+                if haskey(ctx_state[group]["parameters"], param_name)
+                    ctx_state[group]["parameters"][param_name].value = param.value
+                end
+            end
+        end
+    elseif msg isa ChannelStats
+        client.context.channel_stats = msg.stats
     elseif msg isa RemoteReplState
         client.remoterepl_mode[] = msg.enabled
         client.remoterepl_status = msg.enabled ? RemoteReplStatus_Running : RemoteReplStatus_Stopped
@@ -594,16 +844,18 @@ function handle_server(state)
             # because the server is running locally or because it's running remotely
             # and we've forwarded the port. Connecting to open servers is not
             # support for the moment.
-            WebSockets.open("ws://localhost:$(port)") do ws
+            WebSockets.open("ws://localhost:$(port)"; suppress_close_error=true) do ws
                 client.websocket = ws
 
-                # The first messages we receive are our client ID and engine directory
+                # The first message we receive is our client ID
                 id = WebSockets.receive(ws)
                 client.client_id = id
-                client.remote_engine_dir = WebSockets.receive(ws)
 
                 client.status = RemoteStatus_Connected
+                send(client, GetEngineDir())
                 get_devices(client)
+                get_trainmatchers(client)
+                get_routing_rules(client)
 
                 for msg_bytes in ws
                     buffer = IOBuffer(msg_bytes)
@@ -615,8 +867,17 @@ function handle_server(state)
                         nothing
                     end
 
+                    callback = if !isnothing(envelope.reply_to)
+                        pop!(client.engine_request_callbacks, envelope.reply_to, nothing)
+                    else
+                        nothing
+                    end
+
                     try
                         @invokelatest handle_msg(state, envelope.msg, replied_to)
+                        if !isnothing(callback)
+                            @invokelatest callback(envelope.msg)
+                        end
                     catch ex
                         @error "Error handling message!" exception=(ex, catch_backtrace())
                     end
@@ -654,8 +915,10 @@ function handle_server(state)
 
         # Call the shutdown function to ensure that the tunnel is killed too
         disconnect_engine(state, false)
-    else
-        # Otherwise we've disconnected normally
+    elseif client.status != RemoteStatus_Disconnecting
+        # Otherwise we've disconnected normally. Don't overwrite
+        # RemoteStatus_Disconnecting since disconnect_engine() manages
+        # that transition.
         client.status = RemoteStatus_Unconnected
     end
 end
@@ -667,6 +930,11 @@ end
 function get_trainmatchers(client)
     send(client, GetTrainmatchers())
     client.trainmatchers_request_status = RequestStatus_Waiting
+end
+
+function get_routing_rules(client)
+    send(client, GetRoutingRules())
+    client.routing_rules_request_status = RequestStatus_Waiting
 end
 
 function load_context(state)
@@ -701,8 +969,8 @@ function stop(state)
     state.client.context.pipeline_status = PipelineStatus_Stopping
 end
 
-function set_topic_trainmatcher(client, topic, trainmatcher)
-    client.trainmatcher_set_request = send(client, SetTopicTrainmatcher(topic, trainmatcher))
+function set_routing_rules(client, rules::AbstractVector{RoutingRule})
+    client.routing_rules_set_request = send(client, SetRoutingRules(collect(rules)))
 end
 
 function set_debug_mode(state)

@@ -6,6 +6,7 @@ authors = ["JamesWrigley <james@puiterwijk.org>"]
 [deps]
 CImGui = "5d785b6c-b76f-510e-a07c-3070796c7e87"
 CRC32c = "8bf52ea8-c179-5cab-976a-9e18b702a9bc"
+DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 DimensionalData = "0703355e-b756-11e9-17c0-8b28908087d0"
 GLFW = "f7f18e0c-5ee9-5ccd-a5bf-e8befd85ed98"
@@ -29,6 +30,7 @@ XfaEngine = {path = "XfaEngine"}
 [compat]
 CImGui = "7"
 CRC32c = "1"
+DataStructures = "0.19"
 Dates = "1.11.0"
 DimensionalData = "0.30"
 GLFW = "3"

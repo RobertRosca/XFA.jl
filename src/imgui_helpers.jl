@@ -58,8 +58,8 @@ function EditableComboBox(label, text, completions;
     return edited, unsafe_string(pointer(input))
 end
 
-function SafeInputText(label; max_len=63, hint="", current_text="", password=false, reset=false,
-                       callback=C_NULL, user_data=C_NULL)
+function SafeInputText(label; max_len=127, hint="", current_text="", password=false, reset=false,
+                       callback=C_NULL, user_data=C_NULL, validator=nothing)
     id = ig.GetID(label)
     if !haskey(safe_input_text_cache, id) || reset
         safe_input_text_cache[id] = SafeInputTextState(max_len, current_text)
@@ -82,13 +82,24 @@ function SafeInputText(label; max_len=63, hint="", current_text="", password=fal
     end
 
     modified = unsafe_string(pointer(state.buffer)) != current_text
+    validation_error = if !isnothing(validator) && modified
+        validator(unsafe_string(pointer(state.buffer)))
+    else
+        nothing
+    end
 
-    if modified
+    if !isnothing(validation_error)
+        ig.PushStyleColor(ig.ImGuiCol_FrameBg, ig.IM_COL32(180, 40, 40, 255))
+    elseif modified
         ig.PushStyleColor(ig.ImGuiCol_FrameBg, ig.IM_COL32(143, 98, 0, 255))
     end
     ret = ig.InputTextWithHint(label, hint, pointer(state.buffer), length(state.buffer),
                                flags, callback, user_data)
-    if modified
+    if !isnothing(validation_error)
+        ig.PopStyleColor()
+        ig.Text(validation_error)
+        ret = false
+    elseif modified
         ig.PopStyleColor()
     end
 
@@ -155,14 +166,23 @@ end
     ElidedEditState_Edit
 end
 
+struct CompletionResult
+    items::Any
+    formatter::Function
+    renderer::Function
+    query::String
+    source::String
+end
+
 mutable struct ElidedTextState
     edit::ElidedEditState
     selected_idx::Int
     cached_query::String
+    cached_source::String
     cached_scored::Vector{Tuple{Int, Any}}
 end
 
-ElidedTextState() = ElidedTextState(ElidedEditState_NoEdit, 1, "", Tuple{Int, Any}[])
+ElidedTextState() = ElidedTextState(ElidedEditState_NoEdit, 1, "", "", Tuple{Int, Any}[])
 
 const elided_text_states = Dict{UInt32, ElidedTextState}()
 
@@ -176,6 +196,15 @@ positions.
 function fuzzy_match(query::AbstractString, text::AbstractString)
     q = lowercase(query)
     t = lowercase(text)
+
+    # Substring match: rank these above any fuzzy result, by match position
+    # first and then text length. The 1_000_000 floor leaves plenty of room
+    # below the position penalty without colliding with fuzzy scores.
+    substr = findfirst(q, t)
+    if !isnothing(substr)
+        return true, 1_000_000 - 100 * first(substr) - length(t)
+    end
+
     qi = 1
     score = 0
     prev_match_pos = 0
@@ -213,6 +242,10 @@ function fuzzy_match(query::AbstractString, completions::AbstractVector, complet
         end
     end
 
+    # The partial-top-N strategy above leaves the buffer min-at-front (or in
+    # insertion order if it never filled). Sort descending so callers can iterate
+    # best-first.
+    sort!(scored; by=first, rev=true)
     return scored
 end
 
@@ -237,15 +270,15 @@ completion text if one was chosen, `nothing` otherwise.
   return on selection
 - `completion_renderer(item, index, is_selected)`: draws a single completion row
 """
-function draw_autocomplete_popup(label, state::ElidedTextState, query, completions,
-                                 completion_text, completion_renderer)
+function draw_autocomplete_popup(label, state::ElidedTextState, ac::CompletionResult)
     popup_label = "##autocomplete-$(label)"
 
-    scored = if query == state.cached_query && !isempty(state.cached_scored)
+    scored = if ac.query == state.cached_query && ac.source == state.cached_source && !isempty(state.cached_scored)
         state.cached_scored
     else
-        state.cached_query = query
-        state.cached_scored = fuzzy_match(query, completions, completion_text)
+        state.cached_query = ac.query
+        state.cached_source = ac.source
+        state.cached_scored = fuzzy_match(ac.query, ac.items, ac.formatter)
     end
 
     result = nothing
@@ -279,10 +312,10 @@ function draw_autocomplete_popup(label, state::ElidedTextState, query, completio
 
             for (i, (_, item)) in enumerate(scored)
                 is_selected = (i == state.selected_idx)
-                formatted = completion_text(item)
+                formatted = ac.formatter(item)
                 ig.PushID(i)
                 ig.SetNextItemAllowOverlap()
-                if completion_renderer(item, i, is_selected)
+                if ac.renderer(item, i, is_selected)
                     result = formatted
                 end
                 RowCopyButton("ac-$i", formatted, popup_width)
@@ -303,12 +336,19 @@ end
 
 function ElidedText(label::AbstractString, text::AbstractString;
                     max_chars::Int=30, editable::Bool=false,
+                    focus::Bool=false,
                     completions=nothing,
                     completion_text::Function=string,
                     completion_renderer::Function=default_completion_renderer,
-                    callback=C_NULL, user_data=C_NULL)
+                    callback=C_NULL, user_data=C_NULL,
+                    validator=nothing)
     id = ig.GetID(label)
     state = get!(ElidedTextState, elided_text_states, id)
+    if focus && state.edit == ElidedEditState_NoEdit
+        state.edit = ElidedEditState_WantEdit
+    end
+
+    min_width = ig.CalcTextSize("m").x * 13  # minimum clickable width
 
     if editable && state.edit != ElidedEditState_NoEdit
         just_started = state.edit == ElidedEditState_WantEdit
@@ -317,22 +357,21 @@ function ElidedText(label::AbstractString, text::AbstractString;
             state.edit = ElidedEditState_Edit
             state.selected_idx = 1
         end
-        ig.SetNextItemWidth(ig.CalcTextSize(text).x + 40)
+        ig.SetNextItemWidth(max(min_width, ig.CalcTextSize(text).x + 40))
         edited, new_text = SafeInputText("##elided-$(label)"; current_text=text, reset=just_started,
-                                         callback, user_data)
+                                         callback, user_data, validator)
         lost_focus = !just_started && ig.IsItemDeactivated() && !ig.IsItemActive()
 
         # Draw autocomplete popup if completions are provided
         ac_result = nothing
         ac_hovered = false
         if !isnothing(completions)
-            ac_completions, ac_text_fn, ac_renderer, ac_query = if completions isa Base.Callable
+            ac = if completions isa Base.Callable
                 completions(new_text)
             else
-                (completions, completion_text, completion_renderer, new_text)
+                CompletionResult(completions, completion_text, completion_renderer, new_text, "")
             end
-            ac_result, ac_hovered = draw_autocomplete_popup(label, state, ac_query,
-                                                            ac_completions, ac_text_fn, ac_renderer)
+            ac_result, ac_hovered = draw_autocomplete_popup(label, state, ac)
         end
 
         if !isnothing(ac_result)
@@ -357,7 +396,7 @@ function ElidedText(label::AbstractString, text::AbstractString;
             padding = ImVec2(2, 2)
             cursor = ig.GetCursorPos()
             ig.SetCursorPos(ImVec2(cursor.x, cursor.y - padding.y))
-            ig.InvisibleButton("##elided-btn-$(label)", ImVec2(text_size.x + 2 * padding.x, text_size.y + 2 * padding.y))
+            ig.InvisibleButton("##elided-btn-$(label)", ImVec2(max(text_size.x, min_width) + 2 * padding.x, text_size.y + 2 * padding.y))
             hovered = ig.IsItemHovered()
             clicked = ig.IsItemClicked()
 
@@ -410,8 +449,8 @@ function CopyButton(label, text)
 end
 
 function RowCopyButton_size()
-    width = ig.CalcTextSize("\uf0c5").x + unsafe_load(ig.GetStyle().FramePadding.x) * 2
-    height = ig.GetFontSize() + 2
+    width = ig.CalcTextSize("\uf0c5").x + 2
+    height = ig.GetFontSize() + 1
 
     width, height
 end
@@ -425,7 +464,7 @@ function RowCopyButton(label, copy_text, popup_width)
     row_min = ig.GetItemRectMin()
     row_max = ig.GetItemRectMax()
     ig.SameLine(popup_width - width - unsafe_load(ig.GetStyle().WindowPadding.x) * 2)
-    if ig.IsMouseHoveringRect(row_min, ImVec2(row_max.x, row_max.y))
+    if ig.IsMouseHoveringRect(row_min, ImVec2(row_min.x + popup_width, row_max.y))
         CopyButton(label, copy_text)
     else
         ig.Dummy(ImVec2(width, height))
@@ -443,8 +482,10 @@ function CopyableCombo(label, items, selected_idx::Ref{Cint})
 
     # AllowOverlap so the copy button overlaid on the preview can receive clicks
     ig.SetNextItemAllowOverlap()
+    combo_w = ig.CalcItemWidth() + ig.GetFrameHeight()
+    ig.SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(combo_w, Cfloat(typemax(Int32))))
     if ig.BeginCombo("##$label", preview)
-        popup_w = ig.GetWindowSize().x
+        popup_w = combo_w
         for (i, name) in enumerate(items)
             ig.SetNextItemAllowOverlap()
             if ig.Selectable("##$label-$i")
@@ -527,7 +568,8 @@ strip_topic(s) = (m = match(r"^\w+//(.+)$", s); isnothing(m) ? s : m.captures[1]
 # Compute completions for a KaraboDependency text input. Returns
 # (items, formatter, query) where items is the list to complete from, formatter
 # maps an item to the string to insert, and query is the fuzzy match input.
-function dep_completions(input, cursor, source_list, device_props::DeviceProperties)
+function dep_completions(input, cursor, source_list, device_props::DeviceProperties;
+                         allow_slow::Bool=true)
     sep = find_separator(input)
     cursor_after_sep = !isnothing(sep) && cursor >= 0 && cursor > sep - 1
 
@@ -549,6 +591,9 @@ function dep_completions(input, cursor, source_list, device_props::DevicePropert
         end
         return (sources, formatter, query)
     elseif input[sep] == '.'
+        if !allow_slow
+            return (String[], identity, "")
+        end
         dev = @view input[1:sep-1]
         query = @view input[sep+1:end]
         return (device_props.slow.names, prop -> "$(dev).$(prop)", query)
@@ -592,22 +637,29 @@ after each call to determine which source's `DeviceProperties` to pass on the
 next frame.
 """
 function KaraboDepText(label, text, dep_state::KaraboDepTextState,
-                       source_list, device_props::DeviceProperties)
+                       source_list, device_props::DeviceProperties;
+                       device_only::Bool=false, allow_slow::Bool=true,
+                       focus::Bool=false)
     id = ig.GetID(label)
 
     cb = @cfunction(dep_text_callback, Cint, (Ptr{ig.ImGuiInputTextCallbackData},))
 
     live_text = Ref(text)
     edited, new_text = ElidedText(label, text;
-        editable=true,
+        editable=true, focus,
         callback=cb,
         user_data=pointer_from_objref(dep_state),
         completions=input -> begin
             live_text[] = input
-            items, formatter, query = dep_completions(input, dep_state.cursor_pos,
-                                                      source_list, device_props)
-            renderer = items isa Vector{SourceInfo} ? source_completion_renderer : property_completion_renderer
-            (items, formatter, renderer, query)
+            cursor = device_only ? -1 : dep_state.cursor_pos
+            items, formatter, query = dep_completions(input, cursor,
+                                                      source_list, device_props;
+                                                      allow_slow)
+            is_source_list = items isa Vector{SourceInfo}
+            renderer = is_source_list ? source_completion_renderer : property_completion_renderer
+            mode = is_source_list ? "devices" : "properties"
+            source = "karabo:$(mode):" * @something(dep_state.device, "")
+            CompletionResult(items, formatter, renderer, query, source)
         end)
 
     # Update the device field based on current text and cursor position
@@ -624,7 +676,7 @@ function KaraboDepText(label, text, dep_state::KaraboDepTextState,
         has_colon = !isnothing(sep) && new_text[sep] == ':'
         # A complete expression is either "device.property" (dot separator) or
         # "device:pipeline[property]" (colon separator with closing bracket).
-        is_complete = !isnothing(sep) && (!has_colon || endswith(new_text, ']'))
+        is_complete = device_only || !isnothing(sep) && (!has_colon || endswith(new_text, ']'))
         if is_complete
             dep_state.cursor_pos = -1
             dep_state.device = nothing
@@ -649,3 +701,90 @@ function KaraboDepText(label, text, dep_state::KaraboDepTextState,
 
     return false, text
 end
+
+function variable_completion_renderer(item, i, selected)
+    clicked = ig.Selectable("##var-$i", selected)
+    ig.SameLine(0, 0)
+    ig.Text(item)
+    return clicked
+end
+
+# Draw a dependency editor widget with a type selector (Karabo/Variable) and
+# autocomplete text field. Returns (edited::Bool, new_dep::Dependency) where
+# new_dep is the updated dependency if edited.
+#
+# - `dep`: the current Dependency value
+# - `dep_state`: mutable DepTextState tracking the selected type and karabo state
+# - `source_list`: Karabo source list for Karabo-mode completions
+# - `device_props`: DeviceProperties for the currently-entered Karabo device
+# - `variable_names`: list of variable names (including subvariable outputs) for Variable-mode completions
+# - `device_only`: if true, Karabo mode only completes device names (no property)
+function DepText(label, dep::Dependency, dep_state::DepTextState,
+                 source_list, device_props::DeviceProperties,
+                 variable_names::Vector{String};
+                 device_only::Bool=false, variable_name::String="")
+    # Type selector combo
+    dep_kinds = ["Karabo", "Variable"]
+    current_idx = dep_state.is_karabo ? 0 : 1
+    focus = false
+    frame_padding = unsafe_load(ig.GetStyle().FramePadding.x)
+    ig.SetNextItemWidth(ig.CalcTextSize("Variable ").x)
+    if ig.BeginCombo("##dep-kind-$(label)", dep_kinds[current_idx + 1], ig.ImGuiComboFlags_NoArrowButton)
+        for (i, kind_label) in enumerate(dep_kinds)
+            selected = (i - 1) == current_idx
+            if ig.Selectable(kind_label, selected)
+                focus = dep_state.is_karabo != (i == 1)
+                dep_state.is_karabo = (i == 1)
+                # Reset karabo state when switching
+                dep_state.karabo_state.cursor_pos = -1
+                dep_state.karabo_state.device = nothing
+                dep_state.karabo_state.wanted_text = nothing
+            end
+        end
+        ig.EndCombo()
+    end
+
+    ig.SameLine()
+
+    if dep_state.is_karabo
+        text = dep.kind == DepKind_Karabo ? string(dep) : ""
+        focus &= isempty(text)
+        edited, new_text = KaraboDepText(label, text, dep_state.karabo_state,
+                                         source_list, device_props;
+                                         device_only, focus)
+        if edited
+            return true, karabo_dependency(new_text)
+        end
+    else
+        text = dep.kind == DepKind_Karabo ? "" : dep.name
+        focus &= isempty(text)
+        edited, new_text = ElidedText(label, text;
+            editable=true, focus,
+            completions=input -> begin
+                prefix = variable_name * "."
+                filtered = filter(v -> v != variable_name && !startswith(v, prefix), variable_names)
+                CompletionResult(filtered, identity, variable_completion_renderer, input, "variable")
+            end)
+        if edited && !isempty(new_text)
+            return true, Dependency(new_text)
+        end
+    end
+
+    return false, dep
+end
+
+function variable_name_validator(new_name, current_name)
+    client = state[].client
+
+    if isempty(new_name)
+        "Name cannot be empty"
+    elseif !Meta.isidentifier(new_name)
+        "'$(new_name)' is not a valid Julia identifier"
+    elseif new_name ∈ client.variable_names && new_name != current_name
+        "A variable named '$(new_name)' already exists"
+    else
+        nothing
+    end
+end
+
+variable_name_validator(current_name) = Base.Fix2(variable_name_validator, current_name)

@@ -42,7 +42,7 @@ while !isfile(toml_path) || filesize(toml_path) == 0
     else
         elapsed_str = @sprintf "%.2fs" elapsed
         println("Waiting for engine to start... $(elapsed_str)")
-        sleep(1)
+        sleep(2)
     end
 end
 

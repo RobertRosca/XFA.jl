@@ -8,16 +8,17 @@ using ModernGL
 
 include("imnodes.jl")
 
-using NaNStatistics: nanmean, nanmaximum, nanminimum
+using NaNStatistics: nanmean, nanmaximum, nanminimum, nanpctile
 using DimensionalData: DimensionalData as DD, DimVector, DimMatrix, DimArray, At, lookup
+using DataStructures: CircularBuffer
 include("plotting.jl")
 
 using LibSSH: LibSSH as ssh
 using HTTP: HTTP, WebSockets
-using XfaEngine: EngineState, getavailableport
+using XfaEngine: EngineState, getavailableport, RoutingRule
 using Dates: Dates, unix2datetime, @dateformat_str
+using XfaEngine.Context: Parameter, OptionalDims, KaraboDevice
 include("states.jl")
-include("imgui_helpers.jl")
 
 using Printf: @sprintf
 using TOML: TOML
@@ -26,10 +27,14 @@ using CRC32c: crc32c
 using Serialization
 using XfaEngine.Protocol
 using XfaEngine: XfaEngine, Protocol
-using XfaEngine.Context: KaraboDependency, Dependency, Parameter, KaraboDevice
+using XfaEngine.Context: Dependency, DependencyKind, DepKind_Variable, DepKind_Karabo, DepKind_Group,
+    karabo_dependency, Parameter, KaraboDevice, VariableData, OptionalDims
+
+include("imgui_helpers.jl")
 include("state_inspector.jl")
 include("client.jl")
 include("context_edit.jl")
+include("variable_widgets.jl")
 
 import Revise
 
@@ -38,20 +43,6 @@ import .ImNodes
 const state = ScopedValue{GuiState}()
 
 ## Helper functions for the GUI
-
-# function update_device_list(state)
-#     client = state.client.webproxy_client
-#     client.status = WebProxyClientStatus_Connecting
-
-#     try
-#         devices = WebProxy.get_devices(state.webproxy_client)
-#         state.karabo_devices = keys(devices)
-#         client.status = WebProxyClientStatus_Connected
-#     catch ex
-#         client.status = WebProxyClientStatus_Error
-#         client.last_error = Util.exception2str(ex, catch_backtrace())
-#     end
-# end
 
 function draw_revise()
     can_revise = length(Revise.revision_queue) > 0
@@ -111,11 +102,11 @@ function draw_parameter_widget(name, param::Parameter{Float64})
 end
 
 function draw_parameter_widget(name, param::Parameter{Int})
-    int32_value = Int32(param.value)
-    @c ig.InputInt(name, &int32_value)
-    param.value = Int(int32_value)
+    int32_ref = Ref(Int32(param.value))
+    ret = ig.InputInt("##$(name)", int32_ref)
+    param.value = Int(int32_ref[])
 
-    return false, nothing
+    return ret, param.value
 end
 
 function draw_parameter_widget(name, param::Parameter{String})
@@ -128,15 +119,103 @@ function draw_parameter_widget(name, param::Parameter{Vector{String}})
     return false, nothing
 end
 
-function draw_parameter_widget(name, param::Parameter{KaraboDevice})
-    device = param.value
-    ig.Text("$(device.name) ($(device.topic))")
+function draw_parameter_widget(name, param::Parameter{Vector{Int}})
+    ig.Text("Vector{Int}")
+    return false, nothing
+end
+
+function draw_parameter_widget(name, param::Parameter{OptionalDims})
+    ps = state[].client.parameter_states[param.name]::OptionalDimsState
+
+    checkbox_changed = @c ig.Checkbox("All##$(name)", &ps.all_dims)
+    if checkbox_changed
+        if ps.all_dims
+            return true, OptionalDims()
+        end
+    end
+
+    if !ps.all_dims
+        current = join(param.value.dims, ", ")
+        text = isempty(ps.pending_text) ? current : ps.pending_text
+        if ps.pending_text == current
+            ps.pending_text = ""
+        end
+        ig.SetNextItemWidth(ig.GetContentRegionAvail().x)
+        edited, new_text = SafeInputText("##dims_$(name)"; current_text=text)
+
+        if edited || checkbox_changed
+            ps.pending_text = new_text
+            parts = [strip(s) for s in split(new_text, ","; keepempty=false)]
+            dims = try
+                Int[parse(Int, p) for p in parts]
+            catch
+                String[parts...]
+            end
+            return true, OptionalDims(dims)
+        end
+    end
 
     return false, nothing
 end
 
+function draw_parameter_widget(name, param::Parameter{KaraboDevice})
+    client = state[].client
+    dep_key = node_hash(param.name)
+    dep_state = get!(client.karabo_dep_states, dep_key, KaraboDepTextState())
+    device_props = if isnothing(dep_state.device)
+        DeviceProperties()
+    else
+        get_source_properties(client, dep_state.device)
+    end
+
+    device = param.value
+    text = "$(device.topic)//$(device.name)"
+    edited, new_text = KaraboDepText("param-$(param.name)", text, dep_state,
+                                     client.source_list, device_props; device_only=true)
+    if edited
+        new_device = KaraboDevice(new_text)
+        if isempty(new_device.topic)
+            idx = findfirst(s -> s.name == new_device.name, client.source_list)
+            if !isnothing(idx)
+                new_device = KaraboDevice(client.source_list[idx].topic, new_device.name)
+            end
+        end
+        return true, new_device
+    end
+
+    return false, nothing
+end
+
+# Draw a dependency editor (type selector + autocomplete text field).
+# Returns (edited::Bool, new_dep::Dependency). Used for both dependency pins
+# and Parameter{Dependency} widgets.
+function draw_dep_editor(label, dep::Dependency, dep_id::Integer;
+                         device_only::Bool=false, variable_name::String="")
+    client = state[].client
+    dep_state = get!(client.dep_text_states, Int(dep_id)) do
+        DepTextState(dep.kind == DepKind_Karabo)
+    end
+    device_props = if isnothing(dep_state.karabo_state.device)
+        DeviceProperties()
+    else
+        get_source_properties(client, dep_state.karabo_state.device)
+    end
+    DepText(label, dep, dep_state, client.source_list, device_props,
+            client.variable_names; device_only, variable_name)
+end
+
+function draw_parameter_widget(name, param::Parameter{Dependency})
+    dep = param.value
+    dep_id = node_hash(param.name)
+    edited, new_dep = draw_dep_editor("param-dep-$(param.name)", dep, dep_id)
+    if edited
+        return true, new_dep
+    end
+    return false, nothing
+end
+
 function draw_parameter_widget(name, param::Parameter{Bool})
-    @c ig.Checkbox(name, &param.value)
+    @c ig.Checkbox("", &param.value)
 
     return false, nothing
 end
@@ -158,6 +237,9 @@ function clear_variables()
     for store in values(client.variable_data)
         if store.data isa AbstractVector
             empty!(store.data)
+        end
+        if !isnothing(store.scalar_tids)
+            empty!(store.scalar_tids)
         end
     end
 
@@ -213,6 +295,8 @@ end
 # Draw a single parameter with appropriate width, and send a change message
 # if modified.
 function draw_parameter(name, param; min_node_width=150)
+    ig.Text(name * ":")
+    ig.SameLine()
     ig.SetNextItemWidth(round(Int, min_node_width * 1.5))
     modified, new_value = draw_parameter_widget(name, param)
     if modified
@@ -236,22 +320,6 @@ end
 # Return a gui state object to persist custom state across frames, or nothing.
 draw_variable_content(::Val, name, var_data, gui_state) = nothing
 
-function draw_variable_content(::Val{Symbol("XfaEngine.Context.KaraboBridge")}, name, var_data, gui_state)
-    var_data["draw_parameters"] = false
-    params = var_data["parameters"]
-
-    ig.Text("Parameters:")
-    draw_parameter("trainmatcher", params["trainmatcher"])
-    draw_parameter("manual_configuration", params["manual_configuration"])
-
-    if params["manual_configuration"].value
-        draw_parameter("hostname", params["hostname"])
-        draw_parameter("port", params["port"])
-    end
-
-    return nothing
-end
-
 # Draws a variable node. The node shell (titlebar, dependencies, outputs) is
 # always the same, but draw_variable_content() is called inside to allow
 # custom rendering for specific variables.
@@ -260,64 +328,59 @@ function draw_variable(name, var_data)
     min_node_width = 150
     variable_store = get(client.variable_data, name, nothing)
 
+    ig.PushID(name)
     ImNodes.BeginNode(var_data["id"])
 
-    # Draw titlebar
-    ImNodes.BeginNodeTitleBar()
-    edited, new_name = ElidedText("var-name-$(name)", name; editable=true)
-    if edited
-        @guiasync rename_variable(state[], name, new_name)
-    end
-    ImNodes.EndNodeTitleBar()
-
-    # Draw custom content
-    origin = var_data["origin"]
-    gui_state = get(client.variable_gui_states, name, nothing)
-    new_gui_state = draw_variable_content(Val(Symbol(origin)), name, var_data, gui_state)
-    if !isnothing(new_gui_state) && !haskey(client.variable_gui_states, name)
-        client.variable_gui_states[name] = new_gui_state
-    end
-
-    if var_data["draw_parameters"]
-        draw_parameters(var_data)
-    end
-
-    ig.Dummy(min_node_width, 20)
-
-    # Draw dependencies
-    deps = var_data["dependencies"]
-    for (dep_id, dep_pair) in deps
-        arg_name, dep = dep_pair
-        # Don't draw pins for parameters
-        if dep isa Parameter
-            continue
+    disable_node = client.context.pipeline_status ∉ (PipelineStatus_Stopped, PipelineStatus_Started)
+    @Disabled disable_node begin
+        # Draw titlebar
+        ImNodes.BeginNodeTitleBar()
+        edited, new_name = ElidedText("var-name-$(name)", name; editable=true,
+                                      validator=variable_name_validator(name))
+        if edited
+            @guiasync rename_variable(state[], name, new_name)
+        end
+        ImNodes.EndNodeTitleBar()
+        # Draw custom content
+        origin = var_data["origin"]
+        gui_state = get(client.variable_gui_states, name, nothing)
+        new_gui_state = draw_variable_content(Val(Symbol(origin)), name, var_data, gui_state)
+        if !isnothing(new_gui_state) && !haskey(client.variable_gui_states, name)
+            client.variable_gui_states[name] = new_gui_state
         end
 
-        pin_shape = dep isa KaraboDependency ? ImNodes.ImNodesPinShape_TriangleFilled : ImNodes.ImNodesPinShape_CircleFilled
-
-        ImNodes.BeginInputAttribute(dep_id, pin_shape)
-        if dep isa KaraboDependency
-            ig.TextDisabled("Karabo")
-            ig.SameLine()
-            dep_state = get!(client.karabo_dep_states, dep_id, KaraboDepTextState())
-            device_props = if isnothing(dep_state.device)
-                DeviceProperties()
-            else
-                get_source_properties(client, dep_state.device)
-            end
-            disable_dep = client.context.pipeline_status ∉ (PipelineStatus_Stopped, PipelineStatus_Started)
-            @Disabled disable_dep begin
-                edited, new_text = KaraboDepText("dep-$(dep_id)", string(dep), dep_state,
-                                                client.source_list, device_props)
-                if edited
-                    @guiasync rename_karabo_dep(state[], name, arg_name, KaraboDependency(new_text))
-                end
-            end
-        else
-            ig.Text(arg_name)
+        if var_data["draw_parameters"]
+            draw_parameters(var_data)
         end
-        ImNodes.EndInputAttribute()
-    end
+
+        ig.Dummy(min_node_width, 20)
+
+        # Draw dependencies
+        deps = var_data["dependencies"]
+        for (dep_id, dep_pair) in deps
+            arg_name, dep = dep_pair
+            # Don't draw pins for parameters
+            if dep isa Parameter
+                continue
+            end
+
+            dep_ts = get!(client.dep_text_states, dep_id) do
+                DepTextState(dep isa Dependency && dep.kind == DepKind_Karabo)
+            end
+            pin_shape = dep_ts.is_karabo ? ImNodes.ImNodesPinShape_TriangleFilled : ImNodes.ImNodesPinShape_CircleFilled
+
+            ImNodes.BeginInputAttribute(dep_id, pin_shape)
+            if var_data["type"] == :group
+                ig.Text(arg_name * ":")
+                ig.SameLine()
+            end
+            edited, new_dep = draw_dep_editor("dep-$(dep_id)", dep, dep_id; variable_name=name)
+            if edited
+                @guiasync rename_dep(state[], name, arg_name, dep, new_dep)
+            end
+            ImNodes.EndInputAttribute()
+        end
+    end # @Disabled
 
     ig.Dummy(min_node_width, 10)
 
@@ -338,7 +401,6 @@ function draw_variable(name, var_data)
         output_name = isempty(label) ? name : "$(name).$(label)"
         ImNodes.BeginOutputAttribute(output_id, ImNodes.ImNodesPinShape_CircleFilled)
 
-        ig.Indent(min_node_width - ig.CalcTextSize(label).x)
         typestr = get_variable_typeinfo(output_name)
         if !isempty(typestr)
             label = isempty(label) ? typestr : "$(label) - $(typestr)"
@@ -358,7 +420,236 @@ function draw_variable(name, var_data)
         ImNodes.EndOutputAttribute()
     end
 
+    # Draw postprocessors
+    postprocessors = get(var_data, "postprocessors", [])
+    if !isempty(postprocessors)
+        ig.Dummy(min_node_width, 8)
+        ig.TextDisabled("Postprocessors")
+        pp_sep_pos = ig.GetCursorScreenPos()
+        ig.AddLine(draw_list, pp_sep_pos, (pp_sep_pos.x + min_node_width / 2f0, pp_sep_pos.y), gray, 2)
+        ig.Dummy(min_node_width, 2)
+
+        for pp in postprocessors
+            label = pp.display_name * pp.tree_id_suffix
+
+            ImNodes.BeginOutputAttribute(pp.id, ImNodes.ImNodesPinShape_CircleFilled)
+
+            # This child window is here to get around an imnodes limitation that
+            # would make a regular TreeNode extend it's width to the edge of the
+            # screen: https://github.com/Nelarius/imnodes/issues/167
+            ig.PushStyleColor(ig.ImGuiCol_ChildBg, ig.ImVec4(0, 0, 0, 0))
+            node_width = ImNodes.GetNodeDimensions(var_data["id"]).x
+            child_width = max(min_node_width, node_width * 3 / 4)
+            if ig.BeginChild("##pp-$(pp.id)", ImVec2(child_width, 0), ig.ImGuiChildFlags_AutoResizeY, ig.ImGuiWindowFlags_HorizontalScrollbar)
+                expanded = ig.TreeNode(label)
+                if haskey(client.variable_data, pp.name)
+                    typestr = get_variable_typeinfo(pp.name)
+                    if !isempty(typestr)
+                        ig.SameLine()
+                        if ig.SmallButton("$(typestr)$(pp.tree_id_suffix)_plot")
+                            push!(client.plots, Plot(pp.name, client.plot_counter))
+                            client.plot_counter += 1
+                        end
+                    end
+                end
+                if expanded
+                    if isempty(pp.params)
+                        ig.TextDisabled("(no parameters)")
+                    else
+                        for (param_name, param) in pp.params
+                            draw_parameter(param_name, param; min_node_width)
+                        end
+                    end
+                    ig.TreePop()
+                end
+            end
+            ig.EndChild()
+            ig.PopStyleColor()
+
+            ImNodes.EndOutputAttribute()
+        end
+    end
+
     ImNodes.EndNode()
+    ig.PopID()
+end
+
+# Link color for a channel-fill ratio (load ∈ [0, 1]). Ramps from muted green
+# (empty) through orange (half-full) to bright red (at capacity). The green
+# ceiling is lowered so idle channels don't glare.
+function link_load_color(load)
+    green_ceiling = 0xa0
+    r = load < 0.5 ? round(UInt8, 0xff * 2 * load) : 0xff
+    g = load < 0.5 ? green_ceiling : round(UInt8, green_ceiling * 2 * (1 - load))
+    return ig.IM_COL32(r, g, 0, 0xff)
+end
+
+function draw_routing_rules()
+    client = state[].client
+
+    topics = sort!(collect(keys(client.trainmatchers)))
+
+    routing_rules_pending = is_pending(client, client.routing_rules_set_request)
+    @Disabled routing_rules_pending begin
+        if ig.Button("Add rule")
+            default_topic = isempty(topics) ? "" : first(topics)
+            push!(client.routing_rules, RoutingRule(default_topic, "*", ""))
+            set_routing_rules(client, client.routing_rules)
+        end
+        ig.SameLine()
+        if ig.Button("Refresh trainmatchers")
+            get_trainmatchers(client)
+        end
+        if client.trainmatchers_request_status == RequestStatus_Waiting
+            ig.SameLine()
+            Spinner()
+        end
+        if routing_rules_pending
+            ig.SameLine()
+            Spinner()
+        end
+
+        if client.routing_rules_request_status == RequestStatus_Waiting
+            Spinner("Waiting for routing rules")
+        else
+            ig.BeginTable("##routing-rules", 4,
+                          ig.ImGuiTableFlags_Borders | ig.ImGuiTableFlags_RowBg |
+                          ig.ImGuiTableFlags_Resizable)
+            ig.TableSetupColumn("", ig.ImGuiTableColumnFlags_WidthFixed |
+                                     ig.ImGuiTableColumnFlags_NoResize)
+            ig.TableSetupColumn("Topic")
+            ig.TableSetupColumn("Source")
+            ig.TableSetupColumn("Input (trainmatcher device)")
+            ig.TableHeadersRow()
+
+            # Mutations are deferred to after the iteration loop so we don't
+            # shift indices out from under ourselves mid-row.
+            rules_changed = false
+            delete_idx = nothing
+            move_idx = nothing
+            for (i, rule) in enumerate(client.routing_rules)
+                ig.TableNextRow()
+
+                # Column 1: row controls (drag-to-reorder grip + delete button).
+                ig.TableNextColumn()
+                grip_icon = "\uf58d"
+                ig.PushStyleVar(ig.ImGuiStyleVar_SelectableTextAlign, ImVec2(0.5, 0.5))
+                ig.Selectable("$(grip_icon)##rule-grip-$i", false, 0,
+                              ImVec2(ig.CalcTextSize(grip_icon).x + 4, ig.GetFrameHeight()))
+                ig.PopStyleVar()
+                if ig.IsItemHovered()
+                    ig.SetTooltip("Drag to reorder")
+                end
+
+                if ig.BeginDragDropSource()
+                    payload = Ref{Cint}(i)
+                    ig.SetDragDropPayload("ROUTING_RULE_ROW", payload, sizeof(Cint))
+                    ig.Text(rule.topic * "  /  " * rule.source)
+                    ig.EndDragDropSource()
+                end
+                if ig.BeginDragDropTarget()
+                    accepted = ig.AcceptDragDropPayload("ROUTING_RULE_ROW")
+                    if accepted != C_NULL
+                        from = unsafe_load(Ptr{Cint}(unsafe_load(accepted).Data))
+                        if from != i
+                            move_idx = (Int(from), i)
+                        end
+                    end
+                    ig.EndDragDropTarget()
+                end
+
+                ig.SameLine()
+                if ig.Button("\uf2ed##rule-$i")
+                    delete_idx = i
+                end
+                if ig.IsItemHovered()
+                    ig.SetTooltip("Delete rule")
+                end
+
+                # Column 2: topic glob (free-form text).
+                ig.TableNextColumn()
+                ig.SetNextItemWidth(-1)
+                edited, new_topic = SafeInputText("##rule-topic-$i"; current_text=rule.topic)
+                if edited
+                    client.routing_rules[i] = RoutingRule(new_topic, rule.source, rule.input)
+                    rules_changed = true
+                end
+
+                # Column 3: source autocomplete, restricted to devices in the row's topic.
+                ig.TableNextColumn()
+                ig.SetNextItemWidth(-1)
+                src_state = get!(client.routing_rule_source_states, i, KaraboDepTextState())
+                src_props = if isnothing(src_state.device)
+                    DeviceProperties()
+                else
+                    get_source_properties(client, src_state.device)
+                end
+                filtered_sources = get(client.sources_by_topic, rule.topic, SourceInfo[])
+                edited, new_source = KaraboDepText("##rule-source-$i", rule.source, src_state,
+                                                   filtered_sources, src_props;
+                                                   allow_slow=false)
+                if edited
+                    client.routing_rules[i] = RoutingRule(rule.topic, new_source, rule.input)
+                    rules_changed = true
+                end
+
+                # Column 4: trainmatcher combo, populated with devices from the row's topic.
+                # A yellow warning icon appears when the selected device isn't whitelisted
+                # in the topic's webproxy.
+                ig.TableNextColumn()
+                tm_names = sort!(get(client.trainmatchers, rule.topic, String[]))
+                tm_warn = rule.input in tm_names &&
+                          !(KaraboDevice(rule.topic, rule.input) in client.whitelisted_trainmatchers)
+
+                # Reserve space at the right edge of the cell for the warning icon
+                # so the combo doesn't push it out of the column.
+                warning_icon = "\uf06a"
+                icon_w = ig.CalcTextSize(warning_icon).x
+                ig.SetNextItemWidth(-(icon_w + 8))
+                tm_idx = findfirst(==(rule.input), tm_names)
+                tm_sel = Ref(Cint(isnothing(tm_idx) ? -1 : tm_idx - 1))
+                if CopyableCombo("rule-input-$i", tm_names, tm_sel)
+                    new_input = tm_names[tm_sel[] + 1]
+                    client.routing_rules[i] = RoutingRule(rule.topic, rule.source, new_input)
+                    rules_changed = true
+                end
+
+                if tm_warn
+                    ig.SameLine()
+                    ig.TextColored(ImVec4(1.0, 0.7, 0.0, 1.0), warning_icon)
+                    if ig.IsItemHovered() && ig.BeginTooltip()
+                        ig.Text("""This trainmatcher is not in the webproxy whitelist. That means
+                                   that it cannot be used with XFA because it cannot be automatically
+                                   reconfigured.
+
+                                   To use $(rule.input), you have to add it to the
+                                   `devices` property of `karabo/WebProxy/device` in the $(rule.topic) topic.""")
+                        ig.EndTooltip()
+                    end
+                end
+            end
+
+            # Apply deferred reorder/delete now that the row loop is done.
+            if !isnothing(move_idx)
+                from, to = move_idx
+                rule = client.routing_rules[from]
+                deleteat!(client.routing_rules, from)
+                insert!(client.routing_rules, to, rule)
+                rules_changed = true
+            end
+
+            if !isnothing(delete_idx)
+                deleteat!(client.routing_rules, delete_idx)
+                rules_changed = true
+            end
+
+            if rules_changed
+                set_routing_rules(client, client.routing_rules)
+            end
+
+            ig.EndTable()
+        end
+    end
 end
 
 function draw_dag()
@@ -439,9 +730,18 @@ function draw_dag()
         ig.PopID()
     end
 
+    channel_stats = context.channel_stats
     for var_data in values(ctx_state)
-        for (link_id, start_id, end_id) in var_data["links"]
-            ImNodes.Link(link_id, start_id, end_id)
+        for link in var_data["links"]
+            stat = get(channel_stats, link.channel_key, nothing)
+            colored = !isnothing(stat) && stat.capacity > 0
+            if colored
+                ig.imnodes_PushColorStyle(ig.ImNodesCol_Link, link_load_color(stat.size / stat.capacity))
+            end
+            ImNodes.Link(link.id, link.start_id, link.end_id)
+            if colored
+                ig.imnodes_PopColorStyle()
+            end
         end
     end
 
@@ -636,11 +936,21 @@ function draw_plots()
             push!(new_tids, tid)
             store.type = type
             if x isa Number
-                push!(array, x, (; trainId=tid))
+                push!(array, x)
+                push!(store.scalar_tids, tid)
             elseif x isa AbstractArray
                 store.data = x
                 store.trainId = tid
             end
+        end
+
+        # Update contiguous caches for scalar data so plotting doesn't allocate
+        if !isnothing(store.scalar_tids)
+            n = length(store.data)
+            resize!(store.scalar_data_cache, n)
+            resize!(store.scalar_tids_cache, n)
+            copyto!(store.scalar_data_cache, store.data)
+            copyto!(store.scalar_tids_cache, store.scalar_tids)
         end
 
         updated_variables[name] = new_tids
@@ -652,8 +962,7 @@ function draw_plots()
             draw_plot(plot, client.variable_data, updated_variables)
         else
             store = get(client.variable_data, plot.name, nothing)
-            data = isnothing(store) ? nothing : store.data
-            draw_plot(plot, data, !isnothing(store) && haskey(updated_variables, plot.name))
+            draw_plot(plot, store, !isnothing(store) && haskey(updated_variables, plot.name))
         end
     end
 
@@ -797,6 +1106,14 @@ function draw_gui()
                 end
             end
 
+            ig.SameLine()
+
+            @Disabled client.status != RemoteStatus_Connected begin
+                if ig.Button("Restart")
+                    @guiasync restart_engine(state[])
+                end
+            end
+
             ig.Dummy(0, 20)
             if client.status == RemoteStatus_Disconnecting
                 Spinner("Disconnecting...")
@@ -862,55 +1179,7 @@ function draw_gui()
 
                 ig.Dummy(0, 10)
 
-                trainmatcher_request_pending = is_pending(client, client.trainmatcher_set_request)
-                @Disabled trainmatcher_request_pending begin
-                    if ig.Button("Update trainmatchers")
-                        get_trainmatchers(client)
-                    end
-                    if trainmatcher_request_pending
-                        ig.SameLine()
-                        Spinner()
-                    end
-
-                    # Show trainmatchers as a table
-                    if client.trainmatchers_request_status == RequestStatus_Waiting
-                        Spinner("Waiting for trainmatcher list")
-                    else
-                        ig.BeginTable("##trainmatchers", 2, ig.ImGuiTableFlags_Borders | ig.ImGuiTableFlags_RowBg)
-                        ig.TableSetupColumn("Topic")
-                        ig.TableSetupColumn("Default trainmatcher")
-                        ig.TableHeadersRow()
-
-                        for topic in sort(collect(keys(client.trainmatchers)))
-                            matchers = client.trainmatchers[topic]
-                            names = [m[1] for m in matchers]
-                            ig.TableNextRow()
-                            ig.TableNextColumn()
-                            ig.Text(topic)
-                            ig.TableNextColumn()
-
-                            if !isempty(matchers)
-                                if !haskey(client.trainmatcher_selected_idx, topic)
-                                    client.trainmatcher_selected_idx[topic] = Ref(Cint(0))
-                                end
-
-                                if CopyableCombo("matcher-$topic", names, client.trainmatcher_selected_idx[topic])
-                                    idx = client.trainmatcher_selected_idx[topic][] + 1
-                                    set_topic_trainmatcher(client, topic, names[idx])
-                                end
-
-                                # Warn if the selected trainmatcher is not configurable
-                                sel_idx = client.trainmatcher_selected_idx[topic][] + 1
-                                if 1 <= sel_idx <= length(matchers) && !matchers[sel_idx][2]
-                                    ig.SameLine()
-                                    ig.TextColored(ImVec4(1.0, 0.6, 0.0, 1.0), "(not in webproxy whitelist)")
-                                end
-                            end
-                        end
-
-                        ig.EndTable()
-                    end
-                end
+                draw_routing_rules()
 
                 ig.Dummy(0, 10)
 
@@ -1002,6 +1271,7 @@ function main(; test_engine=nothing)
     for (font, font_size) in fonts
         ig.AddFontFromFileTTF(font_atlas, font, font_size)
         ig.AddFontFromFileTTF(font_atlas, joinpath(font_dir, "fa-regular-400.otf"), 20, font_config)
+        ig.AddFontFromFileTTF(font_atlas, joinpath(font_dir, "fa-solid-900.otf"), 20, font_config)
     end
 
     # Setup ImPlot context
@@ -1075,5 +1345,5 @@ function main(; test_engine=nothing)
     return t, gui_state
 end
 
-precompile(main, ())
-precompile(draw_gui, ())
+# precompile(main, ())
+# precompile(draw_gui, ())

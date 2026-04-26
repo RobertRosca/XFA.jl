@@ -147,7 +147,7 @@ end
 
 # Return the string content inside a Karabo string macro literal, i.e. the
 # dependency string without the topic prefix.
-function karabo_dep_content(dep::KaraboDependency)
+function karabo_dep_content(dep::Dependency)
     if occursin(':', dep.source)
         "$(dep.source)[$(dep.property)]"
     else
@@ -155,31 +155,39 @@ function karabo_dep_content(dep::KaraboDependency)
     end
 end
 
-"""
-    replace_karabo_dep(source, variable_name, arg_name, new_dep) -> String
-
-Replace the karabo dependency for a specific argument within a `@Variable`
-definition in the source code. For shorthand variables (`@Variable foo ->
-karabo"..."`), the argument name is `"data"`. Returns the modified source, or
-the original source unchanged if the variable or argument was not found.
-"""
-function replace_karabo_dep(source::String, variable_name::String, arg_name::String, new_dep::KaraboDependency)
-    tree = parseall(SyntaxNode, source; ignore_errors=true)
-    var_node = find_variable_node(tree, variable_name)
-    if isnothing(var_node)
-        @warn "Could not find @Variable definition for '$(variable_name)'"
-        return source
+# Convert a Dependency to its source code representation.
+function dep_to_source(dep::Dependency)
+    if dep.kind == DepKind_Karabo
+        content = karabo_dep_content(dep)
+        if isnothing(dep.topic)
+            "karabo\"$(content)\""
+        else
+            "karabo\"$(dep.topic)//$(content)\""
+        end
+    else
+        dep.name
     end
+end
 
-    # Find -> nodes where the left side matches arg_name. For shorthand
-    # variables the arg name in the AST is the variable name itself.
+# Convert a Dependency to source code for use as a group constructor kwarg value.
+# Variable deps need to be wrapped in Dependency("...") since they can't
+# appear as bare identifiers inside a constructor kwarg.
+function parameter_dep_to_source(dep::Dependency)
+    if dep.kind == DepKind_Karabo
+        dep_to_source(dep)
+    else
+        "Dependency(\"$(dep.name)\")"
+    end
+end
+
+# Find the arrow node for a specific argument in a @Variable definition.
+function find_arg_arrow(var_node::SyntaxNode, variable_name::String, arg_name::String)
     arrow_nodes = find_nodes(var_node) do node
         kind(node) == K"->" || return false
         cs = children(node)
         isnothing(cs) && return false
 
         lhs = cs[1]
-        # The LHS can be a tuple node (shorthand) or a bare identifier
         if kind(lhs) == K"tuple"
             tuple_cs = children(lhs)
             !isnothing(tuple_cs) && !isempty(tuple_cs) &&
@@ -189,49 +197,138 @@ function replace_karabo_dep(source::String, variable_name::String, arg_name::Str
         end
     end
 
-    if isempty(arrow_nodes)
-        @warn "No argument '$(arg_name)' found in @Variable definition for '$(variable_name)'"
+    return isempty(arrow_nodes) ? nothing : arrow_nodes[1]
+end
+
+"""
+    replace_dep(source, variable_name, arg_name, new_dep) -> String
+
+Replace the dependency for a specific argument within a `@Variable` definition
+or a group constructor call in the source code. Works for both Karabo and
+variable dependencies by replacing the entire RHS of the arrow expression (for
+variables) or the kwarg value (for group kwargs). Returns the modified source,
+or the original source unchanged if the variable or argument was not found.
+"""
+function replace_dep(source::String, variable_name::String, arg_name::String, new_dep::Dependency)
+    tree = parseall(SyntaxNode, source; ignore_errors=true)
+
+    # Try @Variable definition first
+    var_node = find_variable_node(tree, variable_name)
+    if !isnothing(var_node)
+        arrow = find_arg_arrow(var_node, variable_name, arg_name)
+        if isnothing(arrow)
+            @warn "No argument '$(arg_name)' found in @Variable definition for '$(variable_name)'"
+            return source
+        end
+
+        rhs = children(arrow)[2]
+        br = byte_range(rhs)
+        return source[1:first(br)-1] * dep_to_source(new_dep) * source[last(br)+1:end]
+    end
+
+    # Fall back to group constructor kwarg
+    new_source = replace_constructor_kwarg(source, variable_name, arg_name,
+                                           parameter_dep_to_source(new_dep);
+                                           warn=false)
+    if new_source == source
+        @warn "Could not find @Variable definition or group assignment for '$(variable_name)'"
+    end
+    return new_source
+end
+
+# Find an assignment node `name = SomeConstructor(...)` in the AST.
+function find_assignment_call(tree::SyntaxNode, name::String)
+    assignments = find_nodes(tree) do node
+        kind(node) == K"=" || return false
+        cs = children(node)
+        (isnothing(cs) || length(cs) < 2) && return false
+
+        lhs = cs[1]
+        is_leaf(lhs) && lhs.val == Symbol(name) && kind(cs[2]) == K"call"
+    end
+
+    return isempty(assignments) ? nothing : assignments[1]
+end
+
+# Replace a keyword argument value in a constructor call assigned to `var_name`.
+# Handles patterns like: `my_group = Foo(; x=old_value)`
+# If the kwarg doesn't exist, it is appended. If there are no kwargs at all,
+# a new parameter section is inserted.
+function replace_constructor_kwarg(source::String, var_name::String,
+                                   kwarg_name::String, new_value::String;
+                                   warn::Bool=true)
+    tree = parseall(SyntaxNode, source; ignore_errors=true)
+    assign_node = find_assignment_call(tree, var_name)
+    if isnothing(assign_node)
+        if warn
+            @warn "Could not find constructor assignment for '$(var_name)'"
+        end
         return source
     end
 
-    # Find the karabo literal on the right side of the arrow
-    arrow = arrow_nodes[1]
-    rhs = children(arrow)[2]
-    karabo_nodes = find_nodes(rhs) do n
-        kind(n) == K"macrocall" && any(children(n)) do c
-            is_leaf(c) && kind(c) == K"StringMacroName" && c.val == Symbol("@karabo_str") # in XfaEngine.Context._KARABO_MACRO_NAMES
+    call_node = children(assign_node)[2]
+
+    # Find the parameters node (kwargs after ;)
+    params_node = nothing
+    for c in children(call_node)
+        if kind(c) == K"parameters"
+            params_node = c
+            break
         end
     end
 
-    if isempty(karabo_nodes)
-        @warn "No karabo dependency found for argument '$(arg_name)' in @Variable '$(variable_name)'"
-        return source
+    new_kwarg = "$(kwarg_name)=$(new_value)"
+
+    if isnothing(params_node)
+        # No kwargs at all — insert before the closing paren
+        call_end = last(byte_range(call_node))
+        return source[1:call_end-1] * "; $(new_kwarg)" * source[call_end:end]
     end
 
-    br = byte_range(karabo_nodes[1])
-    new_literal = if isnothing(new_dep.topic)
-        "karabo\"$(karabo_dep_content(new_dep))\""
-    else
-        "karabo\"$(new_dep.topic)//$(karabo_dep_content(new_dep))\""
+    # Find the kwarg matching kwarg_name
+    kwarg_node = nothing
+    for c in children(params_node)
+        if kind(c) == K"=" && !isempty(children(c)) &&
+           is_leaf(children(c)[1]) && children(c)[1].val == Symbol(kwarg_name)
+            kwarg_node = c
+            break
+        end
     end
-    return source[1:first(br)-1] * new_literal * source[last(br)+1:end]
+
+    if isnothing(kwarg_node)
+        # Kwarg not present — append it after the existing kwargs
+        br = byte_range(params_node)
+        return source[1:last(br)] * ", $(new_kwarg)" * source[last(br)+1:end]
+    end
+
+    # Replace the entire RHS of the kwarg with the new value
+    rhs = children(kwarg_node)[2]
+    br = byte_range(rhs)
+    return source[1:first(br)-1] * new_value * source[last(br)+1:end]
 end
 
-function rename_karabo_dep(state, variable_name::String, arg_name::String, new_dep::KaraboDependency)
+# Replace a dependency inside a group constructor's keyword argument.
+# Handles patterns like: `my_group = Foo(; x=karabo"A/B.prop")`
+function replace_group_dep(source::String, group_name::String,
+                           kwarg_name::String, new_dep::Dependency)
+    replace_constructor_kwarg(source, group_name, kwarg_name,
+                              parameter_dep_to_source(new_dep))
+end
+
+function set_group_param(state, var_name::String, kwarg_name::String, new_value::String)
     client = state.client
     source = client.context.source
 
     if isempty(source)
-        @error "No context source available for renaming"
+        @error "No context source available for editing"
         return
     end
 
-    new_source = replace_karabo_dep(source, variable_name, arg_name, new_dep)
+    new_source = replace_constructor_kwarg(source, var_name, kwarg_name, new_value)
     if new_source == source
         return
     end
 
-    # Write modified file back to server
     if client.embedded_engine
         write(client.context_path, new_source)
     else
@@ -240,6 +337,31 @@ function rename_karabo_dep(state, variable_name::String, arg_name::String, new_d
         end
     end
 
-    # Reload the context
+    load_context(state)
+end
+
+# Replace a dependency (Karabo or variable) in the source code and reload.
+function rename_dep(state, variable_name::String, arg_name::String, old_dep::Dependency, new_dep::Dependency)
+    client = state.client
+    source = client.context.source
+
+    if isempty(source)
+        @error "No context source available for editing"
+        return
+    end
+
+    new_source = replace_dep(source, variable_name, arg_name, new_dep)
+    if new_source == source
+        return
+    end
+
+    if client.embedded_engine
+        write(client.context_path, new_source)
+    else
+        open(client.context_path, client.sftp; write=true) do f
+            write(f, new_source)
+        end
+    end
+
     load_context(state)
 end

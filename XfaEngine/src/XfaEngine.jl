@@ -2,6 +2,10 @@ module XfaEngine
 
 include("karabo_bridge.jl")
 include("context.jl")
+
+import TOML
+import Glob
+include("settings.jl")
 include("protocol.jl")
 
 using .Context: KaraboDevice
@@ -62,12 +66,14 @@ end
     clients::Dict{String, ClientState} = Dict()
 
     webproxies::Dict{String, WebProxy} = Dict()
-    default_trainmatchers::Dict{String, String} = Dict()
+    routing_rules::Vector{RoutingRule} = RoutingRule[]
 
     remoterepl_server::TCPServer = TCPServer()
     remoterepl_task::Union{Task, Nothing} = nothing
 
     ctx::XfaContext = XfaContext()
+
+    channel_stats_task::Union{Task, Nothing} = nothing
 
     stop_event::Base.Event = Base.Event()
     stop_task::Union{Task, Nothing} = nothing
@@ -77,8 +83,64 @@ current_engine_state::Union{EngineState, Nothing} = nothing
 
 function forward_output(state::EngineState, stream_output)
     for data in stream_output
+        for (id, client) in state.clients
+            try
+                Protocol.server_send(client.websocket, TrainData([data]))
+            catch ex
+                @warn "Couldn't forward data to client '$(id)'" exception=ex
+            end
+        end
+    end
+end
+
+# Periodically broadcast a snapshot of every variable channel's drop count,
+# fill level, and capacity to all connected clients. Used by the GUI to color
+# pipeline edges by load.
+function broadcast_channel_stats(state::EngineState; period=1.0)
+    stats = Dict{Tuple{String, String}, Context.ChannelStat}()
+
+    while !state.stop_event.set
+        sleep(period)
+        # Re-read state.ctx each iteration — LoadContext swaps it for a fresh
+        # XfaContext, so capturing it outside the loop would leave us pinned
+        # to the never-running default context.
+        ctx = state.ctx
+        if !ctx.is_running[] || isempty(state.clients)
+            continue
+        end
+
+        empty!(stats)
+        try
+            # Karabo edges are served by a two-stage channel chain
+            # (input -> extractor -> consumer). Drops may land on either
+            # stage, so sum both into a single edge entry keyed by
+            # (dep_name, consumer); size reflects the downstream stage
+            # since that's what the consumer actually sees queued.
+            for (dep_name, downstream) in ctx.external_dependency_channels
+                input_name = ctx.dep_to_input[dep_name]
+                up = Context.channel_stat(ctx.input_variable_channels[input_name][dep_name])
+                for (consumer, channel) in downstream
+                    ds = Context.channel_stat(channel)
+                    stats[(dep_name, consumer)] = Context.ChannelStat(up.drops + ds.drops, ds.size, ds.capacity)
+                end
+            end
+            for (producer, downstream) in ctx.variable_channels
+                for (consumer, channel) in downstream
+                    stats[(producer, consumer)] = Context.channel_stat(channel)
+                end
+            end
+        catch ex
+            @warn "Failed to gather channel stats" exception=(ex, catch_backtrace())
+            continue
+        end
+
+        msg = Protocol.ChannelStats(stats)
         for client in values(state.clients)
-            Protocol.server_send(client.websocket, TrainData([data]))
+            try
+                Protocol.server_send(client.websocket, msg)
+            catch ex
+                @debug "Failed to send ChannelStats to client" exception=(ex, catch_backtrace())
+            end
         end
     end
 end
@@ -106,10 +168,26 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
         @info "Received shutdown request from client $(id)"
         shutdown(state)
         notify(state.stop_event)
-    elseif msg isa SetTopicTrainmatcher
-        state.default_trainmatchers[msg.topic] = msg.trainmatcher
-        @info "Set default trainmatcher for topic '$(msg.topic)' to: $(msg.trainmatcher)"
+    elseif msg isa GetRoutingRules
+        Protocol.server_send(ws, RoutingRules(state.routing_rules); reply_to)
+    elseif msg isa SetRoutingRules
+        state.routing_rules = msg.rules
+        write_routing_rules(msg.rules)
+        @info "Updated routing rules" n=length(msg.rules) path=engine_settings_path()
         Protocol.server_send(ws, Ack(); reply_to)
+
+        # Broadcast to all clients so concurrent editors stay in sync.
+        broadcast = RoutingRules(state.routing_rules)
+        for (other_id, other) in state.clients
+            if other_id == id
+                continue
+            end
+            try
+                Protocol.server_send(other.websocket, broadcast)
+            catch ex
+                @warn "Failed to broadcast routing rules to client '$(other_id)'" exception=ex
+            end
+        end
     elseif msg isa GetDevices
         try
             devices = if isnothing(msg.topic)
@@ -127,9 +205,21 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
         schema = get_schema(KaraboDevice(msg.topic, msg.name))
         Protocol.server_send(ws, DeviceSchema(msg.topic, msg.name, schema); reply_to)
         @info "Responded to 'GetDeviceSchema' from $(id)"
+    elseif msg isa GetDeviceProperty
+        try
+            wp = get_webproxy(KaraboDevice(msg.topic, msg.device))
+            value = get_property(wp, msg.device, msg.property)
+            Protocol.server_send(ws, DeviceProperty(msg.topic, msg.device, msg.property, value); reply_to)
+            @info "Responded to 'GetDeviceProperty' ($(msg.device).$(msg.property)) from $(id)"
+        catch ex
+            @error "Error in 'GetDeviceProperty', requested by $(id)" exception=(ex, catch_backtrace())
+            Protocol.server_send(ws, DeviceProperty(msg.topic, msg.device, msg.property, ex); reply_to)
+        end
+    elseif msg isa GetEngineDir
+        Protocol.server_send(ws, EngineDir(pkgdir(XfaEngine)); reply_to)
     elseif msg isa GetTrainmatchers
         trainmatchers = get_all_trainmatchers(state.webproxies)
-        Protocol.server_send(ws, AvailableTrainmatchers(trainmatchers, state.default_trainmatchers); reply_to)
+        Protocol.server_send(ws, AvailableTrainmatchers(trainmatchers); reply_to)
     elseif msg isa LoadContext
         path = abspath(expanduser(msg.path))
 
@@ -139,7 +229,7 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
         end
 
         new_ctx_or_ex = try
-            ctx = Context.load_from_file(path)
+            ctx = Context.load_from_file(path; routing_rules=state.routing_rules)
             ctx.forwarder = Base.Fix1(forward_output, state)
             ctx
         catch ex
@@ -165,7 +255,7 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
         Protocol.server_send(ws, Ack(); reply_to)
     elseif msg isa ChangeParameter
         param = msg.parameter
-        Context.change_parameter(param)
+        Context.change_parameter(state.ctx, param)
         @info "ChangeParameter of $(param.name) to $(param.value)"
         Protocol.server_send(ws, Ack(); reply_to)
     elseif msg isa Start
@@ -214,23 +304,9 @@ function handle_client(state::EngineState, id)
     client_state = state.clients[id]
     ws = client_state.websocket
 
-    # Start by sending their identifier and engine directory
+    # Start by sending their identifier
     WebSockets.send(ws, id)
-    WebSockets.send(ws, pkgdir(XfaEngine))
     @info "Connected to new client: $(id) 🙋"
-
-    # Send available trainmatchers with defaults
-    trainmatchers = if !isempty(state.webproxies)
-        try
-            get_all_trainmatchers(state.webproxies)
-        catch ex
-            @warn "Failed to query trainmatchers for client $(id)" exception=(ex, catch_backtrace())
-            Dict{String, Vector{String}}()
-        end
-    else
-        Dict{String, Vector{String}}()
-    end
-    Protocol.server_send(ws, AvailableTrainmatchers(trainmatchers, state.default_trainmatchers))
 
     # If a context is already loaded, send it to the new client
     if !isempty(state.ctx.path)
@@ -269,19 +345,28 @@ function main(stop_event=Base.Event(); info_path=nothing, wait=true)
         state.webproxies["localhost"] = WebProxy("localhost:8484")
     end
 
-    # Query trainmatchers and assign defaults
-    if !isempty(state.webproxies)
-        try
-            all_trainmatchers = get_all_trainmatchers(state.webproxies)
-            for (topic, matchers) in all_trainmatchers
-                if !isempty(matchers)
-                    state.default_trainmatchers[topic] = first(matchers)[1]
+    loaded = load_routing_rules()
+    if isnothing(loaded)
+        # First run: seed one {topic, "*", first_matcher} rule per discovered
+        # topic and persist, so subsequent runs read the file verbatim.
+        rules = RoutingRule[]
+        if !isempty(state.webproxies)
+            try
+                for (topic, matchers) in get_all_trainmatchers(state.webproxies)
+                    if !isempty(matchers)
+                        push!(rules, RoutingRule(topic, "*", first(matchers)[1]))
+                    end
                 end
+            catch ex
+                @warn "Failed to query trainmatchers while seeding routing rules" exception=(ex, catch_backtrace())
             end
-            @info "Initialized default trainmatchers" defaults=state.default_trainmatchers
-        catch ex
-            @warn "Failed to query trainmatchers on startup" exception=(ex, catch_backtrace())
         end
+        write_routing_rules(rules)
+        state.routing_rules = rules
+        @info "Seeded routing rules" n=length(rules) path=engine_settings_path()
+    else
+        state.routing_rules = loaded
+        @info "Loaded routing rules" n=length(loaded) path=engine_settings_path()
     end
 
     ws_server = WebSockets.listen!("0.0.0.0", state.websocket_port) do ws
@@ -329,6 +414,9 @@ function main(stop_event=Base.Event(); info_path=nothing, wait=true)
 
     @info "Wrote worker information to $(info_path)"
 
+    state.channel_stats_task = Threads.@spawn broadcast_channel_stats(state)
+    errormonitor(state.channel_stats_task)
+
     state.stop_task = Threads.@spawn try
         Base.wait(state.stop_event)
     catch ex
@@ -346,6 +434,7 @@ function main(stop_event=Base.Event(); info_path=nothing, wait=true)
 
     if wait
         Base.wait(state.stop_task)
+        Base.wait(state.channel_stats_task)
     end
 
     return state

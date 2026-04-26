@@ -60,6 +60,21 @@ end
 
 KaraboDepTextState() = KaraboDepTextState(-1, nothing, nothing)
 
+mutable struct DepTextState
+    is_karabo::Bool
+    karabo_state::KaraboDepTextState
+end
+
+DepTextState(is_karabo::Bool) = DepTextState(is_karabo, KaraboDepTextState())
+
+abstract type AbstractParameterState end
+
+mutable struct OptionalDimsState <: AbstractParameterState
+    all_dims::Bool
+    pending_text::String
+end
+OptionalDimsState(param::Parameter{OptionalDims}) = OptionalDimsState(isempty(param.value.dims), "")
+
 mutable struct KbdintPromptState
     msg::String
     display::Bool
@@ -133,22 +148,43 @@ end
     VariableType_Unknown
 end
 
-mutable struct VariableStore
-    const updates::Channel
-    data::Union{Vector, Matrix, DimVector, DimMatrix}
-    type::VariableType
+const SCALAR_BUFFER_CAPACITY = 10_000
+
+@kwdef mutable struct VariableStore
+    const updates::Channel = Channel(100)
+    data::Union{Vector, Matrix, DimVector, DimMatrix, CircularBuffer}
+    type::VariableType = VariableType_Unknown
 
     # This field is only used for non-scalar data. Scalar data is stored as a
-    # DimArray with a train ID.
-    trainId::Int
+    # CircularBuffer with a parallel CircularBuffer for train IDs.
+    trainId::Int = -1
+
+    # Train IDs for scalar data, parallel to `data` when it's a CircularBuffer
+    scalar_tids::Maybe{CircularBuffer{Int}} = nothing
+
+    # Contiguous caches for plotting scalar CircularBuffer data
+    const scalar_data_cache::Vector{Float64} = Float64[]
+    const scalar_tids_cache::Vector{Float64} = Float64[]
 
     # Timestamps of recent updates for computing average rate (updates/sec)
-    const update_timestamps::Vector{Float64}
-    update_rate::Float64
+    const update_timestamps::Vector{Float64} = Float64[]
+    update_rate::Float64 = 0.0
+
+    # Metadata from VariableData
+    title::String = ""
+    x_axis::Maybe{AbstractVector} = nothing
+    y_axis::Maybe{AbstractVector} = nothing
+    xlabel::String = ""
+    ylabel::String = ""
+    unit::Maybe{String} = nothing
+    fixed_aspect::Bool = false
 end
 
-function VariableStore(data)
-    VariableStore(Channel(100), data, VariableType_Unknown, -1, Float64[], 0.0)
+struct LinkInfo
+    id::Cint
+    start_id::Cint
+    end_id::Cint
+    channel_key::Tuple{String, String}
 end
 
 @kwdef mutable struct ContextState
@@ -157,6 +193,10 @@ end
     source::String = ""
     node_positions::Dict{String, Point2d} = Dict()
     pipeline_status::PipelineStatus = PipelineStatus_Stopped
+
+    # Latest per-channel (drops, size, capacity) snapshot from the engine,
+    # keyed by (producer, consumer). Updated roughly once per second.
+    channel_stats::Dict{Tuple{String, String}, XfaEngine.Context.ChannelStat} = Dict()
 
     lock::ReentrantLock = ReentrantLock()
 end
@@ -227,10 +267,14 @@ EngineLog(message::String, extra_details::Maybe{String}=nothing) = EngineLog(tim
     context::ContextState = ContextState()
 
     # Karabo status
-    trainmatchers::Dict{String, Vector{Tuple{String, Bool}}} = Dict()
+    trainmatchers::Dict{String, Vector{String}} = Dict()
+    whitelisted_trainmatchers::Set{KaraboDevice} = Set{KaraboDevice}()
     trainmatchers_request_status::RequestStatus = RequestStatus_Idle
-    trainmatcher_selected_idx::Dict{String, Ref{Cint}} = Dict{String, Ref{Cint}}()
-    trainmatcher_set_request::Maybe{Int} = nothing
+    routing_rules::Vector{RoutingRule} = RoutingRule[]
+    routing_rules_request_status::RequestStatus = RequestStatus_Idle
+    routing_rules_set_request::Maybe{Int} = nothing
+    # Per-row source-autocomplete state for the rules table, keyed by row index.
+    routing_rule_source_states::Dict{Int, KaraboDepTextState} = Dict{Int, KaraboDepTextState}()
     karabo_devices::Dict{String, Dict{String, Any}} = Dict()
     devices_request::Maybe{Int} = nothing
     # Pre-sorted for display: [(topic, [(device_name, sorted_info_pairs), ...]), ...]
@@ -239,9 +283,18 @@ EngineLog(message::String, extra_details::Maybe{String}=nothing) = EngineLog(tim
     # their pipeline outputs (e.g. "foo" and "foo:output"). The ambiguous flag
     # indicates that the source name appears in more than one topic.
     source_list::Vector{SourceInfo} = SourceInfo[]
+    # source_list grouped by topic. Rebuilt alongside source_list so the routing
+    # rules table can look up its per-topic source list without rescanning.
+    sources_by_topic::Dict{String, Vector{SourceInfo}} = Dict{String, Vector{SourceInfo}}()
 
-    # KaraboDepText widget state, keyed by dependency ID
+    # Parameter widget states, keyed by parameter name
+    parameter_states::Dict{String, AbstractParameterState} = Dict{String, AbstractParameterState}()
+    # KaraboDepText widget state, keyed by dependency ID (used for Parameter{KaraboDevice})
     karabo_dep_states::Dict{Int, KaraboDepTextState} = Dict{Int, KaraboDepTextState}()
+    # DepText widget state, keyed by dependency ID
+    dep_text_states::Dict{Int, DepTextState} = Dict{Int, DepTextState}()
+    # Variable names available for autocompletion (including subvariable outputs)
+    variable_names::Vector{String} = String[]
     source_properties::Dict{Tuple{String, String}, DeviceProperties} = Dict{Tuple{String, String}, DeviceProperties}()
     device_schema_requests::Dict{Tuple{String, String}, Int} = Dict{Tuple{String, String}, Int}()
 
@@ -257,6 +310,7 @@ EngineLog(message::String, extra_details::Maybe{String}=nothing) = EngineLog(tim
 
     # Message tracking
     pending_requests::Dict{Int, PendingRequest} = Dict()
+    engine_request_callbacks::Dict{Int, Function} = Dict()
 
     lock::ReentrantLock = ReentrantLock()
 end

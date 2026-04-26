@@ -11,10 +11,14 @@ using ReTest: @testset, @test, @test_throws, @test_logs
 using ZMQ: ZMQ
 using HTTP: HTTP, WebSockets
 using OrderedCollections: OrderedDict as OD
+using DataStructures: CircularBuffer, capacity
+using FHist: bincounts, binedges
 
-using XfaEngine: XfaEngine, Context, KaraboBridge, Protocol
-using XfaEngine.Context: @Variable, @karabo_str, VariableData, Dependency, KaraboDependency,
-    GroupDependency, SubvariableDependency, XfaContextException, Parameter, FunctionArgument, KaraboDevice
+using XfaEngine: XfaEngine, Context, KaraboBridge, Protocol, RoutingRule, match_rule
+using XfaEngine.Context: @Variable, @karabo_str, VariableData, Dependency, DependencyKind,
+    DepKind_Variable, DepKind_Subvariable, DepKind_Karabo, DepKind_Group, DepKind_GroupParameter,
+    karabo_dependency, subvariable_dependency, group_dependency, group_parameter_dependency,
+    XfaContextException, Parameter, FunctionArgument, KaraboDevice, CircularChannel, drop_count
 using XfaEngine.KaraboBridge: KaraboBridgeClient, KaraboBridgeServer, ThreadsafeSocket
 
 
@@ -91,6 +95,63 @@ function temp_engine(f::Function; log=Logging.global_logger())
     end
 end
 
+@testset "CircularChannel" begin
+    # Basic FIFO behaviour when within capacity
+    c = CircularChannel{Int}(3)
+    @test isopen(c) && !isready(c)
+    put!(c, 1)
+    put!(c, 2)
+    @test isready(c) && drop_count(c) == 0
+    @test take!(c) == 1 && take!(c) == 2
+    @test !isready(c)
+
+    # Overwrite-oldest when full: 5 puts into capacity 3 → drops=2, remaining 3,4,5
+    for i in 1:5
+        put!(c, i)
+    end
+    @test drop_count(c) == 2
+    @test [take!(c) for _ in 1:3] == [3, 4, 5]
+
+    # take! blocks until put! and is woken by notify.
+    c = CircularChannel{Int}(2)
+    t = Threads.@spawn take!(c)
+    @test timedwait(() -> istaskstarted(t), 10) == :ok
+    put!(c, 42)
+    @test fetch(t) == 42
+
+    # close() drains remaining items then errors; put! on closed also errors.
+    c = CircularChannel{Int}(2)
+    put!(c, 7)
+    close(c)
+    @test !isopen(c)
+    @test take!(c) == 7
+    @test_throws InvalidStateException take!(c)
+    @test_throws InvalidStateException put!(c, 1)
+
+    # close() wakes blocked waiters with InvalidStateException.
+    c = CircularChannel{Int}(1)
+    t = Threads.@spawn try
+        take!(c)
+    catch ex
+        ex
+    end
+    @test timedwait(() -> istaskstarted(t), 10) == :ok
+    close(c)
+    @test fetch(t) isa InvalidStateException
+
+    # Multiple consumers: each put! is delivered to exactly one take!.
+    # Capacity >= n ensures no drops, so every consumer receives an item.
+    n = 50
+    c = CircularChannel{Int}(n)
+    consumers = [Threads.@spawn(take!(c)) for _ in 1:n]
+    for i in 1:n
+        put!(c, i)
+    end
+    taken = sort(fetch.(consumers))
+    @test drop_count(c) == 0
+    @test taken == collect(1:n)
+end
+
 @testset "Engine" begin
     # Smoke test
     event = Base.Event()
@@ -112,13 +173,19 @@ end
     log = TestLogger()
     temp_engine(; log) do address, stop_event, info_path
         WebSockets.open(address) do ws
-            # Test that we get a valid ID and initial trainmatchers
+            # Test that we get a valid ID (the only thing sent
+            # unsolicited on connect)
             id = WebSockets.receive(ws)
             @test id isa String
             @test length(id) > 5
-            engine_dir = WebSockets.receive(ws)
-            @test engine_dir isa String
-            @test engine_dir == pkgdir(XfaEngine)
+
+            # Engine directory and trainmatchers are now only sent on request
+            Protocol.client_send(ws, Protocol.GetEngineDir())
+            engine_dir_msg = Protocol.receive(ws).msg
+            @test engine_dir_msg isa Protocol.EngineDir
+            @test engine_dir_msg.path == pkgdir(XfaEngine)
+
+            Protocol.client_send(ws, Protocol.GetTrainmatchers())
             @test Protocol.receive(ws).msg isa Protocol.AvailableTrainmatchers
 
             # Test Ping
@@ -175,16 +242,65 @@ end
     #         run(`$(executable) --project=$(environment) --startup-file=no --color=no $(launcher_script)`)
     #     end
     # end
+
+
+    @testset "Channel stats" begin
+        # End-to-end check that the engine periodically pushes a ChannelStats
+        # message summarising drops/size/capacity for each variable channel.
+        # A slow downstream variable guarantees drops accumulate.
+        log = TestLogger()
+        temp_engine(; log) do address, stop_event, info_path
+            WebSockets.open(address) do ws
+                WebSockets.receive(ws) # client id
+
+                # Load a slow-consumer pipeline
+                mktemp() do path, io
+                    write(path, """
+                    @Input function input(::Context.MockInput, output)
+                        for tid in 1:1000
+                            put!(output, (tid, Dict("motor" => Dict("pos" => tid))))
+                        end
+                    end
+                    x = Context.MockInput()
+
+                    @Variable function slow(data -> karabo"motor.pos")
+                        sleep(0.01)
+                        return data
+                    end
+                    """)
+                    Protocol.client_send(ws, Protocol.LoadContext(path))
+                    while !(Protocol.receive(ws).msg isa Protocol.ContextInfo) end
+                end
+
+                Protocol.client_send(ws, Protocol.Start())
+                while !(Protocol.receive(ws).msg isa Protocol.Ack) end
+
+                # Collect messages until we get a ChannelStats with a non-zero
+                # drop count on the (motor.pos, slow) channel, or time out.
+                key = ("motor.pos", "slow")
+                stats = nothing # Context.ChannelStat(0, 0, 0)
+                deadline = time() + 10.0
+                while isnothing(stats) || (time() < deadline && stats.drops == 0)
+                    msg = Protocol.receive(ws).msg
+                    if msg isa Protocol.ChannelStats && msg.stats[key].drops > 0
+                        stats = msg.stats[key]
+                    end
+                end
+
+                @test stats.drops > 0
+                @test stats.capacity == 100
+                @test 0 <= stats.size <= 100
+            end
+        end
+    end
 end
 
 @testset "Message tracking" begin
     log = TestLogger()
     temp_engine(; log) do address, stop_event, info_path
         WebSockets.open(address) do ws
-            # Consume the client ID, engine dir, and initial trainmatchers
+            # Consume the client ID
             WebSockets.receive(ws)
-            WebSockets.receive(ws)
-            Protocol.receive(ws)
 
             # Test that send always assigns an ID and the server
             # echoes it back as reply_to
@@ -198,8 +314,8 @@ end
 
             # Test that Ack messages carry reply_to for fire-and-forget
             # messages
-            id1 = Protocol.client_send(ws, Protocol.SetTopicTrainmatcher("localhost", "tm1"))
-            id2 = Protocol.client_send(ws, Protocol.SetTopicTrainmatcher("localhost", "tm2"))
+            id1 = Protocol.client_send(ws, Protocol.SetRoutingRules(RoutingRule[]))
+            id2 = Protocol.client_send(ws, Protocol.SetRoutingRules(RoutingRule[]))
             env1 = Protocol.receive(ws)
             env2 = Protocol.receive(ws)
             @test env1.msg isa Protocol.Ack
@@ -353,27 +469,27 @@ end
     @test length(Context.match_train(tm, VariableData(3, "foo.baz", 1))) == 1
 end
 
-@testset "KaraboDependency" begin
-    @test karabo"foo.bar" == KaraboDependency("foo", "bar")
-    @test karabo"foo.bar.baz" == KaraboDependency("foo", "bar.baz")
-    @test karabo"foo:output[bar]" == KaraboDependency("foo:output", "bar")
-    @test karabo"foo:channel_1.output[bar]" == KaraboDependency("foo:channel_1.output", "bar")
+@testset "karabo_dependency" begin
+    @test karabo"foo.bar" == karabo_dependency("foo", "bar")
+    @test karabo"foo.bar.baz" == karabo_dependency("foo", "bar.baz")
+    @test karabo"foo:output[bar]" == karabo_dependency("foo:output", "bar")
+    @test karabo"foo:channel_1.output[bar]" == karabo_dependency("foo:channel_1.output", "bar")
 
-    @test_throws ArgumentError KaraboDependency("foo")
-    @test_throws ArgumentError KaraboDependency("foo.bar[]")
-    @test_throws ArgumentError KaraboDependency("foo:[bar]")
+    @test_throws ArgumentError karabo_dependency("foo")
+    @test_throws ArgumentError karabo_dependency("foo.bar[]")
+    @test_throws ArgumentError karabo_dependency("foo:[bar]")
 
     # Topic macros
-    @test karabo"MID//foo.bar" == KaraboDependency("MID", "foo", "bar")
-    @test karabo"SA2//foo:output[bar]" == KaraboDependency("SA2", "foo:output", "bar")
+    @test karabo"MID//foo.bar" == karabo_dependency("MID", "foo", "bar")
+    @test karabo"SA2//foo:output[bar]" == karabo_dependency("SA2", "foo:output", "bar")
 
     # Parsing from string with topic
-    @test KaraboDependency("MID//foo.bar") == KaraboDependency("MID", "foo", "bar")
-    @test KaraboDependency("SA2//foo:output[bar]") == KaraboDependency("SA2", "foo:output", "bar")
+    @test karabo_dependency("MID//foo.bar") == karabo_dependency("MID", "foo", "bar")
+    @test karabo_dependency("SA2//foo:output[bar]") == karabo_dependency("SA2", "foo:output", "bar")
 
     # Round trip
-    @test KaraboDependency(string(karabo"MID//foo.bar")) == karabo"MID//foo.bar"
-    @test KaraboDependency(string(karabo"SA2//foo:output[bar]")) == karabo"SA2//foo:output[bar]"
+    @test karabo_dependency(string(karabo"MID//foo.bar")) == karabo"MID//foo.bar"
+    @test karabo_dependency(string(karabo"SA2//foo:output[bar]")) == karabo"SA2//foo:output[bar]"
 end
 
 # Helper module that defines variables for reference tests, defined in
@@ -388,6 +504,24 @@ end
         @add_subvariable("half", data / 2)
         return data
     end
+end
+
+# Test postprocessors, also in Main for load_from_string access.
+@eval Main module PostprocessorLibrary
+    using Statistics: mean
+    using XfaEngine: Context
+    using XfaEngine.Context: AbstractPostprocessor, Parameter
+
+    struct TestMean <: AbstractPostprocessor end
+    Context.default_name(::TestMean) = "mean"
+    (::TestMean)(data) = mean(data)
+
+    mutable struct TestWindow <: AbstractPostprocessor
+        size::Parameter{Int}
+    end
+    TestWindow(; size=10) = TestWindow(Parameter(size))
+    Context.default_name(::TestWindow) = "window"
+    (w::TestWindow)(data) = data[1:min(end, w.size[])]
 end
 
 @testset "@Variable" begin
@@ -431,14 +565,14 @@ end
 
     # And their dependencies should have been marked
     for name in expected_variables
-        @test ctx.dag[name] == OD("data" => KaraboDependency(name, "data"))
+        @test ctx.dag[name] == OD("data" => karabo_dependency(name, "data"))
     end
     @test Context.external_dependencies(ctx; per_variable=true) == Dict("foo" => [karabo"foo.data"],
                                                                         "bar" => [karabo"bar.data"],
                                                                         "baz" => [karabo"baz.data"])
 
     # Test variables depending on each other
-    ctx = Context.load_from_string(raw"""
+    ctx = Context.load_from_string("""
     @Variable foo -> karabo"foo.bar"
 
     @Variable function bar(data -> foo)
@@ -470,7 +604,7 @@ end
                                                              false)
 
     # Test creating a subvariable
-    ctx = Context.load_from_string(raw"""
+    ctx = Context.load_from_string("""
     @Variable function foo(data -> karabo"device.property")
         @add_subvariable("bar", mean(data))
 
@@ -483,10 +617,10 @@ end
     """)
     @test Set(keys(ctx.functions)) == Set(["foo", "quux"])
     @test ctx.subvariables["foo"] == ["foo.bar"]
-    @test ctx.dag["quux"] == OD("data" => SubvariableDependency("foo", "bar"))
+    @test ctx.dag["quux"] == OD("data" => subvariable_dependency("foo", "bar"))
 
     # Test loading from a file
-    ctx_code = raw"""
+    ctx_code = """
     @Variable foo -> karabo"foo.bar"
     """
     ctx_from_str = Context.load_from_string(ctx_code)
@@ -556,6 +690,71 @@ end
     end
 end
 
+@testset "@postprocess" begin
+    # Execution with mixed @add_subvariable and @postprocess
+    ctx = Context.load_from_string("""
+    using Main.PostprocessorLibrary: TestMean, TestWindow
+
+    @Input function input(::Context.MockInput, output)
+        put!(output, (0, Dict("foo" => Dict("bar" => [1, 2, 3]))))
+    end
+    x = Context.MockInput()
+
+    @Variable function foo(data -> karabo"foo.bar")
+        @postprocess(TestWindow(; size=2))
+        @postprocess("avg", TestMean())
+        return data
+    end
+    """)
+    @test Set(ctx.subvariables["foo"]) == Set(["foo.avg", "foo.window"])
+    @test ctx.parameters["foo.window.size"][] == 2
+    @test issetequal(["foo.avg", "foo.window"], keys(ctx.postprocessors))
+    @test ctx.variable_postprocessors["foo"] == ["foo.window", "foo.avg"]
+
+    Context.run(ctx) do
+        @test timedwait(() -> !isopen(ctx.stream_output), 5) == :ok
+    end
+    result = take!(ctx.stream_output)
+    @test result.subvariables["foo.window"] == VariableData(0, "foo.window", [1, 2])
+    @test result.subvariables["foo.avg"] == VariableData(0, "foo.avg", 2.0)
+
+    # Changing a postprocessor parameter should update its value, invoke the
+    # update handler with the postprocessor object, and affect subsequent runs.
+    ctx = Context.load_from_string("""
+    using Main.PostprocessorLibrary: TestWindow
+
+    next_input = Base.Event()
+    param_value = -1
+
+    @Input function input(::Context.MockInput, output)
+        put!(output, (0, Dict("foo" => Dict("bar" => 1:10))))
+        wait(next_input)
+        put!(output, (1, Dict("foo" => Dict("bar" => 1:10))))
+    end
+    i = Context.MockInput()
+
+    @Variable function foo(data -> karabo"foo.bar")
+        @postprocess(TestWindow(Parameter(; name="", value=3, update_handler=(_, value) -> global param_value = value)))
+        return data
+    end
+    """)
+    @test ctx.parameters["foo.window.size"][] == 3
+
+    Context.run(ctx) do
+        r1 = take!(ctx.stream_output)
+        @test r1.subvariables["foo.window"].data == 1:3
+
+        Context.change_parameter(ctx, Parameter("foo.window.size", 5))
+        mod = Context.worker_state.current_ctx_module
+        @test ctx.parameters["foo.window.size"][] == 5
+        @test mod.param_value == 5
+
+        notify(mod.next_input)
+        r2 = take!(ctx.stream_output)
+        @test r2.subvariables["foo.window"].data == 1:5
+    end
+end
+
 @testset "Parameter" begin
     # Smoke tests for constructors
     @test Parameter(0) isa Parameter
@@ -618,7 +817,7 @@ end
     x = Context.MockInput()
     """)
     @test isempty(ctx.dag)
-    @test ctx.inputs["x.bridge"] == Dict("_" => GroupDependency("x", Context.MockInput))
+    @test ctx.inputs["x.bridge"] == Dict("_" => group_dependency("x", Context.MockInput))
 
     # And a input function that's part of a group
     ctx = Context.load_from_string(raw"""
@@ -643,6 +842,7 @@ end
 @testset "@Group" begin
     @test_throws ArgumentError Context._group(@__MODULE__, "foo", false)
     @test_throws ArgumentError Context._group(@__MODULE__, :(1 + 1), false)
+    @test_throws ArgumentError Context._group(@__MODULE__, :(@kwdef struct Foo end), false)
 
     ctx = Context.load_from_string(raw"""
     @Group struct Foo end
@@ -663,18 +863,38 @@ end
     # Test instantiating a group
     ctx = Context.load_from_string(raw"""
     @Group struct Foo
-        bar::Parameter{Int}
+        bar::Parameter{Int} = Parameter(42)
     end
 
     @Variable function foo(data::Foo)
         data.bar
     end
 
-    foo_group = Foo(Parameter(42))
+    foo_group = Foo()
     """)
     group_type = only(filter(x -> nameof(x) == :Foo, keys(ctx.group_types)))
-    @test ctx.dag == Dict("foo_group.foo" => OD("data" => Context.GroupDependency("foo_group", group_type)))
+    @test ctx.dag == Dict("foo_group.foo" => OD("data" => group_dependency("foo_group", group_type)))
     @test ctx.parameters == Dict("foo_group.bar" => Parameter("foo_group.bar", 42))
+
+    # Test that @kwdef groups accept raw values for Parameter fields,
+    # and that handlers from the default are preserved.
+    ctx = Context.load_from_string(raw"""
+    handler_called = Ref(false)
+    @Group mutable struct Bar
+        x::Parameter{Int} = Parameter(0) do _; handler_called[] = true end
+        y::Parameter{Int}
+        z::Int = 5
+    end
+
+    bar = Bar(; y=10)
+    """)
+    bar = ctx.groups["bar"]
+    @test bar.x[] == 0 && bar.y[] == 10 && bar.z == 5
+    @test !isnothing(bar.x.update_handler)
+    @invokelatest bar.x.update_handler(99)
+    @test invokelatest() do
+        Context.worker_state.current_ctx_module.handler_called[]
+    end
 
     # Test that the struct can be used as a dependency
     ctx = Context.load_from_string(raw"""
@@ -686,7 +906,7 @@ end
         data.value
     end
 
-    foo_group = Foo(2π)
+    foo_group = Foo(; value=2π)
 
     @Variable function bar(data -> foo_group.foo)
         data
@@ -694,14 +914,44 @@ end
     """)
     @test ctx.dag["bar"] == OD("data" => Context.Dependency("foo_group.foo"))
 
+    # Test that group variable dependencies must reference group parameters
+    @test_throws ArgumentError Context._variable(@__MODULE__, :(function bar(::Foo, data -> karabo"motor1.pos") data end), false)
+    @test_throws ArgumentError Context._variable(@__MODULE__, :(function bar(::Foo, data -> some_var) data end), false)
+
+    # Test group parameter dependency resolution
+    ctx = Context.load_from_string(raw"""
+    @Group mutable struct Foo
+        source::Parameter{Dependency}
+    end
+
+    @Variable function foo(group::Foo, data -> Foo.source)
+        data
+    end
+
+    foo_group = Foo(; source=karabo"motor1.pos")
+    """)
+    @test ctx.dag["foo_group.foo"] == OD("group" => group_dependency("foo_group", only(filter(x -> nameof(x) == :Foo, keys(ctx.group_types)))),
+                                         "data" => karabo"motor1.pos")
+
+    # Test that referencing a non-existent parameter throws
+    @test_throws XfaContextException Context.load_from_string(raw"""
+    @Group mutable struct Foo end
+
+    @Variable function foo(group::Foo, data -> Foo.nonexistent)
+        data
+    end
+
+    foo_group = Foo()
+    """)
+
     # Test instantiating groups from other modules
     helper_file_path = joinpath(@__DIR__, "dummy_variables.jl")
     ctx = Context.load_from_string("""
     Base.include(@__MODULE__, "$(helper_file_path)")
 
-    bridge = KaraboBridge("foo", 1, String[])
+    bridge = KaraboBridge(; trainmatcher=KaraboDevice("MATCHER"))
 
-    foo = DummyVariables.Foo(Parameter(1))
+    foo = DummyVariables.Foo(; bar=1)
     """)
     @test haskey(ctx.inputs, "bridge.stream")
     @test ctx.functions["bridge.stream"] === Context.stream
@@ -722,12 +972,99 @@ end
         @test Context.topological_sort(dag) == ["camera"]
 
         # Subvariables should be ignored too
-        dag = Dict("camera" => [], "foo" => [SubvariableDependency("camera", "bar")])
+        dag = Dict("camera" => [], "foo" => [subvariable_dependency("camera", "bar")])
         @test Context.topological_sort(dag) == ["camera", "foo"]
 
         # Test that sorting actually works
         dag = Dict("camera" => [karabo"foo.bar"], "foo" => ["camera"], "bar" => ["foo"])
         @test Context.topological_sort(dag) == ["camera", "foo", "bar"]
+    end
+
+    @testset "Routing" begin
+        @testset "match_rule" begin
+            # Empty rules always miss; literal and glob patterns both work;
+            # first match wins when multiple rules could apply.
+            @test isnothing(match_rule(RoutingRule[], "T", "foo"))
+
+            rules = [RoutingRule("T1", "exact", "DEV_A"),
+                     RoutingRule("T1", "foo.*", "DEV_B"),
+                     RoutingRule("*", "*", "DEV_FALLBACK")]
+            @test match_rule(rules, "T1", "exact") == "DEV_A"
+            @test match_rule(rules, "T1", "foo.bar") == "DEV_B"
+            @test match_rule(rules, "T2", "anything") == "DEV_FALLBACK"
+
+            # More-specific rule only wins if it's ordered first
+            reversed = [RoutingRule("*", "*", "DEV_FALLBACK"),
+                        RoutingRule("T1", "exact", "DEV_A")]
+            @test match_rule(reversed, "T1", "exact") == "DEV_FALLBACK"
+
+            # Character-class and ?-wildcard globs
+            class_rules = [RoutingRule("*", "cam[0-9]", "DEV_CAM"),
+                           RoutingRule("*", "mot?r", "DEV_MOTOR")]
+            @test match_rule(class_rules, "T", "cam3") == "DEV_CAM"
+            @test match_rule(class_rules, "T", "motor") == "DEV_MOTOR"
+            @test isnothing(match_rule(class_rules, "T", "camera"))
+        end
+
+        @testset "build_dep_routing with rules" begin
+            # Two bridges, different trainmatcher devices. Rules are matched
+            # against the karabo dependency's source/device name (e.g. for
+            # karabo"foo.bar" the source is "foo", not "foo.bar").
+            ctx_src = """
+            bridge_a = KaraboBridge(; trainmatcher=KaraboDevice("T1//DEV_A"))
+            bridge_a._mock_sources = String[]
+
+            bridge_b = KaraboBridge(; trainmatcher=KaraboDevice("T2//DEV_B"))
+            bridge_b._mock_sources = String[]
+
+            @Variable foo -> karabo"foo.bar"
+            @Variable special -> karabo"T1//special.src"
+            """
+
+            # No rules: topic-match routes the prefixed dep; unprefixed dep has no
+            # topic/source match and two inputs exist, so it errors.
+            @test_throws XfaContextException Context.load_from_string(ctx_src)
+
+            # Rule forces source "foo" to bridge_b (device name DEV_B) regardless
+            # of topic. The topicked dep falls through to the topic-match heuristic.
+            rules = [RoutingRule("*", "foo", "DEV_B")]
+            ctx = Context.load_from_string(ctx_src; routing_rules=rules)
+            @test ctx.dep_to_input["foo.bar"] == "bridge_b.stream"
+            @test ctx.dep_to_input["T1//special.src"] == "bridge_a.stream"
+
+            # Rule pointing at a device that isn't among the inputs falls through
+            # to the existing heuristics (the trailing rule keeps foo routable).
+            rules = [RoutingRule("*", "special", "NONEXISTENT_DEV"),
+                     RoutingRule("*", "*", "DEV_A")]
+            ctx = Context.load_from_string(ctx_src; routing_rules=rules)
+            @test ctx.dep_to_input["T1//special.src"] == "bridge_a.stream"
+
+            # First-match-wins: a specific rule overrides the catch-all below it.
+            rules = [RoutingRule("*", "foo", "DEV_A"),
+                     RoutingRule("*", "*", "DEV_B")]
+            ctx = Context.load_from_string(ctx_src; routing_rules=rules)
+            @test ctx.dep_to_input["foo.bar"] == "bridge_a.stream"
+            @test ctx.dep_to_input["T1//special.src"] == "bridge_b.stream"
+
+            # Topic-qualified input ("T//DEV") disambiguates when multiple
+            # topics have devices with the same name.
+            same_name_src = raw"""
+            bridge_a = KaraboBridge(; trainmatcher=KaraboDevice("T1//DEV"))
+            bridge_a._mock_sources = String[]
+
+            bridge_b = KaraboBridge(; trainmatcher=KaraboDevice("T2//DEV"))
+            bridge_b._mock_sources = String[]
+
+            @Variable foo -> karabo"foo.bar"
+            """
+            rules = [RoutingRule("*", "foo", "T2//DEV")]
+            ctx = Context.load_from_string(same_name_src; routing_rules=rules)
+            @test ctx.dep_to_input["foo.bar"] == "bridge_b.stream"
+
+            rules = [RoutingRule("*", "foo", "T1//DEV")]
+            ctx = Context.load_from_string(same_name_src; routing_rules=rules)
+            @test ctx.dep_to_input["foo.bar"] == "bridge_a.stream"
+        end
     end
 
     @testset "Execution" begin
@@ -907,15 +1244,17 @@ end
 
         @Group struct Foo
             x::Parameter{Int}
+            source::Parameter{Dependency}
         end
 
-        @Variable function bar(group::Foo, data -> karabo"motor1.pos")
+        @Variable function bar(group::Foo, data -> Foo.source)
             return group.x[] + data
         end
 
-        foo = Foo(Parameter(1))
+        foo = Foo(; x=1, source=karabo"motor1.pos")
         """)
-        @test only(keys(ctx.parameters)) == "foo.x"
+        @test "foo.x" ∈ keys(ctx.parameters)
+        @test "foo.source" ∈ keys(ctx.parameters)
         Context.run(ctx) do
             @test timedwait(() -> !isopen(ctx.stream_output), 5) == :ok
         end
@@ -947,8 +1286,38 @@ end
             push!(results, take!(ctx.stream_output))
         end
         @test length(results) == 2
-        @test results[1] == VariableData(0, "foo", 10, Dict{String, Any}("foo.half" => 5.0))
+        @test results[1] == VariableData(0, "foo", 10, Dict{String, Any}("foo.half" => VariableData(0, "foo.half", 5.0)))
         @test results[2] == VariableData(0, "bar", 6.0)
+
+        # Test that returning a VariableData from a variable function overwrites
+        # tid, name, and subvariables but preserves metadata fields.
+        ctx = Context.load_from_string(raw"""
+        @Input function input(::Context.MockInput, output)
+            put!(output, (5, Dict("motor1" => Dict("pos" => 10))))
+        end
+        x = Context.MockInput()
+
+        @Variable function foo(data -> karabo"motor1.pos")
+            @add_subvariable("half", data / 2)
+            return VariableData(; data=data * 2, xlabel="my x", ylabel="my y",
+                                x_axis=[1.0, 2.0, 3.0], y_axis=[1, 2, 3],
+                                title="Foo", unit="j")
+        end
+        """)
+        Context.run(ctx) do
+            @test timedwait(() -> !isopen(ctx.stream_output), 5) == :ok
+        end
+        result = take!(ctx.stream_output)
+        @test result.tid == 5
+        @test result.name == "foo"
+        @test result.data == 20
+        @test result.subvariables == Dict{String, Any}("foo.half" => VariableData(5, "foo.half", 5.0))
+        @test result.xlabel == "my x"
+        @test result.ylabel == "my y"
+        @test result.x_axis == [1.0, 2.0, 3.0]
+        @test result.y_axis == [1, 2, 3]
+        @test result.title == "Foo"
+        @test result.unit == "j"
 
         # Test input groups
         ctx = Context.load_from_string(raw"""
@@ -961,7 +1330,7 @@ end
             put!(output, (0, Dict("foo" => Dict("x" => foo.x))))
         end
 
-        foo = Foo(42)
+        foo = Foo(; x=42)
 
         @Variable bar -> karabo"foo.x"
         """)
@@ -1012,23 +1381,249 @@ end
         """)
         Context.run(ctx) do
             @test take!(ctx.stream_output).data == 0
-            Context.change_parameter(Parameter("x", 1))
+            Context.change_parameter(ctx, Parameter("x", 1))
             notify(Context.worker_state.current_ctx_module.next_input)
             @test take!(ctx.stream_output).data == 1
             @test Context.worker_state.current_ctx_module.x_side_effect == 1
         end
+
+        # Test that group parameter update handlers receive the group object
+        ctx = Context.load_from_string(raw"""
+        @Input function input(::Context.MockInput, output)
+            put!(output, (42, Dict("motor1" => Dict("pos" => 1))))
+        end
+        i = Context.MockInput()
+
+        @Group mutable struct MyGroup
+            handler_received_value::Int = 0
+            x::Parameter{Int} = Parameter(10) do group, value
+                group.handler_received_value = value * 2
+            end
+        end
+
+        g = MyGroup()
+
+        @Variable function foo(_ -> karabo"motor1.pos")
+            return g.x[]
+        end
+        """)
+        Context.run(ctx) do
+            @test take!(ctx.stream_output) == VariableData(42, "foo", 10)
+            Context.change_parameter(ctx, Parameter("g.x", 5))
+            @test ctx.groups["g"].handler_received_value == 10
+            @test ctx.groups["g"].x[] == 5
+        end
+    end
+
+    @testset "Multiple inputs" begin
+        # Two inputs with different topics, deps routed by topic
+        ctx = Context.load_from_string(raw"""
+        @Group struct TopicA end
+        Context.update_sources(::TopicA, _) = nothing
+        Context.input_topic(::TopicA) = "SA2"
+
+        @Group struct TopicB end
+        Context.update_sources(::TopicB, _) = nothing
+        Context.input_topic(::TopicB) = "MID"
+
+        @Input function sa2_input(::TopicA, output)
+            put!(output, (0, Dict("SA2_DEVICE" => Dict("val" => 10))))
+        end
+
+        @Input function mid_input(::TopicB, output)
+            put!(output, (0, Dict("MID_DEVICE" => Dict("val" => 20))))
+        end
+
+        a = TopicA()
+        b = TopicB()
+
+        @Variable sa2_data -> karabo"SA2//SA2_DEVICE.val"
+        @Variable mid_data -> karabo"MID//MID_DEVICE.val"
+        """)
+        @test ctx.dep_to_input["SA2//SA2_DEVICE.val"] == "a.sa2_input"
+        @test ctx.dep_to_input["MID//MID_DEVICE.val"] == "b.mid_input"
+
+        Context.run(ctx) do
+            @test timedwait(() -> !isopen(ctx.stream_output), 5) == :ok
+        end
+        results = Dict{String, Any}()
+        while isready(ctx.stream_output)
+            r = take!(ctx.stream_output)
+            results[r.name] = r.data
+        end
+        @test results["sa2_data"] == 10
+        @test results["mid_data"] == 20
+
+        # Two inputs with topics, dep without a topic should error
+        @test_throws XfaContextException Context.load_from_string(raw"""
+        @Group struct TopicA2 end
+        Context.update_sources(::TopicA2, _) = nothing
+        Context.input_topic(::TopicA2) = "SA2"
+
+        @Group struct TopicB2 end
+        Context.update_sources(::TopicB2, _) = nothing
+        Context.input_topic(::TopicB2) = "MID"
+
+        @Input function sa2_input(::TopicA2, output) end
+        @Input function mid_input(::TopicB2, output) end
+
+        a = TopicA2()
+        b = TopicB2()
+
+        @Variable foo -> karabo"unknown_device.val"
+        """)
+
+        # Test that single-input contexts still work without topics
+        ctx = Context.load_from_string(raw"""
+        @Input function input(::Context.MockInput, output)
+            put!(output, (0, Dict("motor" => Dict("pos" => 42))))
+        end
+        x = Context.MockInput()
+
+        @Variable motor_pos -> karabo"motor.pos"
+        """)
+        @test only(values(ctx.dep_to_input)) == "x.input"
+        Context.run(ctx) do
+            @test timedwait(() -> !isopen(ctx.stream_output), 5) == :ok
+        end
+        @test take!(ctx.stream_output) == VariableData(0, "motor_pos", 42)
     end
 end
 
+@testset "Pipeline drops" begin
+    # With a slow downstream variable, a fast producer should not block: items
+    # are dropped in the variable channel rather than stalling upstream. Produce
+    # many more trains than the channel capacity (100) and check that the slow
+    # consumer processed fewer than were produced while the pipeline still ran
+    # to completion.
+    ctx = Context.load_from_string("""
+    n_trains::Int = 500
+    processed::Int = 0
+
+    @Input function input(::Context.MockInput, output)
+        for tid in 1:n_trains
+            put!(output, (tid, Dict("motor" => Dict("pos" => tid))))
+        end
+    end
+    x = Context.MockInput()
+
+    @Variable function slow(data -> karabo"motor.pos")
+        sleep(0.005)
+        global processed += 1
+        return data
+    end
+    """)
+    Context.run(ctx) do
+        @test timedwait(() -> !isopen(ctx.stream_output), 10) == :ok
+    end
+
+    mod = Context.worker_state.current_ctx_module
+    n_processed = mod.processed[]
+    @test 0 < n_processed < mod.n_trains
+
+    # We should have stored the last 100 elements
+    outputs = [x.data for x in ctx.stream_output]
+    @test outputs == 401:500
+end
+
 @testset "Context builtins" begin
+    @testset "Mean" begin
+        # Reducing over all dims
+        m = Context.Mean()
+        @test m([1.0, 2.0, 3.0, NaN]) == 2.0
+        @test isempty(m.buffer)
+
+        # Reducing over specific dims with dropdims, with a NaN mixed in
+        m = Context.Mean(; dims=(2,))
+        A = [1.0 2.0 3.0; 4.0 NaN 6.0]
+        @test m(A) == [2.0, 5.0]
+        @test !isempty(m.buffer)
+        buf = m.buffer
+
+        # Calling again with matching type/dims reuses the buffer
+        @test m(A .+ 1) == [3.0, 6.0]
+        @test m.buffer === buf
+
+        # Changing dims forces reallocation
+        m.dims[] = Context.OptionalDims([1])
+        @test m(A) == [2.5, 2.0, 4.5]
+        @test m.buffer !== buf
+    end
+
+    @testset "Correlation" begin
+        corr = Context.Correlation(; x=karabo"foo.bar", y=karabo"foo.baz")
+
+        # compute_edges: empty buffer → degenerate [0,0] padded to [-1,1];
+        # positive data → [0, max]; explicit `pulses` picks a subset.
+        @test Context.compute_edges([], [], 10) == -1:0.2:1
+
+        cb1 = CircularBuffer{Float64}([1.0, 2.0])
+        cb2 = CircularBuffer{Float64}([50.0, 100.0])
+        @test Context.compute_edges([cb1], [], 10) == 1:0.1:2
+        @test Context.compute_edges([cb1, cb2], [2], 4) == 50:12.5:100
+        @test Context.compute_edges([cb1, cb2], [], 4) == 1:24.75:100
+
+        # Parameter update handlers should trigger rebuilding
+        for handler in (corr.buffer_size.update_handler, corr.nbins.update_handler, corr.pulses.update_handler)
+            corr.rebuild_histogram = false
+            handler(corr, nothing)
+            @test corr.rebuild_histogram
+        end
+
+        # update_buffer_size resizes existing buffers and invalidates
+        push!(corr.x_buffers, CircularBuffer{Float64}(10))
+        push!(corr.y_buffers, CircularBuffer{Float64}(10))
+        corr.rebuild_histogram = false
+        Context.update_buffer_size(corr, 500)
+        @test capacity(corr.x_buffers[1]) == 500
+        @test capacity(corr.y_buffers[1]) == 500
+        @test corr.rebuild_histogram
+
+        # Scalar inputs allocate a single per-pulse buffer at buffer_size
+        corr = Context.Correlation(; x=karabo"foo.bar", y=karabo"foo.baz")
+        corr.nbins[] = 10
+        corr.buffer_size[] = 50
+        Context.correlate(corr, 1.0, 2.0)
+        @test length(corr.x_buffers) == 1
+        @test capacity(corr.x_buffers[1]) == 50
+        @test binedges(corr.histogram)[1] == -1:0.2:1
+
+        # Vector inputs create one buffer per pulse; shrinking pops the extras
+        corr = Context.Correlation(; x=karabo"foo.bar", y=karabo"foo.baz")
+        Context.correlate(corr, [1.0, 2.0], [10.0, 20.0])
+        @test length(corr.x_buffers) == 2
+        Context.correlate(corr, [3.0], [30.0])
+        @test length(corr.x_buffers) == 1
+
+        # Changing nbins rebuilds the histogram with the new bin count
+        corr = Context.Correlation(; x=karabo"foo.bar", y=karabo"foo.baz")
+        corr.nbins[] = 10
+        Context.correlate(corr, 1.0, 2.0)
+        @test length(binedges(corr.histogram)[1]) == 11
+        corr.nbins[] = 20
+        corr.rebuild_histogram = true
+        Context.correlate(corr, 2.0, 3.0)
+        @test length(binedges(corr.histogram)[1]) == 21
+
+        # `pulses` restricts which pulses contribute to edges and counts
+        corr = Context.Correlation(; x=karabo"foo.bar", y=karabo"foo.baz")
+        corr.pulses[] = [1]
+        Context.correlate(corr, [1.0, 999.0], [2.0, 999.0])
+        @test last(binedges(corr.histogram)[1]) ≤ 1.0
+        @test sum(bincounts(corr.histogram)) == 1
+    end
+
     @testset "KaraboBridge" begin
         port = getavailableport(42000)
-        bridge_server = KaraboBridgeServer("tcp://localhost:$(port)")
+        address = "tcp://localhost:$(port)"
+        bridge_server = KaraboBridgeServer(address)
         KaraboBridge.startbridge(bridge_server)
 
         ctx = Context.load_from_string("""
-        bridge = KaraboBridge("localhost", $(port), ["foo.x"])
+        bridge = KaraboBridge(; trainmatcher=KaraboDevice("MATCHER"), sources=["foo.x"])
+        bridge._mock_sources = String[]
         bridge.manual_configuration[] = true
+        bridge.address[] = "$(address)"
 
         @Variable foo -> karabo"foo.x"
         """)
@@ -1071,19 +1666,23 @@ end
 
 @testset "Serialization" begin
     ctx = Context.load_from_string(raw"""
-    bridge = KaraboBridge("", 45000)
+        using Main.PostprocessorLibrary: TestWindow
 
-    period = Parameter(2π)
+        bridge = KaraboBridge(; trainmatcher=KaraboDevice(""))
+        bridge._mock_sources = String[]
 
-    @Variable xgm -> karabo"xgm.intensity"
+        period = Parameter(2π)
 
-    @Variable function foo() 42 end
+        @Variable xgm -> karabo"xgm.intensity"
 
-    @Variable function bar(data -> xgm)
-        @add_subvariable("max_data", max(data))
-        mean(data)
-    end
-    """)
+        @Variable function foo() 42 end
+
+        @Variable function bar(data -> xgm)
+            @add_subvariable("max_data", max(data))
+            @postprocess(TestWindow(; size=5))
+            mean(data)
+        end
+        """)
 
     @test Context.to_dict(ctx) == Dict("inputs" => Dict("bridge.stream" => ["bridge"]),
                                        "groups" => ["bridge"],
@@ -1092,17 +1691,19 @@ end
                                                               "bar" => OD("data" => Dependency("xgm"))),
                                        "subvariables" => Dict("xgm" => [],
                                                               "foo" => [],
-                                                              "bar" => ["bar.max_data"]),
+                                                              "bar" => ["bar.max_data", "bar.window"]),
+                                       "postprocessors" => Dict("bar" => ["bar.window"]),
                                        "origins" => Dict("xgm" => "xgm",
                                                          "foo" => "foo",
                                                          "bar" => "bar",
                                                          "bridge" => "XfaEngine.Context.KaraboBridge",
                                                          "bridge.stream" => "XfaEngine.Context.stream"),
                                        "parameters" => Dict("period" => Parameter("period", 2π),
-                                                            "bridge.hostname" => Parameter("bridge.hostname", ""),
-                                                            "bridge.port" => Parameter("bridge.port", 45000),
+                                                            "bar.window.size" => Parameter("bar.window.size", 5),
+                                                            "bridge.address" => Parameter("bridge.address", ""),
                                                             "bridge.trainmatcher" => Parameter("bridge.trainmatcher", KaraboDevice("", "")),
                                                             "bridge.manual_configuration" => Parameter("bridge.manual_configuration", false)),
+                                       "dep_to_input" => Dict("xgm.intensity" => "bridge.stream"),
                                        "path" => "")
 end
 

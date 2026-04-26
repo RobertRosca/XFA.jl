@@ -1,5 +1,7 @@
 module XFA
 
+using XfaEngine: XfaEngine
+
 const Maybe{T} = Union{T, Nothing}
 
 struct Point2d
