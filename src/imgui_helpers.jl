@@ -568,7 +568,8 @@ strip_topic(s) = (m = match(r"^\w+//(.+)$", s); isnothing(m) ? s : m.captures[1]
 # Compute completions for a KaraboDependency text input. Returns
 # (items, formatter, query) where items is the list to complete from, formatter
 # maps an item to the string to insert, and query is the fuzzy match input.
-function dep_completions(input, cursor, source_list, device_props::DeviceProperties)
+function dep_completions(input, cursor, source_list, device_props::DeviceProperties;
+                         allow_slow::Bool=true)
     sep = find_separator(input)
     cursor_after_sep = !isnothing(sep) && cursor >= 0 && cursor > sep - 1
 
@@ -590,6 +591,9 @@ function dep_completions(input, cursor, source_list, device_props::DevicePropert
         end
         return (sources, formatter, query)
     elseif input[sep] == '.'
+        if !allow_slow
+            return (String[], identity, "")
+        end
         dev = @view input[1:sep-1]
         query = @view input[sep+1:end]
         return (device_props.slow.names, prop -> "$(dev).$(prop)", query)
@@ -634,7 +638,8 @@ next frame.
 """
 function KaraboDepText(label, text, dep_state::KaraboDepTextState,
                        source_list, device_props::DeviceProperties;
-                       device_only::Bool=false, focus::Bool=false)
+                       device_only::Bool=false, allow_slow::Bool=true,
+                       focus::Bool=false)
     id = ig.GetID(label)
 
     cb = @cfunction(dep_text_callback, Cint, (Ptr{ig.ImGuiInputTextCallbackData},))
@@ -648,7 +653,8 @@ function KaraboDepText(label, text, dep_state::KaraboDepTextState,
             live_text[] = input
             cursor = device_only ? -1 : dep_state.cursor_pos
             items, formatter, query = dep_completions(input, cursor,
-                                                      source_list, device_props)
+                                                      source_list, device_props;
+                                                      allow_slow)
             is_source_list = items isa Vector{SourceInfo}
             renderer = is_source_list ? source_completion_renderer : property_completion_renderer
             mode = is_source_list ? "devices" : "properties"
