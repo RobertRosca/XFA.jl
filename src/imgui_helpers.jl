@@ -196,6 +196,15 @@ positions.
 function fuzzy_match(query::AbstractString, text::AbstractString)
     q = lowercase(query)
     t = lowercase(text)
+
+    # Substring match: rank these above any fuzzy result, by match position
+    # first and then text length. The 1_000_000 floor leaves plenty of room
+    # below the position penalty without colliding with fuzzy scores.
+    substr = findfirst(q, t)
+    if !isnothing(substr)
+        return true, 1_000_000 - 100 * first(substr) - length(t)
+    end
+
     qi = 1
     score = 0
     prev_match_pos = 0
@@ -233,6 +242,10 @@ function fuzzy_match(query::AbstractString, completions::AbstractVector, complet
         end
     end
 
+    # The partial-top-N strategy above leaves the buffer min-at-front (or in
+    # insertion order if it never filled). Sort descending so callers can iterate
+    # best-first.
+    sort!(scored; by=first, rev=true)
     return scored
 end
 
