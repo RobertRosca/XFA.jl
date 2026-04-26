@@ -15,9 +15,9 @@ include("plotting.jl")
 
 using LibSSH: LibSSH as ssh
 using HTTP: HTTP, WebSockets
-using XfaEngine: EngineState, getavailableport
+using XfaEngine: EngineState, getavailableport, RoutingRule
 using Dates: Dates, unix2datetime, @dateformat_str
-using XfaEngine.Context: Parameter, OptionalDims
+using XfaEngine.Context: Parameter, OptionalDims, KaraboDevice
 include("states.jl")
 
 using Printf: @sprintf
@@ -116,6 +116,11 @@ end
 function draw_parameter_widget(name, param::Parameter{Vector{String}})
     ig.Text("Vector{String}")
 
+    return false, nothing
+end
+
+function draw_parameter_widget(name, param::Parameter{Vector{Int}})
+    ig.Text("Vector{Int}")
     return false, nothing
 end
 
@@ -477,6 +482,174 @@ function link_load_color(load)
     r = load < 0.5 ? round(UInt8, 0xff * 2 * load) : 0xff
     g = load < 0.5 ? green_ceiling : round(UInt8, green_ceiling * 2 * (1 - load))
     return ig.IM_COL32(r, g, 0, 0xff)
+end
+
+function draw_routing_rules()
+    client = state[].client
+
+    topics = sort!(collect(keys(client.trainmatchers)))
+
+    routing_rules_pending = is_pending(client, client.routing_rules_set_request)
+    @Disabled routing_rules_pending begin
+        if ig.Button("Add rule")
+            default_topic = isempty(topics) ? "" : first(topics)
+            push!(client.routing_rules, RoutingRule(default_topic, "*", ""))
+            set_routing_rules(client, client.routing_rules)
+        end
+        ig.SameLine()
+        if ig.Button("Refresh trainmatchers")
+            get_trainmatchers(client)
+        end
+        if client.trainmatchers_request_status == RequestStatus_Waiting
+            ig.SameLine()
+            Spinner()
+        end
+        if routing_rules_pending
+            ig.SameLine()
+            Spinner()
+        end
+
+        if client.routing_rules_request_status == RequestStatus_Waiting
+            Spinner("Waiting for routing rules")
+        else
+            ig.BeginTable("##routing-rules", 4,
+                          ig.ImGuiTableFlags_Borders | ig.ImGuiTableFlags_RowBg |
+                          ig.ImGuiTableFlags_Resizable)
+            ig.TableSetupColumn("", ig.ImGuiTableColumnFlags_WidthFixed |
+                                     ig.ImGuiTableColumnFlags_NoResize)
+            ig.TableSetupColumn("Topic")
+            ig.TableSetupColumn("Source")
+            ig.TableSetupColumn("Input (trainmatcher device)")
+            ig.TableHeadersRow()
+
+            # Mutations are deferred to after the iteration loop so we don't
+            # shift indices out from under ourselves mid-row.
+            rules_changed = false
+            delete_idx = nothing
+            move_idx = nothing
+            for (i, rule) in enumerate(client.routing_rules)
+                ig.TableNextRow()
+
+                # Column 1: row controls (drag-to-reorder grip + delete button).
+                ig.TableNextColumn()
+                grip_icon = "\uf58d"
+                ig.PushStyleVar(ig.ImGuiStyleVar_SelectableTextAlign, ImVec2(0.5, 0.5))
+                ig.Selectable("$(grip_icon)##rule-grip-$i", false, 0,
+                              ImVec2(ig.CalcTextSize(grip_icon).x + 4, ig.GetFrameHeight()))
+                ig.PopStyleVar()
+                if ig.IsItemHovered()
+                    ig.SetTooltip("Drag to reorder")
+                end
+
+                if ig.BeginDragDropSource()
+                    payload = Ref{Cint}(i)
+                    ig.SetDragDropPayload("ROUTING_RULE_ROW", payload, sizeof(Cint))
+                    ig.Text(rule.topic * "  /  " * rule.source)
+                    ig.EndDragDropSource()
+                end
+                if ig.BeginDragDropTarget()
+                    accepted = ig.AcceptDragDropPayload("ROUTING_RULE_ROW")
+                    if accepted != C_NULL
+                        from = unsafe_load(Ptr{Cint}(unsafe_load(accepted).Data))
+                        if from != i
+                            move_idx = (Int(from), i)
+                        end
+                    end
+                    ig.EndDragDropTarget()
+                end
+
+                ig.SameLine()
+                if ig.Button("\uf2ed##rule-$i")
+                    delete_idx = i
+                end
+                if ig.IsItemHovered()
+                    ig.SetTooltip("Delete rule")
+                end
+
+                # Column 2: topic glob (free-form text).
+                ig.TableNextColumn()
+                ig.SetNextItemWidth(-1)
+                edited, new_topic = SafeInputText("##rule-topic-$i"; current_text=rule.topic)
+                if edited
+                    client.routing_rules[i] = RoutingRule(new_topic, rule.source, rule.input)
+                    rules_changed = true
+                end
+
+                # Column 3: source autocomplete, restricted to devices in the row's topic.
+                ig.TableNextColumn()
+                ig.SetNextItemWidth(-1)
+                src_state = get!(client.routing_rule_source_states, i, KaraboDepTextState())
+                src_props = if isnothing(src_state.device)
+                    DeviceProperties()
+                else
+                    get_source_properties(client, src_state.device)
+                end
+                filtered_sources = get(client.sources_by_topic, rule.topic, SourceInfo[])
+                edited, new_source = KaraboDepText("##rule-source-$i", rule.source, src_state,
+                                                   filtered_sources, src_props;
+                                                   allow_slow=false)
+                if edited
+                    client.routing_rules[i] = RoutingRule(rule.topic, new_source, rule.input)
+                    rules_changed = true
+                end
+
+                # Column 4: trainmatcher combo, populated with devices from the row's topic.
+                # A yellow warning icon appears when the selected device isn't whitelisted
+                # in the topic's webproxy.
+                ig.TableNextColumn()
+                tm_names = sort!(get(client.trainmatchers, rule.topic, String[]))
+                tm_warn = rule.input in tm_names &&
+                          !(KaraboDevice(rule.topic, rule.input) in client.whitelisted_trainmatchers)
+
+                # Reserve space at the right edge of the cell for the warning icon
+                # so the combo doesn't push it out of the column.
+                warning_icon = "\uf06a"
+                icon_w = ig.CalcTextSize(warning_icon).x
+                ig.SetNextItemWidth(-(icon_w + 8))
+                tm_idx = findfirst(==(rule.input), tm_names)
+                tm_sel = Ref(Cint(isnothing(tm_idx) ? -1 : tm_idx - 1))
+                if CopyableCombo("rule-input-$i", tm_names, tm_sel)
+                    new_input = tm_names[tm_sel[] + 1]
+                    client.routing_rules[i] = RoutingRule(rule.topic, rule.source, new_input)
+                    rules_changed = true
+                end
+
+                if tm_warn
+                    ig.SameLine()
+                    ig.TextColored(ImVec4(1.0, 0.7, 0.0, 1.0), warning_icon)
+                    if ig.IsItemHovered() && ig.BeginTooltip()
+                        ig.Text("""This trainmatcher is not in the webproxy whitelist. That means
+                                   that it cannot be used with XFA because it cannot be automatically
+                                   reconfigured.
+
+                                   To use $(rule.input), you have to add it to the
+                                   `devices` property of `karabo/WebProxy/device` in the $(rule.topic) topic.""")
+                        ig.EndTooltip()
+                    end
+                end
+            end
+
+            # Apply deferred reorder/delete now that the row loop is done.
+            if !isnothing(move_idx)
+                from, to = move_idx
+                rule = client.routing_rules[from]
+                deleteat!(client.routing_rules, from)
+                insert!(client.routing_rules, to, rule)
+                rules_changed = true
+            end
+
+            if !isnothing(delete_idx)
+                deleteat!(client.routing_rules, delete_idx)
+                rules_changed = true
+            end
+
+            if rules_changed
+                set_routing_rules(client, client.routing_rules)
+            end
+
+            ig.EndTable()
+        end
+    end
 end
 
 function draw_dag()
@@ -1006,55 +1179,7 @@ function draw_gui()
 
                 ig.Dummy(0, 10)
 
-                trainmatcher_request_pending = is_pending(client, client.trainmatcher_set_request)
-                @Disabled trainmatcher_request_pending begin
-                    if ig.Button("Update trainmatchers")
-                        get_trainmatchers(client)
-                    end
-                    if trainmatcher_request_pending
-                        ig.SameLine()
-                        Spinner()
-                    end
-
-                    # Show trainmatchers as a table
-                    if client.trainmatchers_request_status == RequestStatus_Waiting
-                        Spinner("Waiting for trainmatcher list")
-                    else
-                        ig.BeginTable("##trainmatchers", 2, ig.ImGuiTableFlags_Borders | ig.ImGuiTableFlags_RowBg)
-                        ig.TableSetupColumn("Topic")
-                        ig.TableSetupColumn("Default trainmatcher")
-                        ig.TableHeadersRow()
-
-                        for topic in sort(collect(keys(client.trainmatchers)))
-                            matchers = client.trainmatchers[topic]
-                            names = [m[1] for m in matchers]
-                            ig.TableNextRow()
-                            ig.TableNextColumn()
-                            ig.Text(topic)
-                            ig.TableNextColumn()
-
-                            if !isempty(matchers)
-                                if !haskey(client.trainmatcher_selected_idx, topic)
-                                    client.trainmatcher_selected_idx[topic] = Ref(Cint(0))
-                                end
-
-                                if CopyableCombo("matcher-$topic", names, client.trainmatcher_selected_idx[topic])
-                                    idx = client.trainmatcher_selected_idx[topic][] + 1
-                                    set_topic_trainmatcher(client, topic, names[idx])
-                                end
-
-                                # Warn if the selected trainmatcher is not configurable
-                                sel_idx = client.trainmatcher_selected_idx[topic][] + 1
-                                if 1 <= sel_idx <= length(matchers) && !matchers[sel_idx][2]
-                                    ig.SameLine()
-                                    ig.TextColored(ImVec4(1.0, 0.6, 0.0, 1.0), "(not in webproxy whitelist)")
-                                end
-                            end
-                        end
-
-                        ig.EndTable()
-                    end
-                end
+                draw_routing_rules()
 
                 ig.Dummy(0, 10)
 
@@ -1146,6 +1271,7 @@ function main(; test_engine=nothing)
     for (font, font_size) in fonts
         ig.AddFontFromFileTTF(font_atlas, font, font_size)
         ig.AddFontFromFileTTF(font_atlas, joinpath(font_dir, "fa-regular-400.otf"), 20, font_config)
+        ig.AddFontFromFileTTF(font_atlas, joinpath(font_dir, "fa-solid-900.otf"), 20, font_config)
     end
 
     # Setup ImPlot context

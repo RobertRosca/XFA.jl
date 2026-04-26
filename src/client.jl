@@ -306,6 +306,7 @@ function disconnect_engine(state, shutdown_engine)
     # Note that we use setfield!() here to bypass the locking, which would
     # otherwise cause locking mismatches.
     setfield!(state, :client, ClientState(load_settings()))
+end
 
 # Restart the engine by shutting it down, waiting for it to die, and then
 # re-initializing it. The SSH session is kept alive.
@@ -734,22 +735,37 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
             client.source_list = [SourceInfo((topic, name, name in ambiguous))
                                   for (topic, devices) in client.device_tree
                                   for (name, _) in devices]
+            sources_by_topic = Dict{String, Vector{SourceInfo}}()
+            for s in client.source_list
+                if !haskey(sources_by_topic, s.topic)
+                    sources_by_topic[s.topic] = SourceInfo[]
+                end
+                push!(sources_by_topic[s.topic], s)
+            end
+            client.sources_by_topic = sources_by_topic
             client.webproxy_status = RequestStatus_Idle
         end
     elseif msg isa EngineDir
         client.remote_engine_dir = msg.path
     elseif msg isa AvailableTrainmatchers
-        client.trainmatchers = msg.topic_trainmatchers
-        client.trainmatchers_request_status = RequestStatus_Idle
-
-        # Apply defaults to combo selection indices
-        for (topic, default_tm) in msg.defaults
-            matchers = client.trainmatchers[topic]
-            idx = findfirst(m -> m[1] == default_tm, matchers)
-            if !isnothing(idx)
-                client.trainmatcher_selected_idx[topic] = Ref(Cint(idx - 1))
+        trainmatchers = Dict{String, Vector{String}}()
+        whitelisted = Set{KaraboDevice}()
+        for (topic, ms) in msg.topic_trainmatchers
+            names = String[]
+            for (name, in_whitelist) in ms
+                push!(names, name)
+                if in_whitelist
+                    push!(whitelisted, KaraboDevice(topic, name))
+                end
             end
+            trainmatchers[topic] = names
         end
+        client.trainmatchers = trainmatchers
+        client.whitelisted_trainmatchers = whitelisted
+        client.trainmatchers_request_status = RequestStatus_Idle
+    elseif msg isa RoutingRules
+        client.routing_rules = msg.rules
+        client.routing_rules_request_status = RequestStatus_Idle
     elseif msg isa DeviceSchema
         client.source_properties[(msg.topic, msg.name)] = schema_property_names(msg.schema)
         delete!(client.device_schema_requests, (msg.topic, msg.name))
@@ -838,6 +854,8 @@ function handle_server(state)
                 client.status = RemoteStatus_Connected
                 send(client, GetEngineDir())
                 get_devices(client)
+                get_trainmatchers(client)
+                get_routing_rules(client)
 
                 for msg_bytes in ws
                     buffer = IOBuffer(msg_bytes)
@@ -914,6 +932,11 @@ function get_trainmatchers(client)
     client.trainmatchers_request_status = RequestStatus_Waiting
 end
 
+function get_routing_rules(client)
+    send(client, GetRoutingRules())
+    client.routing_rules_request_status = RequestStatus_Waiting
+end
+
 function load_context(state)
     client = state.client
     send(client, LoadContext(client.context_path))
@@ -946,8 +969,8 @@ function stop(state)
     state.client.context.pipeline_status = PipelineStatus_Stopping
 end
 
-function set_topic_trainmatcher(client, topic, trainmatcher)
-    client.trainmatcher_set_request = send(client, SetTopicTrainmatcher(topic, trainmatcher))
+function set_routing_rules(client, rules::AbstractVector{RoutingRule})
+    client.routing_rules_set_request = send(client, SetRoutingRules(collect(rules)))
 end
 
 function set_debug_mode(state)

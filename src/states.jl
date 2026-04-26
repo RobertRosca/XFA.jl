@@ -263,10 +263,14 @@ EngineLog(message::String, extra_details::Maybe{String}=nothing) = EngineLog(tim
     context::ContextState = ContextState()
 
     # Karabo status
-    trainmatchers::Dict{String, Vector{Tuple{String, Bool}}} = Dict()
+    trainmatchers::Dict{String, Vector{String}} = Dict()
+    whitelisted_trainmatchers::Set{KaraboDevice} = Set{KaraboDevice}()
     trainmatchers_request_status::RequestStatus = RequestStatus_Idle
-    trainmatcher_selected_idx::Dict{String, Ref{Cint}} = Dict{String, Ref{Cint}}()
-    trainmatcher_set_request::Maybe{Int} = nothing
+    routing_rules::Vector{RoutingRule} = RoutingRule[]
+    routing_rules_request_status::RequestStatus = RequestStatus_Idle
+    routing_rules_set_request::Maybe{Int} = nothing
+    # Per-row source-autocomplete state for the rules table, keyed by row index.
+    routing_rule_source_states::Dict{Int, KaraboDepTextState} = Dict{Int, KaraboDepTextState}()
     karabo_devices::Dict{String, Dict{String, Any}} = Dict()
     devices_request::Maybe{Int} = nothing
     # Pre-sorted for display: [(topic, [(device_name, sorted_info_pairs), ...]), ...]
@@ -275,6 +279,9 @@ EngineLog(message::String, extra_details::Maybe{String}=nothing) = EngineLog(tim
     # their pipeline outputs (e.g. "foo" and "foo:output"). The ambiguous flag
     # indicates that the source name appears in more than one topic.
     source_list::Vector{SourceInfo} = SourceInfo[]
+    # source_list grouped by topic. Rebuilt alongside source_list so the routing
+    # rules table can look up its per-topic source list without rescanning.
+    sources_by_topic::Dict{String, Vector{SourceInfo}} = Dict{String, Vector{SourceInfo}}()
 
     # Parameter widget states, keyed by parameter name
     parameter_states::Dict{String, AbstractParameterState} = Dict{String, AbstractParameterState}()

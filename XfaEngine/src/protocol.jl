@@ -1,10 +1,11 @@
 module Protocol
 
 export AbstractMessage, Ping, Shutdown,
-    GetDevices, GetTrainmatchers, SetTopicTrainmatcher, LoadContext, ReviseCode,
+    GetDevices, GetTrainmatchers, LoadContext, ReviseCode,
     GetDeviceSchema, DeviceSchema,
     GetDeviceProperty, DeviceProperty,
     GetEngineDir, EngineDir,
+    GetRoutingRules, SetRoutingRules, RoutingRules,
     ChangeParameter, Start, Stop,
     SetDebugMode, SetRemoteRepl,
     Pong, AvailableTrainmatchers,
@@ -17,7 +18,8 @@ import Serialization: serialize, deserialize
 import HTTP: WebSockets
 
 import ..Context
-import ..Context: XfaContext, VariableData, Parameter
+using ..Context: XfaContext, VariableData, Parameter
+using ..XfaEngine: RoutingRule
 
 
 abstract type AbstractMessage end
@@ -52,9 +54,10 @@ struct ChangeParameter <: AbstractMessage
     parameter::Parameter
 end
 
-struct SetTopicTrainmatcher <: AbstractMessage
-    topic::String
-    trainmatcher::String
+struct GetRoutingRules <: AbstractMessage end
+
+struct SetRoutingRules <: AbstractMessage
+    rules::Vector{RoutingRule}
 end
 
 struct Start <: AbstractMessage end
@@ -77,7 +80,10 @@ struct Pong <: AbstractMessage end
 
 struct AvailableTrainmatchers <: AbstractMessage
     topic_trainmatchers::Dict{String, Vector{Tuple{String, Bool}}}
-    defaults::Dict{String, String}
+end
+
+struct RoutingRules <: AbstractMessage
+    rules::Vector{RoutingRule}
 end
 
 struct EngineDir <: AbstractMessage

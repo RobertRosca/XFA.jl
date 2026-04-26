@@ -48,6 +48,10 @@ variable_postprocessors(_) = VariablePostprocessor[]
 # Returns the topic served by an input group, or nothing for generic inputs
 input_topic(::Any) = nothing
 
+# Returns the identifying device for an input group (used to match routing
+# rules against the input), or nothing if the input isn't device-backed.
+input_device(::Any) = nothing
+
 # Returns the sources available from an input group
 get_sources(::Any) = String[]
 # For variable references (@Variable name -> MyLib.func), returns the
@@ -170,10 +174,12 @@ end
 
 # Build a mapping from external dependency name -> input name.
 # Routing priority:
-# 1. Topic match: dep has a topic, input group's input_topic() matches
-# 2. Source match: dep's source is in the input group's get_sources() result
-# 3. Single input fallback: only one input exists
-function build_dep_routing(ctx::XfaContext)
+# 1. Routing rule: match (topic, source) against engine-level rules; the
+#    resolved trainmatcher device name is looked up against the inputs.
+# 2. Topic match: dep has a topic, input group's input_topic() matches
+# 3. Source match: dep's source is in the input group's get_sources() result
+# 4. Single input fallback: only one input exists
+function build_dep_routing(ctx::XfaContext, routing_rules=nothing)
     dep_to_input = Dict{String, String}()
     deps = external_dependencies(ctx)
 
@@ -181,16 +187,24 @@ function build_dep_routing(ctx::XfaContext)
         return dep_to_input
     end
 
-    # Build topic -> input name map and sources -> input name map
+    # Build topic -> input, sources -> input, and trainmatcher-device -> input maps
     topic_map = Dict{String, String}()
     source_map = Dict{String, String}()
+    device_map = Dict{KaraboDevice, String}()
     for (input_name, _) in ctx.inputs
         group = get_input_group(ctx, input_name)
-        isnothing(group) && continue
+        if isnothing(group)
+            continue
+        end
 
         topic = input_topic(group)
         if !isnothing(topic)
             topic_map[topic] = input_name
+        end
+
+        device = input_device(group)
+        if !isnothing(device)
+            device_map[device] = input_name
         end
 
         for source in get_sources(group)
@@ -198,22 +212,45 @@ function build_dep_routing(ctx::XfaContext)
         end
     end
 
+    rules = isnothing(routing_rules) ? [] : routing_rules
+
     for dep in deps
         dep_name = string(dep)
 
-        # 1. Topic match
+        # 1. Routing rule. The rule's `input` is parsed as a KaraboDevice —
+        # topic-qualified ("T//DEV") matches exactly, bare ("DEV") matches by
+        # name only (first-hit wins if multiple topics share a device name).
+        if !isempty(rules)
+            dep_topic = isnothing(dep.topic) ? "" : dep.topic
+            matched = XfaEngine.match_rule(rules, dep_topic, dep.source)
+            if !isnothing(matched)
+                target = KaraboDevice(matched)
+                input_name = if !isempty(target.topic)
+                    get(device_map, target, nothing)
+                else
+                    name_hits = [v for (dev, v) in device_map if dev.name == target.name]
+                    isempty(name_hits) ? nothing : first(name_hits)
+                end
+                if !isnothing(input_name)
+                    dep_to_input[dep_name] = input_name
+                    continue
+                end
+            end
+        end
+
+        # 2. Topic match
         if !isnothing(dep.topic) && haskey(topic_map, dep.topic)
             dep_to_input[dep_name] = topic_map[dep.topic]
             continue
         end
 
-        # 2. Source match
+        # 3. Source match
         if haskey(source_map, dep.source)
             dep_to_input[dep_name] = source_map[dep.source]
             continue
         end
 
-        # 3. Single input fallback
+        # 4. Single input fallback
         if length(ctx.inputs) == 1
             dep_to_input[dep_name] = first(keys(ctx.inputs))
             continue
@@ -919,7 +956,7 @@ function _cleanup_context_methods()
     end
 end
 
-function load_from_string(ctx_str::AbstractString)
+function load_from_string(ctx_str::AbstractString; routing_rules=nothing)
     _cleanup_context_methods()
 
     ctx_module = Module(Symbol(:XfaContext, gensym()))
@@ -943,10 +980,10 @@ function load_from_string(ctx_str::AbstractString)
         @eval ctx_module $expr
     end
 
-    @invokelatest load_from_module(ctx_module, exprs)
+    @invokelatest load_from_module(ctx_module, exprs; routing_rules)
 end
 
-function load_from_module(ctx_module::Module, exprs::Vector{Expr})
+function load_from_module(ctx_module::Module, exprs::Vector{Expr}; routing_rules=nothing)
     parameters = Dict{String, Parameter}()
 
     # Discover all variables, inputs, group types, and parameters defined
@@ -1197,16 +1234,16 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr})
                      variable_postprocessors=ctx_variable_postprocessors,
                      postprocessors=ctx_postprocessors,
                      parameters, exprs, inputs)
-    ctx.dep_to_input = build_dep_routing(ctx)
+    ctx.dep_to_input = build_dep_routing(ctx, routing_rules)
     return ctx
 end
 
-function load_from_file(ctx_path::AbstractString)
+function load_from_file(ctx_path::AbstractString; routing_rules=nothing)
     if !isfile(ctx_path)
         throw(ArgumentError("$(ctx_path) is not a file!"))
     end
 
-    ctx = load_from_string(read(ctx_path, String))
+    ctx = load_from_string(read(ctx_path, String); routing_rules)
     ctx.path = ctx_path
     return ctx
 end

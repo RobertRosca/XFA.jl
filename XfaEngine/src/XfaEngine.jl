@@ -2,6 +2,10 @@ module XfaEngine
 
 include("karabo_bridge.jl")
 include("context.jl")
+
+import TOML
+import Glob
+include("settings.jl")
 include("protocol.jl")
 
 using .Context: KaraboDevice
@@ -62,7 +66,7 @@ end
     clients::Dict{String, ClientState} = Dict()
 
     webproxies::Dict{String, WebProxy} = Dict()
-    default_trainmatchers::Dict{String, String} = Dict()
+    routing_rules::Vector{RoutingRule} = RoutingRule[]
 
     remoterepl_server::TCPServer = TCPServer()
     remoterepl_task::Union{Task, Nothing} = nothing
@@ -164,10 +168,26 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
         @info "Received shutdown request from client $(id)"
         shutdown(state)
         notify(state.stop_event)
-    elseif msg isa SetTopicTrainmatcher
-        state.default_trainmatchers[msg.topic] = msg.trainmatcher
-        @info "Set default trainmatcher for topic '$(msg.topic)' to: $(msg.trainmatcher)"
+    elseif msg isa GetRoutingRules
+        Protocol.server_send(ws, RoutingRules(state.routing_rules); reply_to)
+    elseif msg isa SetRoutingRules
+        state.routing_rules = msg.rules
+        write_routing_rules(msg.rules)
+        @info "Updated routing rules" n=length(msg.rules) path=engine_settings_path()
         Protocol.server_send(ws, Ack(); reply_to)
+
+        # Broadcast to all clients so concurrent editors stay in sync.
+        broadcast = RoutingRules(state.routing_rules)
+        for (other_id, other) in state.clients
+            if other_id == id
+                continue
+            end
+            try
+                Protocol.server_send(other.websocket, broadcast)
+            catch ex
+                @warn "Failed to broadcast routing rules to client '$(other_id)'" exception=ex
+            end
+        end
     elseif msg isa GetDevices
         try
             devices = if isnothing(msg.topic)
@@ -199,7 +219,7 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
         Protocol.server_send(ws, EngineDir(pkgdir(XfaEngine)); reply_to)
     elseif msg isa GetTrainmatchers
         trainmatchers = get_all_trainmatchers(state.webproxies)
-        Protocol.server_send(ws, AvailableTrainmatchers(trainmatchers, state.default_trainmatchers); reply_to)
+        Protocol.server_send(ws, AvailableTrainmatchers(trainmatchers); reply_to)
     elseif msg isa LoadContext
         path = abspath(expanduser(msg.path))
 
@@ -209,7 +229,7 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
         end
 
         new_ctx_or_ex = try
-            ctx = Context.load_from_file(path)
+            ctx = Context.load_from_file(path; routing_rules=state.routing_rules)
             ctx.forwarder = Base.Fix1(forward_output, state)
             ctx
         catch ex
@@ -325,19 +345,28 @@ function main(stop_event=Base.Event(); info_path=nothing, wait=true)
         state.webproxies["localhost"] = WebProxy("localhost:8484")
     end
 
-    # Query trainmatchers and assign defaults
-    if !isempty(state.webproxies)
-        try
-            all_trainmatchers = get_all_trainmatchers(state.webproxies)
-            for (topic, matchers) in all_trainmatchers
-                if !isempty(matchers)
-                    state.default_trainmatchers[topic] = first(matchers)[1]
+    loaded = load_routing_rules()
+    if isnothing(loaded)
+        # First run: seed one {topic, "*", first_matcher} rule per discovered
+        # topic and persist, so subsequent runs read the file verbatim.
+        rules = RoutingRule[]
+        if !isempty(state.webproxies)
+            try
+                for (topic, matchers) in get_all_trainmatchers(state.webproxies)
+                    if !isempty(matchers)
+                        push!(rules, RoutingRule(topic, "*", first(matchers)[1]))
+                    end
                 end
+            catch ex
+                @warn "Failed to query trainmatchers while seeding routing rules" exception=(ex, catch_backtrace())
             end
-            @info "Initialized default trainmatchers" defaults=state.default_trainmatchers
-        catch ex
-            @warn "Failed to query trainmatchers on startup" exception=(ex, catch_backtrace())
         end
+        write_routing_rules(rules)
+        state.routing_rules = rules
+        @info "Seeded routing rules" n=length(rules) path=engine_settings_path()
+    else
+        state.routing_rules = loaded
+        @info "Loaded routing rules" n=length(loaded) path=engine_settings_path()
     end
 
     ws_server = WebSockets.listen!("0.0.0.0", state.websocket_port) do ws

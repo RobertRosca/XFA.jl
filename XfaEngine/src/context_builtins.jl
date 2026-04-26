@@ -36,6 +36,9 @@ end
 end
 
 input_topic(bridge::KaraboBridge) = let t = bridge.trainmatcher[].topic; isempty(t) ? nothing : t end
+input_device(bridge::KaraboBridge) = let dev = bridge.trainmatcher[]
+    isempty(dev.name) ? nothing : dev
+end
 
 function get_sources(bridge::KaraboBridge)
     if !isnothing(bridge._mock_sources)

@@ -14,7 +14,7 @@ using OrderedCollections: OrderedDict as OD
 using DataStructures: CircularBuffer, capacity
 using FHist: bincounts, binedges
 
-using XfaEngine: XfaEngine, Context, KaraboBridge, Protocol
+using XfaEngine: XfaEngine, Context, KaraboBridge, Protocol, RoutingRule, match_rule
 using XfaEngine.Context: @Variable, @karabo_str, VariableData, Dependency, DependencyKind,
     DepKind_Variable, DepKind_Subvariable, DepKind_Karabo, DepKind_Group, DepKind_GroupParameter,
     karabo_dependency, subvariable_dependency, group_dependency, group_parameter_dependency,
@@ -314,8 +314,8 @@ end
 
             # Test that Ack messages carry reply_to for fire-and-forget
             # messages
-            id1 = Protocol.client_send(ws, Protocol.SetTopicTrainmatcher("localhost", "tm1"))
-            id2 = Protocol.client_send(ws, Protocol.SetTopicTrainmatcher("localhost", "tm2"))
+            id1 = Protocol.client_send(ws, Protocol.SetRoutingRules(RoutingRule[]))
+            id2 = Protocol.client_send(ws, Protocol.SetRoutingRules(RoutingRule[]))
             env1 = Protocol.receive(ws)
             env2 = Protocol.receive(ws)
             @test env1.msg isa Protocol.Ack
@@ -978,6 +978,93 @@ end
         # Test that sorting actually works
         dag = Dict("camera" => [karabo"foo.bar"], "foo" => ["camera"], "bar" => ["foo"])
         @test Context.topological_sort(dag) == ["camera", "foo", "bar"]
+    end
+
+    @testset "Routing" begin
+        @testset "match_rule" begin
+            # Empty rules always miss; literal and glob patterns both work;
+            # first match wins when multiple rules could apply.
+            @test isnothing(match_rule(RoutingRule[], "T", "foo"))
+
+            rules = [RoutingRule("T1", "exact", "DEV_A"),
+                     RoutingRule("T1", "foo.*", "DEV_B"),
+                     RoutingRule("*", "*", "DEV_FALLBACK")]
+            @test match_rule(rules, "T1", "exact") == "DEV_A"
+            @test match_rule(rules, "T1", "foo.bar") == "DEV_B"
+            @test match_rule(rules, "T2", "anything") == "DEV_FALLBACK"
+
+            # More-specific rule only wins if it's ordered first
+            reversed = [RoutingRule("*", "*", "DEV_FALLBACK"),
+                        RoutingRule("T1", "exact", "DEV_A")]
+            @test match_rule(reversed, "T1", "exact") == "DEV_FALLBACK"
+
+            # Character-class and ?-wildcard globs
+            class_rules = [RoutingRule("*", "cam[0-9]", "DEV_CAM"),
+                           RoutingRule("*", "mot?r", "DEV_MOTOR")]
+            @test match_rule(class_rules, "T", "cam3") == "DEV_CAM"
+            @test match_rule(class_rules, "T", "motor") == "DEV_MOTOR"
+            @test isnothing(match_rule(class_rules, "T", "camera"))
+        end
+
+        @testset "build_dep_routing with rules" begin
+            # Two bridges, different trainmatcher devices. Rules are matched
+            # against the karabo dependency's source/device name (e.g. for
+            # karabo"foo.bar" the source is "foo", not "foo.bar").
+            ctx_src = """
+            bridge_a = KaraboBridge(; trainmatcher=KaraboDevice("T1//DEV_A"))
+            bridge_a._mock_sources = String[]
+
+            bridge_b = KaraboBridge(; trainmatcher=KaraboDevice("T2//DEV_B"))
+            bridge_b._mock_sources = String[]
+
+            @Variable foo -> karabo"foo.bar"
+            @Variable special -> karabo"T1//special.src"
+            """
+
+            # No rules: topic-match routes the prefixed dep; unprefixed dep has no
+            # topic/source match and two inputs exist, so it errors.
+            @test_throws XfaContextException Context.load_from_string(ctx_src)
+
+            # Rule forces source "foo" to bridge_b (device name DEV_B) regardless
+            # of topic. The topicked dep falls through to the topic-match heuristic.
+            rules = [RoutingRule("*", "foo", "DEV_B")]
+            ctx = Context.load_from_string(ctx_src; routing_rules=rules)
+            @test ctx.dep_to_input["foo.bar"] == "bridge_b.stream"
+            @test ctx.dep_to_input["T1//special.src"] == "bridge_a.stream"
+
+            # Rule pointing at a device that isn't among the inputs falls through
+            # to the existing heuristics (the trailing rule keeps foo routable).
+            rules = [RoutingRule("*", "special", "NONEXISTENT_DEV"),
+                     RoutingRule("*", "*", "DEV_A")]
+            ctx = Context.load_from_string(ctx_src; routing_rules=rules)
+            @test ctx.dep_to_input["T1//special.src"] == "bridge_a.stream"
+
+            # First-match-wins: a specific rule overrides the catch-all below it.
+            rules = [RoutingRule("*", "foo", "DEV_A"),
+                     RoutingRule("*", "*", "DEV_B")]
+            ctx = Context.load_from_string(ctx_src; routing_rules=rules)
+            @test ctx.dep_to_input["foo.bar"] == "bridge_a.stream"
+            @test ctx.dep_to_input["T1//special.src"] == "bridge_b.stream"
+
+            # Topic-qualified input ("T//DEV") disambiguates when multiple
+            # topics have devices with the same name.
+            same_name_src = raw"""
+            bridge_a = KaraboBridge(; trainmatcher=KaraboDevice("T1//DEV"))
+            bridge_a._mock_sources = String[]
+
+            bridge_b = KaraboBridge(; trainmatcher=KaraboDevice("T2//DEV"))
+            bridge_b._mock_sources = String[]
+
+            @Variable foo -> karabo"foo.bar"
+            """
+            rules = [RoutingRule("*", "foo", "T2//DEV")]
+            ctx = Context.load_from_string(same_name_src; routing_rules=rules)
+            @test ctx.dep_to_input["foo.bar"] == "bridge_b.stream"
+
+            rules = [RoutingRule("*", "foo", "T1//DEV")]
+            ctx = Context.load_from_string(same_name_src; routing_rules=rules)
+            @test ctx.dep_to_input["foo.bar"] == "bridge_a.stream"
+        end
     end
 
     @testset "Execution" begin
