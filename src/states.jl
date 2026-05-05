@@ -166,8 +166,7 @@ const SCALAR_BUFFER_CAPACITY = 10_000
     const scalar_data_cache::Vector{Float64} = Float64[]
     const scalar_tids_cache::Vector{Float64} = Float64[]
 
-    # Timestamps of recent updates for computing average rate (updates/sec)
-    const update_timestamps::Vector{Float64} = Float64[]
+    # Processing rate (Hz) reported by the engine.
     update_rate::Float64 = 0.0
 
     # Metadata from VariableData
@@ -197,6 +196,10 @@ end
     # Latest per-channel (drops, size, capacity) snapshot from the engine,
     # keyed by (producer, consumer). Updated roughly once per second.
     channel_stats::Dict{Tuple{String, String}, XfaEngine.Context.ChannelStat} = Dict()
+
+    # Latest smoothed Hz at which each input is pushing data, keyed by input
+    # name. Updated roughly once per second alongside `channel_stats`.
+    input_rates::Dict{String, Float64} = Dict()
 
     lock::ReentrantLock = ReentrantLock()
 end

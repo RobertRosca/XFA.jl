@@ -246,7 +246,7 @@ end
 
 
     @testset "Channel stats" begin
-        # End-to-end check that the engine periodically pushes a ChannelStats
+        # End-to-end check that the engine periodically pushes a PipelineStats
         # message summarising drops/size/capacity for each variable channel.
         # A slow downstream variable guarantees drops accumulate.
         log = TestLogger()
@@ -276,15 +276,15 @@ end
                 Protocol.client_send(ws, Protocol.Start())
                 while !(Protocol.receive(ws).msg isa Protocol.Ack) end
 
-                # Collect messages until we get a ChannelStats with a non-zero
+                # Collect messages until we get a PipelineStats with a non-zero
                 # drop count on the (motor.pos, slow) channel, or time out.
                 key = ("motor.pos", "slow")
-                stats = nothing # Context.ChannelStat(0, 0, 0)
+                stats = nothing
                 deadline = time() + 10.0
                 while isnothing(stats) || (time() < deadline && stats.drops == 0)
                     msg = Protocol.receive(ws).msg
-                    if msg isa Protocol.ChannelStats && msg.stats[key].drops > 0
-                        stats = msg.stats[key]
+                    if msg isa Protocol.PipelineStats && msg.channel_stats[key].drops > 0
+                        stats = msg.channel_stats[key]
                     end
                 end
 

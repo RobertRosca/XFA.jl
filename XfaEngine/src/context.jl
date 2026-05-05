@@ -122,6 +122,11 @@ end
     variable_tasks::Dict{String, Task} = Dict()
     variable_channels::Dict{String, Dict{String, RemoteChannel}} = Dict()
 
+    # Smoothed Hz at which inputs and external dependencies are pushing data,
+    # keyed by input/dep name. Variable rates are sent piggy-backed on
+    # `VariableData.update_rate` instead.
+    input_rates::Dict{String, Float64} = Dict()
+
     stream_output::Union{RemoteChannel, Nothing} = nothing
     forwarder::Function = Returns(nothing)
     output_forwarder_task::Union{Task, Nothing} = nothing
@@ -482,14 +487,14 @@ function input_wrapper(name, group, channel)
     end
 end
 
-function wrap_result(result, tid, name; subvariables=Dict{String, Any}())
+function wrap_result(result, tid, name; subvariables=Dict{String, Any}(), update_rate=0.0)
     if result isa VariableData
         VariableData(; tid, name, data=result.data, subvariables,
                      title=result.title, x_axis=result.x_axis, y_axis=result.y_axis,
                      xlabel=result.xlabel, ylabel=result.ylabel, unit=result.unit,
-                     fixed_aspect=result.fixed_aspect)
+                     fixed_aspect=result.fixed_aspect, update_rate)
     else
-        VariableData(; tid, name, data=result, subvariables)
+        VariableData(; tid, name, data=result, subvariables, update_rate)
     end
 end
 
@@ -499,10 +504,14 @@ function putall!(channels, value)
     end
 end
 
-function stream_input(name, channel, downstream_neighbours)
+function stream_input(name, channel, downstream_neighbours, rates)
+    rate = RunningRate()
     try
         while isopen(channel) || isready(channel)
             tid, sources = take!(channel)
+
+            tick!(rate)
+            rates[name] = isnan(rate.value) ? 0.0 : rate.value
 
             putall!(values(downstream_neighbours), VariableData(; tid=Int(tid), data=sources))
             @debug "Pushed input data from '$(name)' to: $(keys(downstream_neighbours))"
@@ -564,6 +573,9 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
     matcher = Trainmatcher(k for (k, v) in upstream if v isa RemoteChannel)
     matched_trains = Dict{Int, Any}()
     args = Vector{Any}(undef, length(deps))
+
+    # Smoothed processing rate (Hz), reported to the client on each output.
+    rate = RunningRate()
     try
         while true
             while isempty(matched_trains)
@@ -632,8 +644,11 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
                 subvar_values[subvar_name] = wrap_result(subvar_value, tid, subvar_name)
             end
 
-            # Send output
-            out = wrap_result(out, tid, name; subvariables=subvar_values)
+            tick!(rate)
+
+            # Send output (NaN rate before the second tick → report 0)
+            update_rate = isnan(rate.value) ? 0.0 : rate.value
+            out = wrap_result(out, tid, name; subvariables=subvar_values, update_rate)
             put!(stream_output, out)
             putall!(values(downstream), out)
             @debug "Pushed output from '$(name)' to: $(keys(downstream))"
@@ -754,7 +769,8 @@ function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50)
         end
         ctx.input_variable_channels[name] = downstream_neighbours
 
-        ctx.input_variables_tasks[name] = Threads.@spawn stream_input(name, ctx.input_channels[name], downstream_neighbours)
+        ctx.input_rates[name] = 0.0
+        ctx.input_variables_tasks[name] = Threads.@spawn stream_input(name, ctx.input_channels[name], downstream_neighbours, ctx.input_rates)
         errormonitor(ctx.input_variables_tasks[name])
     end
 

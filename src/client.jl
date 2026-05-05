@@ -712,15 +712,7 @@ function store_variable_data!(client, variable::VariableData)
         VariableType_Unknown
     end
     push!(store.updates, (variable.tid, data, type))
-
-    ts = store.update_timestamps
-    push!(ts, time())
-    if length(ts) > 100
-        popfirst!(ts)
-    end
-    if length(ts) >= 2
-        store.update_rate = 1 / nanmean(diff(ts))
-    end
+    store.update_rate = variable.update_rate
 end
 
 function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothing)
@@ -826,8 +818,9 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
                 end
             end
         end
-    elseif msg isa ChannelStats
-        client.context.channel_stats = msg.stats
+    elseif msg isa PipelineStats
+        client.context.channel_stats = msg.channel_stats
+        client.context.input_rates = msg.input_rates
     elseif msg isa RemoteReplState
         client.remoterepl_mode[] = msg.enabled
         client.remoterepl_status = msg.enabled ? RemoteReplStatus_Running : RemoteReplStatus_Stopped
@@ -975,7 +968,6 @@ end
 
 function start(state)
     for store in values(state.client.variable_data)
-        empty!(store.update_timestamps)
         store.update_rate = 0
     end
 

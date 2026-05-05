@@ -12,7 +12,7 @@ export AbstractMessage, Ping, Shutdown,
     Pong, AvailableTrainmatchers,
     Started, Stopped, Devices,
     ContextInfo, ParameterChanged, TrainData, RemoteReplState,
-    ChannelStats, Ack, Envelope, MessageId, client_send, server_send
+    PipelineStats, Ack, Envelope, MessageId, client_send, server_send
 
 import Serialization: serialize, deserialize
 
@@ -139,11 +139,14 @@ struct RemoteReplState <: AbstractMessage
     port::Int
 end
 
-# Per-channel snapshots keyed by (producer, consumer). Producer is either an
-# external dependency name (e.g. "motor.pos") or a variable name; consumer is
-# always the downstream variable name.
-struct ChannelStats <: AbstractMessage
-    stats::Dict{Tuple{String, String}, Context.ChannelStat}
+# Periodic pipeline metrics broadcast. `channel_stats` holds per-channel
+# snapshots keyed by (producer, consumer); producer is either an external
+# dependency name (e.g. "motor.pos") or a variable name, consumer is always
+# the downstream variable name. `input_rates` is the smoothed Hz at which
+# each input is pushing data, keyed by input name.
+struct PipelineStats <: AbstractMessage
+    channel_stats::Dict{Tuple{String, String}, Context.ChannelStat}
+    input_rates::Dict{String, Float64}
 end
 
 struct Ack <: AbstractMessage

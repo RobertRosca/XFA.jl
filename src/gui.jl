@@ -8,7 +8,7 @@ using ModernGL
 
 include("imnodes.jl")
 
-using NaNStatistics: nanmean, nanmaximum, nanminimum, nanpctile
+using NaNStatistics: nanpctile
 using DimensionalData: DimensionalData as DD, DimVector, DimMatrix, DimArray, At, lookup
 using DataStructures: CircularBuffer
 include("plotting.jl")
@@ -28,7 +28,7 @@ using Serialization
 using XfaEngine.Protocol
 using XfaEngine: XfaEngine, Protocol
 using XfaEngine.Context: Dependency, DependencyKind, DepKind_Variable, DepKind_Karabo, DepKind_Group,
-    karabo_dependency, Parameter, KaraboDevice, VariableData, OptionalDims
+    karabo_dependency, Parameter, KaraboDevice, VariableData, ArrayMetadata, OptionalDims
 
 include("imgui_helpers.jl")
 include("state_inspector.jl")
@@ -385,10 +385,6 @@ function draw_variable(name, var_data)
     ig.Dummy(min_node_width, 10)
 
     ig.TextDisabled("Outputs")
-    if !isnothing(variable_store)
-        ig.SameLine()
-        ig.TextDisabled(@sprintf "%.2f Hz" variable_store.update_rate)
-    end
     draw_list = ig.GetWindowDrawList()
     start_pos = ig.GetCursorScreenPos()
     gray = ig.IM_COL32(100, 100, 100, 255)
@@ -417,6 +413,16 @@ function draw_variable(name, var_data)
             end
         end
 
+        rate = if haskey(client.variable_data, output_name)
+            client.variable_data[output_name].update_rate
+        else
+            get(client.context.input_rates, output_name, nothing)
+        end
+        if !isnothing(rate)
+            ig.SameLine()
+            ig.TextDisabled(@sprintf "%.2f Hz" rate)
+        end
+
         ImNodes.EndOutputAttribute()
     end
 
@@ -431,7 +437,6 @@ function draw_variable(name, var_data)
 
         for pp in postprocessors
             label = pp.display_name * pp.tree_id_suffix
-
             ImNodes.BeginOutputAttribute(pp.id, ImNodes.ImNodesPinShape_CircleFilled)
 
             # This child window is here to get around an imnodes limitation that
@@ -440,6 +445,7 @@ function draw_variable(name, var_data)
             ig.PushStyleColor(ig.ImGuiCol_ChildBg, ig.ImVec4(0, 0, 0, 0))
             node_width = ImNodes.GetNodeDimensions(var_data["id"]).x
             child_width = max(min_node_width, node_width * 3 / 4)
+
             if ig.BeginChild("##pp-$(pp.id)", ImVec2(child_width, 0), ig.ImGuiChildFlags_AutoResizeY, ig.ImGuiWindowFlags_HorizontalScrollbar)
                 expanded = ig.TreeNode(label)
                 if haskey(client.variable_data, pp.name)
@@ -452,6 +458,7 @@ function draw_variable(name, var_data)
                         end
                     end
                 end
+
                 if expanded
                     if isempty(pp.params)
                         ig.TextDisabled("(no parameters)")
@@ -463,6 +470,7 @@ function draw_variable(name, var_data)
                     ig.TreePop()
                 end
             end
+
             ig.EndChild()
             ig.PopStyleColor()
 

@@ -188,12 +188,12 @@ function broadcast_channel_stats(state::EngineState; period=1.0)
             continue
         end
 
-        msg = Protocol.ChannelStats(stats)
+        msg = Protocol.PipelineStats(stats, copy(ctx.input_rates))
         for client in values(state.clients)
             try
                 Protocol.server_send(client.websocket, msg)
             catch ex
-                @debug "Failed to send ChannelStats to client" exception=(ex, catch_backtrace())
+                @debug "Failed to send PipelineStats to client" exception=(ex, catch_backtrace())
             end
         end
     end
