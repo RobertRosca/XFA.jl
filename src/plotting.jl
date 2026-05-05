@@ -485,19 +485,25 @@ mutable struct Plot
     const autoscale_x::Ref{Bool}
     const autoscale_y::Ref{Bool}
     const fixed_aspect::Ref{Bool}
+
     gpu_heatmap::Union{Nothing, GPUHeatmap}
     dock_id::UInt32
 end
 
 Plot(name, counter::Int) = Plot(name, "$(name)##plot-$(counter)")
 
-Plot(name, id::String, dock_id = 0) = Plot(name, id, Ref(true), Ref(true), Ref(true), Ref(true), nothing, UInt32(dock_id))
+function Plot(name, id::String, dock_id = 0)
+    subscribe_variable(state[], name)
+    Plot(name, id, Ref(true), Ref(true), Ref(true), Ref(true), nothing, UInt32(dock_id))
+end
 
 function Base.close(plot::Plot)
     if !isnothing(plot.gpu_heatmap)
         destroy!(plot.gpu_heatmap)
         plot.gpu_heatmap = nothing
     end
+
+    unsubscribe_variable(state[], plot.name)
 end
 
 clear_plot(::Plot) = nothing
@@ -734,6 +740,8 @@ end
     const y_data::Vector{Float64} = Float64[]
     const autoscale_x::Ref{Bool} = Ref(true)
     const autoscale_y::Ref{Bool} = Ref(true)
+    const subscribed::Vector{String} = ["", ""]
+
     trainId::Int = -1
     dock_id::UInt32 = 0
 end
@@ -751,7 +759,10 @@ function CorrelationPlot(id::String, dock_id::Integer = 0)
     CorrelationPlot(; id, dock_id=UInt32(dock_id))
 end
 
-Base.close(::CorrelationPlot) = nothing
+function Base.close(plot::CorrelationPlot)
+    unsubscribe_variable(state[], plot.subscribed[1])
+    unsubscribe_variable(state[], plot.subscribed[2])
+end
 
 function var_type_label(store)
     if store.type == VariableType_Scalar
@@ -833,6 +844,7 @@ function draw_plot(plot::CorrelationPlot, variable_data, updated_variables)
         if ig.Button("Swap axes")
             plot.x_var[], plot.y_var[] = plot.y_var[], plot.x_var[]
             swap_arrays(plot.x_data, plot.y_data)
+            reverse!(plot.subscribed)
         end
 
         ig.SameLine()
@@ -853,6 +865,17 @@ function draw_plot(plot::CorrelationPlot, variable_data, updated_variables)
             y_name = plot.variable_names[plot.y_var[] + 1]
             x = variable_data[x_name]
             y = variable_data[y_name]
+
+            if x_name != plot.subscribed[1]
+                unsubscribe_variable(state[], plot.subscribed[1])
+                subscribe_variable(state[], x_name)
+                plot.subscribed[1] = x_name
+            end
+            if y_name != plot.subscribed[2]
+                unsubscribe_variable(state[], plot.subscribed[2])
+                subscribe_variable(state[], y_name)
+                plot.subscribed[2] = y_name
+            end
 
             if x.type != y.type
                 ig.Text("Both variables must have the same type to correlate against each other.")

@@ -14,7 +14,8 @@ using OrderedCollections: OrderedDict as OD
 using DataStructures: CircularBuffer, capacity
 using FHist: bincounts, binedges
 
-using XfaEngine: XfaEngine, Context, KaraboBridge, Protocol, RoutingRule, match_rule
+using XfaEngine: XfaEngine, Context, KaraboBridge, Protocol, RoutingRule, match_rule,
+    filter_subscriptions, is_scalar_data, ArrayMetadata
 using XfaEngine.Context: @Variable, @karabo_str, VariableData, Dependency, DependencyKind,
     DepKind_Variable, DepKind_Subvariable, DepKind_Karabo, DepKind_Group, DepKind_GroupParameter,
     karabo_dependency, subvariable_dependency, group_dependency, group_parameter_dependency,
@@ -1662,6 +1663,53 @@ end
 
         close(bridge_server)
     end
+end
+
+@testset "Subscription filtering" begin
+    @test is_scalar_data(1.0)
+    @test is_scalar_data("foo")
+    @test is_scalar_data(fill(1.0))
+    @test !is_scalar_data([1, 2, 3])
+
+    # Scalars always pass through; non-subscribed arrays are replaced with
+    # ArrayMetadata so the client still gets shape/type info.
+    scalar = VariableData(0, "s", 42)
+    array = VariableData(0, "a", [1, 2, 3])
+    @test filter_subscriptions(scalar, Set{String}()) === scalar
+    f = filter_subscriptions(array, Set{String}())
+    @test f.data isa ArrayMetadata
+    @test f.data.eltype === Int
+    @test f.data.size == [3]
+    @test filter_subscriptions(array, Set(["a"])) === array
+
+    # Subvariables follow the same rule under their qualified name.
+    parent = VariableData(; tid=0, name="p", data=[1, 2],
+                          subvariables=Dict{String, Any}(
+                              "scalar" => VariableData(0, "scalar", 1.5),
+                              "arr" => VariableData(0, "arr", [4, 5])))
+    f = filter_subscriptions(parent, Set{String}())
+    @test f.data isa ArrayMetadata
+    @test keyset(f.subvariables) == Set(["scalar", "arr"])
+    @test f.subvariables["scalar"].data == 1.5
+    @test f.subvariables["arr"].data isa ArrayMetadata
+
+    f = filter_subscriptions(parent, Set(["p.arr"]))
+    @test f.data isa ArrayMetadata
+    @test keyset(f.subvariables) == Set(["scalar", "arr"])
+    @test f.subvariables["arr"].data == [4, 5]
+
+    f = filter_subscriptions(parent, Set(["p"]))
+    @test f.data == [1, 2]
+    @test keyset(f.subvariables) == Set(["scalar", "arr"])
+    @test f.subvariables["arr"].data isa ArrayMetadata
+
+    # No subscriptions: parent and array subvar both reduced to metadata.
+    arr_only = VariableData(; tid=0, name="p", data=[1, 2],
+                            subvariables=Dict{String, Any}(
+                                "arr" => VariableData(0, "arr", [4, 5])))
+    f = filter_subscriptions(arr_only, Set{String}())
+    @test f.data isa ArrayMetadata
+    @test f.subvariables["arr"].data isa ArrayMetadata
 end
 
 @testset "Serialization" begin

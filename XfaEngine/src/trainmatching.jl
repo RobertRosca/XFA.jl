@@ -1,3 +1,11 @@
+# Stand-in payload sent in place of an unsubscribed array. Carries just enough
+# shape info for the client to display plot buttons / type labels without
+# needing the full data.
+struct ArrayMetadata
+    eltype::DataType
+    size::Vector{Int}
+end
+
 @kwdef struct VariableData{T}
     tid::Int = 0
     name::Union{String, Nothing} = nothing

@@ -24,7 +24,7 @@ import RemoteREPL
 using DimensionalData: DimArray
 
 using .Protocol
-import .Context: XfaContext
+import .Context: XfaContext, VariableData, ArrayMetadata
 
 
 """Find the closest available port to `port_hint`."""
@@ -57,6 +57,10 @@ end
     last_heartbeat::Float64
     handler_task::Union{Task, Nothing} = nothing
     # heartbeat_task::Task
+
+    # Fully-qualified names of array-valued variables this client wants
+    # forwarded. Updated via `SetVariableSubscriptions`.
+    subscriptions::Set{String} = Set{String}()
 end
 
 @kwdef mutable struct EngineState
@@ -81,11 +85,61 @@ end
 
 current_engine_state::Union{EngineState, Nothing} = nothing
 
+# 0-D values (numbers, strings, scalar arrays) are cheap to ship and always
+# forwarded; multi-element arrays must be opted into via subscription.
+is_scalar_data(x) = !(x isa AbstractArray) || ndims(x) == 0
+
+# Strip a non-subscribed variable down to identity + shape. The client only
+# needs this much to render plot buttons / type labels; the heavy fields
+# (title, axis labels, etc.) are dropped to save bandwidth.
+function metadata_only(variable::VariableData; subvariables=variable.subvariables)
+    VariableData(; tid=variable.tid, name=variable.name,
+                 data=ArrayMetadata(eltype(variable.data), collect(size(variable.data))),
+                 subvariables, update_rate=variable.update_rate)
+end
+
+# Build a per-client view of a variable: parent and subvariables that are
+# scalar or subscribed pass through unchanged; non-subscribed array payloads
+# are replaced with `ArrayMetadata`.
+function filter_subscriptions(variable::VariableData, subscriptions::Set{String})
+    parent_keep = is_scalar_data(variable.data) || variable.name in subscriptions
+
+    new_subvars = if isempty(variable.subvariables)
+        variable.subvariables
+    else
+        kept = Dict{String, Any}()
+        for (subname, subvar) in variable.subvariables
+            qualified = "$(variable.name).$(subname)"
+            if is_scalar_data(subvar.data) || qualified in subscriptions
+                kept[subname] = subvar
+            else
+                kept[subname] = metadata_only(subvar)
+            end
+        end
+        kept
+    end
+
+    if parent_keep && new_subvars === variable.subvariables
+        return variable
+    end
+
+    if !parent_keep
+        return metadata_only(variable; subvariables=new_subvars)
+    end
+
+    return VariableData(; tid=variable.tid, name=variable.name, data=variable.data,
+                        subvariables=new_subvars,
+                        title=variable.title, x_axis=variable.x_axis, y_axis=variable.y_axis,
+                        xlabel=variable.xlabel, ylabel=variable.ylabel, unit=variable.unit,
+                        fixed_aspect=variable.fixed_aspect, update_rate=variable.update_rate)
+end
+
 function forward_output(state::EngineState, stream_output)
     for data in stream_output
         for (id, client) in state.clients
+            filtered = filter_subscriptions(data, client.subscriptions)
             try
-                Protocol.server_send(client.websocket, TrainData([data]))
+                Protocol.server_send(client.websocket, TrainData([filtered]))
             catch ex
                 @warn "Couldn't forward data to client '$(id)'" exception=ex
             end
@@ -273,6 +327,9 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
         Context.stop_pipeline(state.ctx)
         Protocol.server_send(ws, Stopped(); reply_to)
         @info "Stopped"
+    elseif msg isa SetVariableSubscriptions
+        client_state.subscriptions = msg.variables
+        Protocol.server_send(ws, Ack(); reply_to)
     elseif msg isa SetDebugMode
         @info "Setting debug mode: $(msg.enable)"
         if msg.enable

@@ -304,6 +304,12 @@ EngineLog(message::String, extra_details::Maybe{String}=nothing) = EngineLog(tim
     plot_counter::Int = 0
     plots::Vector{Union{Plot, CorrelationPlot}} = Union{Plot, CorrelationPlot}[]
 
+    # Variable subscriptions, keyed by fully-qualified name. The value counts
+    # how many plots currently display that variable; entries are removed when
+    # the count drops to zero. The set of keys is what gets sent to the engine
+    # via SetVariableSubscriptions.
+    subscriptions::Dict{String, Int} = Dict{String, Int}()
+
     # Engine log messages
     engine_logs::Vector{EngineLog} = EngineLog[]
     log_dateformat::Dates.DateFormat = dateformat"yyyy-mm-dd HH:MM:SS"

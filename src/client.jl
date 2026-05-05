@@ -637,6 +637,25 @@ function store_variable_data!(client, variable::VariableData)
     data = variable.data
     name = variable.name
 
+    # Unsubscribed array variables arrive as shape-only metadata. We keep a
+    # placeholder array of the right type/shape so plot buttons and type
+    # labels work, but skip the data-flow updates — real data only arrives
+    # after the user subscribes by opening a plot. Reallocate the placeholder
+    # if the shape/eltype changed (dynamically-shaped variable, or first
+    # metadata after a subscribed payload had a different shape).
+    if data isa ArrayMetadata
+        if !haskey(client.variable_data, name)
+            client.variable_data[name] = VariableStore(; data=Array{data.eltype}(undef, data.size...))
+        end
+        store = client.variable_data[name]
+        if eltype(store.data) != data.eltype || collect(size(store.data)) != data.size
+            store.data = Array{data.eltype}(undef, data.size...)
+        end
+        store.type = length(data.size) == 1 ? VariableType_Vector : VariableType_Array
+        store.update_rate = variable.update_rate
+        return
+    end
+
     if !haskey(client.variable_data, name)
         if data isa Number
             values = CircularBuffer{Float64}(SCALAR_BUFFER_CAPACITY)
@@ -982,4 +1001,36 @@ function set_remoterepl(state)
     client = state.client
     client.remoterepl_status = RemoteReplStatus_Changing
     send(client, SetRemoteRepl(client.remoterepl_mode[]))
+end
+
+function send_subscriptions(client)
+    send(client, SetVariableSubscriptions(Set(keys(client.subscriptions))))
+end
+
+function subscribe_variable(state, name)
+    if isempty(name)
+        return
+    end
+
+    subscriptions = state.client.subscriptions
+    if !haskey(subscriptions, name)
+        subscriptions[name] = 1
+        send_subscriptions(state.client)
+    else
+        subscriptions[name] += 1
+    end
+end
+
+# Empty/unknown names are no-ops so callers can pass uninitialised slots safely.
+function unsubscribe_variable(state, name)
+    if isempty(name) || !haskey(state.client.subscriptions, name)
+        return
+    end
+
+    subscriptions = state.client.subscriptions
+    subscriptions[name] -= 1
+    if subscriptions[name] == 0
+        delete!(subscriptions, name)
+        send_subscriptions(state.client)
+    end
 end

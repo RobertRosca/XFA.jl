@@ -6,6 +6,7 @@ export AbstractMessage, Ping, Shutdown,
     GetDeviceProperty, DeviceProperty,
     GetEngineDir, EngineDir,
     GetRoutingRules, SetRoutingRules, RoutingRules,
+    SetVariableSubscriptions,
     ChangeParameter, Start, Stop,
     SetDebugMode, SetRemoteRepl,
     Pong, AvailableTrainmatchers,
@@ -58,6 +59,13 @@ struct GetRoutingRules <: AbstractMessage end
 
 struct SetRoutingRules <: AbstractMessage
     rules::Vector{RoutingRule}
+end
+
+# Tells the engine which array-valued variables this client wants forwarded.
+# Scalar variables are always sent; everything else is suppressed unless its
+# fully-qualified name (e.g. "var", "var.subvar") appears in this list.
+struct SetVariableSubscriptions <: AbstractMessage
+    variables::Set{String}
 end
 
 struct Start <: AbstractMessage end

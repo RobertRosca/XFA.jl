@@ -493,18 +493,6 @@ function wrap_result(result, tid, name; subvariables=Dict{String, Any}())
     end
 end
 
-function maybe_send_output(channel, data::VariableData)
-    # Semi-arbitrarily set a threshold of 30MB, which is just under twice the
-    # size of a Float32 2k camera.
-    threshold = 30_000_000
-
-    if Base.summarysize(data) < threshold
-        put!(channel, data)
-    else
-        put!(channel, VariableData(data.tid, nothing, :threshold_exceeded))
-    end
-end
-
 function putall!(channels, value)
     for channel in channels
         put!(channel, value)
@@ -646,7 +634,7 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
 
             # Send output
             out = wrap_result(out, tid, name; subvariables=subvar_values)
-            maybe_send_output(stream_output, out)
+            put!(stream_output, out)
             putall!(values(downstream), out)
             @debug "Pushed output from '$(name)' to: $(keys(downstream))"
         end
