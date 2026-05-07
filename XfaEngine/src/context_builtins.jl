@@ -30,6 +30,10 @@ end
 
     sources::Vector{String} = String[]
 
+    # Reusable receive buffers for array payloads, keyed by (source, path).
+    # See karabo_bridge.jl BufferRing for the rotation policy.
+    buffer_pool::BufferPool = BufferPool()
+
     # Internal field for testing: when set, get_sources() returns this
     # instead of querying the WebProxy.
     _mock_sources::Union{Vector{String}, Nothing} = nothing
@@ -101,7 +105,7 @@ end
             # take!() may throw an exception when the client is closed
             local msg
             try
-                msg = take!(client)
+                msg = take!(client, bridge.buffer_pool)
             catch
                 break
             end

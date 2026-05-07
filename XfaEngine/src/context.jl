@@ -19,7 +19,7 @@ include("circular_channel.jl")
 
 # Factory for RemoteChannels carrying per-train variable data. Oldest items
 # are overwritten when a consumer falls behind; drops are counted per channel.
-variable_channel() = RemoteChannel(() -> CircularChannel{VariableData}(100))
+variable_channel() = RemoteChannel(() -> CircularChannel{VariableData}(XfaEngine.VARIABLE_CHANNEL_SIZE))
 
 struct ChannelStat
     drops::Int
@@ -85,7 +85,7 @@ end
 include("context_types.jl")
 include("trainmatching.jl")
 
-import ..KaraboBridge: KaraboBridgeClient
+import ..KaraboBridge: KaraboBridgeClient, BufferPool
 include("context_builtins.jl")
 
 @kwdef mutable struct WorkerState
@@ -627,6 +627,10 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
                 continue
             end
 
+            if !isnothing(out)
+                tick!(rate)
+            end
+
             # Run postprocessors on the variable output
             if !isempty(postprocessors)
                 raw_out = out isa VariableData ? out.data : out
@@ -643,8 +647,6 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
             for (subvar_name, subvar_value) in subvar_values
                 subvar_values[subvar_name] = wrap_result(subvar_value, tid, subvar_name)
             end
-
-            tick!(rate)
 
             # Send output (NaN rate before the second tick → report 0)
             update_rate = isnan(rate.value) ? 0.0 : rate.value
@@ -708,7 +710,7 @@ function update_input_sources(ctx::XfaContext)
 
         input_deps = [dep for dep in deps
                       if get(ctx.dep_to_input, string(dep), nothing) == input_name]
-        sources = [dep.source for dep in input_deps]
+        sources = [trainmatcher_dep_string(dep) for dep in input_deps]
         update_sources(group, sources)
     end
 end

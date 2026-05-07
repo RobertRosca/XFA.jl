@@ -446,6 +446,37 @@ end
             @test dummy_data == data
         end
     end
+
+    @testset "BufferPool" begin
+        karabo_bridge_test_state(endpoint) do client, server
+            KaraboBridge.startbridge(server)
+            pool = KaraboBridge.BufferPool()
+
+            send_payload = Dict("src" => Dict("arr" => UInt16[1, 2, 3, 4, 5]))
+            put!(server, send_payload)
+            data, _ = take!(client, pool)
+            @test data == send_payload
+
+            # Same (source, path) should reuse the same underlying Vector
+            # across rotations within VARIABLE_CHANNEL_SIZE trains.
+            ring = pool[("src", "arr")]
+            buf_first_round = ring.buffers[1]
+
+            for _ in 1:XfaEngine.VARIABLE_CHANNEL_SIZE
+                put!(server, send_payload)
+                take!(client, pool)
+            end
+            @test ring.buffers[1] === buf_first_round
+
+            # A different (source, path) gets its own ring.
+            other = Dict("other" => Dict("v" => Float32[1.0, 2.0]))
+            put!(server, other)
+            data, _ = take!(client, pool)
+            @test data == other
+            @test haskey(pool, ("other", "v"))
+            @test pool[("other", "v")] isa KaraboBridge.BufferRing{Float32}
+        end
+    end
 end
 
 @testset "Trainmatching" begin
