@@ -14,7 +14,18 @@ function draw_variable_content(::Val{Symbol("XfaEngine.Context.KaraboBridge")}, 
     end
 
     ig.Text("Parameters:")
-    draw_parameter("trainmatcher", params["trainmatcher"])
+
+    tm_param = params["trainmatcher"]
+    tm_modified, new_tm = draw_parameter("trainmatcher", tm_param)
+    if tm_modified
+        tm_param[] = new_tm
+        @guiasync set_group_param(state[], name, "trainmatcher",
+                                  "KaraboDevice(\"$(new_tm.topic)\", \"$(new_tm.name)\")")
+
+        gui_state.zmq_outputs = nothing
+        gui_state.selected_output = 0
+    end
+
     draw_parameter("manual_configuration", params["manual_configuration"])
 
     if params["manual_configuration"].value
@@ -42,27 +53,29 @@ function draw_variable_content(::Val{Symbol("XfaEngine.Context.KaraboBridge")}, 
             Spinner("Fetching outputs...")
         elseif gui_state.zmq_outputs isa Exception
             ig.TextColored(ig.ImVec4(1, 0.4, 0.4, 1), sprint(showerror, gui_state.zmq_outputs))
-        elseif gui_state.zmq_outputs isa Vector && !isempty(gui_state.zmq_outputs)
-            # Sync combo selection with the current address parameter
-            current_address = params["address"].value
-            if !isempty(current_address)
-                found = findfirst(==(current_address), gui_state.zmq_outputs)
-                if !isnothing(found)
-                    gui_state.selected_output = Cint(found - 1)
+        elseif gui_state.zmq_outputs isa Vector
+            if !isempty(gui_state.zmq_outputs)
+                # Sync combo selection with the current address parameter
+                current_address = params["address"].value
+                if !isempty(current_address)
+                    found = findfirst(==(current_address), gui_state.zmq_outputs)
+                    if !isnothing(found)
+                        gui_state.selected_output = Cint(found - 1)
+                    end
                 end
-            end
 
-            ig.SetNextItemWidth(350)
-            idx = Ref(gui_state.selected_output)
-            if CopyableCombo("Output", gui_state.zmq_outputs, idx)
-                gui_state.selected_output = idx[]
-                new_address = gui_state.zmq_outputs[idx[] + 1]
-                address_param = params["address"]
-                change_parameter(Parameter(address_param.name, new_address))
-                @guiasync set_group_param(state[], name, "address", "\"$(new_address)\"")
+                ig.SetNextItemWidth(350)
+                idx = Ref(gui_state.selected_output)
+                if CopyableCombo("Output", gui_state.zmq_outputs, idx)
+                    gui_state.selected_output = idx[]
+                    new_address = gui_state.zmq_outputs[idx[] + 1]
+                    address_param = params["address"]
+                    change_parameter(Parameter(address_param.name, new_address))
+                    @guiasync set_group_param(state[], name, "address", "\"$(new_address)\"")
+                end
+            else
+                ig.Text("No ZMQ outputs found")
             end
-        elseif isempty(gui_state.zmq_outputs)
-            ig.Text("No ZMQ outputs found")
         end
 
         if !is_pending(client, gui_state.zmq_outputs_request)
