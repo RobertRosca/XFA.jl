@@ -11,6 +11,7 @@ include("imnodes.jl")
 using NaNStatistics: nanpctile
 using DimensionalData: DimensionalData as DD, DimVector, DimMatrix, DimArray, At, lookup
 using DataStructures: CircularBuffer
+using Printf: @sprintf
 include("plotting.jl")
 
 using LibSSH: LibSSH as ssh
@@ -18,9 +19,10 @@ using HTTP: HTTP, WebSockets
 using XfaEngine: EngineState, getavailableport, RoutingRule
 using Dates: Dates, unix2datetime, @dateformat_str
 using XfaEngine.Context: Parameter, OptionalDims, KaraboDevice
+using XfaEngine.ZfpWorkspaces: ZfpWorkspace, CompressedArray, decompress_array,
+    decompress_array!, allocate_array
 include("states.jl")
 
-using Printf: @sprintf
 using TOML: TOML
 using Sockets: Sockets
 using CRC32c: crc32c

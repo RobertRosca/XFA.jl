@@ -637,6 +637,24 @@ function store_variable_data!(client, variable::VariableData)
     data = variable.data
     name = variable.name
 
+    compression_ratio = NaN
+    received_bytes = data isa AbstractArray ? sizeof(data) : 0
+    if data isa CompressedArray
+        # Allocate fresh — the decompressed array is queued onto `store.updates`
+        # and read by GUI consumers later, so reusing one buffer per variable
+        # would let later trains overwrite a not-yet-consumed payload.
+        ws = get!(() -> ZfpWorkspace(), client.zfp_workspaces, name)
+        decompressed = decompress_array(ws, data)
+        received_bytes = sizeof(data.data) + (isnothing(data.nonfinite_mask) ? 0 : sizeof(data.nonfinite_mask))
+        compression_ratio = sizeof(decompressed) / received_bytes
+        variable = VariableData(; tid=variable.tid, name=variable.name, data=decompressed,
+                                subvariables=variable.subvariables,
+                                title=variable.title, x_axis=variable.x_axis, y_axis=variable.y_axis,
+                                xlabel=variable.xlabel, ylabel=variable.ylabel, unit=variable.unit,
+                                fixed_aspect=variable.fixed_aspect, update_rate=variable.update_rate)
+        data = decompressed
+    end
+
     # Unsubscribed array variables arrive as shape-only metadata. We keep a
     # placeholder array of the right type/shape so plot buttons and type
     # labels work, but skip the data-flow updates — real data only arrives
@@ -653,6 +671,8 @@ function store_variable_data!(client, variable::VariableData)
         end
         store.type = length(data.size) == 1 ? VariableType_Vector : VariableType_Array
         store.update_rate = variable.update_rate
+        store.compression_ratio = compression_ratio
+        store.received_bytes = received_bytes
         return
     end
 
@@ -713,6 +733,8 @@ function store_variable_data!(client, variable::VariableData)
     end
     push!(store.updates, (variable.tid, data, type))
     store.update_rate = variable.update_rate
+    store.compression_ratio = compression_ratio
+    store.received_bytes = received_bytes
 end
 
 function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothing)
@@ -996,20 +1018,50 @@ function set_remoterepl(state)
 end
 
 function send_subscriptions(client)
-    send(client, SetVariableSubscriptions(Set(keys(client.subscriptions))))
+    variables = Dict{String, Int}(name => sub.precision
+                                  for (name, sub) in client.subscriptions
+                                  if sub.active)
+    send(client, SetVariableSubscriptions(variables))
 end
 
-function subscribe_variable(state, name)
+# Update the requested zfp precision for a subscribed variable. Callers only
+# invoke this on a real change (e.g. InputInt edit), so we always send.
+function set_subscription_precision(state, name, precision::Int)
+    client = state.client
+    if isempty(name) || !haskey(client.subscriptions, name)
+        return
+    end
+    client.subscriptions[name].precision = precision
+    send_subscriptions(client)
+end
+
+function subscribe_variable(state, name; precision::Maybe{Int}=nothing)
     if isempty(name)
         return
     end
 
-    subscriptions = state.client.subscriptions
-    if !haskey(subscriptions, name)
-        subscriptions[name] = 1
-        send_subscriptions(state.client)
+    client = state.client
+    needs_send = false
+
+    if !haskey(client.subscriptions, name)
+        client.subscriptions[name] = SubscriptionState(; count=1,
+                                                       precision=something(precision, -1))
+        needs_send = true
     else
-        subscriptions[name] += 1
+        sub = client.subscriptions[name]
+        sub.count += 1
+        if !sub.active
+            sub.active = true
+            needs_send = true
+        end
+        if !isnothing(precision) && sub.precision != precision
+            sub.precision = precision
+            needs_send = true
+        end
+    end
+
+    if needs_send
+        send_subscriptions(client)
     end
 end
 
@@ -1019,10 +1071,10 @@ function unsubscribe_variable(state, name)
         return
     end
 
-    subscriptions = state.client.subscriptions
-    subscriptions[name] -= 1
-    if subscriptions[name] == 0
-        delete!(subscriptions, name)
+    sub = state.client.subscriptions[name]
+    sub.count -= 1
+    if sub.count == 0
+        sub.active = false
         send_subscriptions(state.client)
     end
 end

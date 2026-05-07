@@ -15,7 +15,9 @@ using DataStructures: CircularBuffer, capacity
 using FHist: bincounts, binedges
 
 using XfaEngine: XfaEngine, Context, KaraboBridge, Protocol, RoutingRule, match_rule,
-    filter_subscriptions, is_scalar_data, ArrayMetadata
+    build_client_view!, is_scalar_data, ArrayMetadata, EngineState
+using XfaEngine.ZfpWorkspaces: ZfpWorkspace, CompressedArray, compress_array,
+    decompress_array, decompress_array!, allocate_array, should_compress
 using XfaEngine.Context: @Variable, @karabo_str, VariableData, Dependency, DependencyKind,
     DepKind_Variable, DepKind_Subvariable, DepKind_Karabo, DepKind_Group, DepKind_GroupParameter,
     karabo_dependency, subvariable_dependency, group_dependency, group_parameter_dependency,
@@ -1671,45 +1673,54 @@ end
     @test is_scalar_data(fill(1.0))
     @test !is_scalar_data([1, 2, 3])
 
-    # Scalars always pass through; non-subscribed arrays are replaced with
-    # ArrayMetadata so the client still gets shape/type info.
+    state = EngineState()
+    cache() = Dict{String, Tuple{Int, VariableData}}()
+    sub(pairs::Pair{String, Int}...) = Dict{String, Int}(pairs...)
+
+    # Scalars always pass through. Non-compressible arrays (Int, length below
+    # the compression threshold) round-trip raw when subscribed, and become
+    # ArrayMetadata when not.
     scalar = VariableData(0, "s", 42)
     array = VariableData(0, "a", [1, 2, 3])
-    @test filter_subscriptions(scalar, Set{String}()) === scalar
-    f = filter_subscriptions(array, Set{String}())
+    @test build_client_view!(state, scalar, sub(), cache()) === scalar
+    f = build_client_view!(state, array, sub(), cache())
     @test f.data isa ArrayMetadata
     @test f.data.eltype === Int
     @test f.data.size == [3]
-    @test filter_subscriptions(array, Set(["a"])) === array
+    @test build_client_view!(state, array, sub("a" => -1), cache()) === array
 
     # Subvariables follow the same rule under their qualified name.
     parent = VariableData(; tid=0, name="p", data=[1, 2],
                           subvariables=Dict{String, Any}(
                               "scalar" => VariableData(0, "scalar", 1.5),
                               "arr" => VariableData(0, "arr", [4, 5])))
-    f = filter_subscriptions(parent, Set{String}())
+    f = build_client_view!(state, parent, sub(), cache())
     @test f.data isa ArrayMetadata
     @test keyset(f.subvariables) == Set(["scalar", "arr"])
     @test f.subvariables["scalar"].data == 1.5
     @test f.subvariables["arr"].data isa ArrayMetadata
 
-    f = filter_subscriptions(parent, Set(["p.arr"]))
+    f = build_client_view!(state, parent, sub("p.arr" => -1), cache())
     @test f.data isa ArrayMetadata
-    @test keyset(f.subvariables) == Set(["scalar", "arr"])
     @test f.subvariables["arr"].data == [4, 5]
 
-    f = filter_subscriptions(parent, Set(["p"]))
+    f = build_client_view!(state, parent, sub("p" => -1), cache())
     @test f.data == [1, 2]
-    @test keyset(f.subvariables) == Set(["scalar", "arr"])
     @test f.subvariables["arr"].data isa ArrayMetadata
 
-    # No subscriptions: parent and array subvar both reduced to metadata.
-    arr_only = VariableData(; tid=0, name="p", data=[1, 2],
-                            subvariables=Dict{String, Any}(
-                                "arr" => VariableData(0, "arr", [4, 5])))
-    f = filter_subscriptions(arr_only, Set{String}())
-    @test f.data isa ArrayMetadata
-    @test f.subvariables["arr"].data isa ArrayMetadata
+    # Compressible payload: a long enough Float array triggers ZFP. With two
+    # clients sharing the same precision the cache reuses the compressed view.
+    big = VariableData(; tid=0, name="big", data=randn(Float64, 600))
+    c = cache()
+    a = build_client_view!(state, big, sub("big" => -1), c)
+    b = build_client_view!(state, big, sub("big" => -1), c)
+    @test a.data isa CompressedArray
+    @test a === b
+    # A different precision recompresses and overwrites the cache slot.
+    d = build_client_view!(state, big, sub("big" => 8), c)
+    @test d.data isa CompressedArray
+    @test d !== a
+    @test c["big"][1] == 8
 end
 
 @testset "Serialization" begin
@@ -1753,6 +1764,86 @@ end
                                                             "bridge.manual_configuration" => Parameter("bridge.manual_configuration", false)),
                                        "dep_to_input" => Dict("xgm.intensity" => "bridge.stream"),
                                        "path" => "")
+end
+
+@testset "ZfpWorkspace" begin
+    ws = ZfpWorkspace()
+
+    @testset "should_compress" begin
+        @test should_compress(zeros(600))
+        @test should_compress(rand(UInt8, 500))
+        @test !should_compress(zeros(100))
+        @test !should_compress("string")
+        @test !should_compress(zeros(Bool, 600))
+    end
+
+    @testset "Float round-trip (all finite)" begin
+        for T in (Float32, Float64), shape in ((1000,), (40, 40))
+            arr = randn(T, shape)
+            ca = compress_array(ws, arr)
+            @test !ca.promoted && isnothing(ca.nonfinite_mask)
+            @test ca.original_eltype === T && Tuple(ca.shape) == shape
+            out = decompress_array(ws, ca)
+            @test eltype(out) === T && size(out) == shape
+            @test maximum(abs, arr - out) < 1e-2
+        end
+    end
+
+    @testset "Float round-trip with non-finites" begin
+        a = rand(Float32, 2000)
+        a[10] = NaN32
+        a[100] = Inf32
+        a[200] = -Inf32
+        a[1500] = NaN32
+
+        ca = compress_array(ws, a)
+        @test !isnothing(ca.nonfinite_mask)
+        out = decompress_array(ws, ca)
+        @test isnan(out[10]) && out[100] == Inf32 && out[200] == -Inf32 && isnan(out[1500])
+        fin = isfinite.(a)
+        @test maximum(abs, a[fin] - out[fin]) < 1e-2
+    end
+
+    # Int round-trip uses precision=0 (lossless) to exercise the
+    # promote/demote machinery; the default lossy precision=15 would zero
+    # out small integer values and obscure whether promotion is correct.
+    @testset "Low-bit int promote/demote" begin
+        for T in (Int8, UInt8, Int16, UInt16)
+            arr = T.(rand(0:50, 800))
+            ca = compress_array(ws, arr; precision=0)
+            @test ca.promoted && ca.original_eltype === T
+            out = decompress_array(ws, ca)
+            @test eltype(out) === T && out == arr
+        end
+    end
+
+    @testset "Native int (no promotion)" begin
+        arr = Int32.(rand(-100:100, 1000))
+        ca = compress_array(ws, arr; precision=0)
+        @test !ca.promoted && !ca.clamped
+        @test decompress_array(ws, ca) == arr
+    end
+
+    @testset "Native int out-of-range gets clamped" begin
+        mag = Int32(2)^30 - one(Int32)
+        arr = Int32[0, 1, -2, typemax(Int32), typemin(Int32), 100]
+        ca = compress_array(ws, arr; precision=0)
+        @test ca.clamped
+        out = decompress_array(ws, ca)
+        @test out == Int32[0, 1, -2, mag, -mag, 100]
+    end
+
+    @testset "decompress_array! into provided buffer" begin
+        arr = randn(Float64, 800)
+        ca = compress_array(ws, arr)
+        out = allocate_array(ca)
+        @test eltype(out) === Float64 && size(out) == size(arr)
+        decompress_array!(ws, out, ca)
+        @test maximum(abs, arr - out) < 1e-2
+
+        @test_throws ArgumentError decompress_array!(ws, zeros(Float32, 800), ca)
+        @test_throws DimensionMismatch decompress_array!(ws, zeros(801), ca)
+    end
 end
 
 end

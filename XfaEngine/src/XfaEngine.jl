@@ -1,5 +1,11 @@
 module XfaEngine
 
+# Capacity of the per-train variable channels (see Context.variable_channel).
+# Used as the depth of the Karabo recv buffer pool too, so a recycled buffer
+# has had a full window of trains to drain through every consumer.
+const VARIABLE_CHANNEL_SIZE = 100
+
+include("zfp_workspace.jl")
 include("karabo_bridge.jl")
 include("context.jl")
 
@@ -24,6 +30,7 @@ import RemoteREPL
 using DimensionalData: DimArray
 
 using .Protocol
+using .ZfpWorkspaces: ZfpWorkspace, CompressedArray, compress_array, should_compress
 import .Context: XfaContext, VariableData, ArrayMetadata
 
 
@@ -59,8 +66,9 @@ end
     # heartbeat_task::Task
 
     # Fully-qualified names of array-valued variables this client wants
-    # forwarded. Updated via `SetVariableSubscriptions`.
-    subscriptions::Set{String} = Set{String}()
+    # forwarded, mapped to the requested zfp precision (-1 for default).
+    # Updated via `SetVariableSubscriptions`.
+    subscriptions::Dict{String, Int} = Dict{String, Int}()
 end
 
 @kwdef mutable struct EngineState
@@ -77,6 +85,11 @@ end
 
     ctx::XfaContext = XfaContext()
 
+    # One zfp workspace per qualified variable name. Sized to the variable's
+    # data on first use and reused across trains; switching precision on the
+    # same variable just runs zfp again over the same buffers.
+    zfp_workspaces::Dict{String, ZfpWorkspace} = Dict{String, ZfpWorkspace}()
+
     channel_stats_task::Union{Task, Nothing} = nothing
 
     stop_event::Base.Event = Base.Event()
@@ -89,57 +102,111 @@ current_engine_state::Union{EngineState, Nothing} = nothing
 # forwarded; multi-element arrays must be opted into via subscription.
 is_scalar_data(x) = !(x isa AbstractArray) || ndims(x) == 0
 
-# Strip a non-subscribed variable down to identity + shape. The client only
-# needs this much to render plot buttons / type labels; the heavy fields
-# (title, axis labels, etc.) are dropped to save bandwidth.
-function metadata_only(variable::VariableData; subvariables=variable.subvariables)
-    VariableData(; tid=variable.tid, name=variable.name,
-                 data=ArrayMetadata(eltype(variable.data), collect(size(variable.data))),
-                 subvariables, update_rate=variable.update_rate)
-end
+# Sentinel precision used to cache the metadata-only view of a non-subscribed
+# array payload. Real precisions are >= 0 (and -1 maps to the per-eltype
+# default inside compress_array), so this never collides with a real client request.
+const METADATA_PRECISION = typemin(Int)
 
-# Build a per-client view of a variable: parent and subvariables that are
-# scalar or subscribed pass through unchanged; non-subscribed array payloads
-# are replaced with `ArrayMetadata`.
-function filter_subscriptions(variable::VariableData, subscriptions::Set{String})
-    parent_keep = is_scalar_data(variable.data) || variable.name in subscriptions
+# Build (or fetch from `cache`) the per-client view of a single (sub)variable:
+# scalars pass through, non-subscribed arrays become ArrayMetadata, subscribed
+# compressible arrays become a CompressedArray at the requested precision, and
+# subscribed non-compressible arrays pass through raw. The cache stores at most
+# one (precision, VariableData) per qualified name; if a client asks for a
+# different precision than the cached one we just recompress and overwrite.
+function client_view_for(state::EngineState, variable::VariableData, qualified::String,
+                         subscriptions::Dict{String, Int},
+                         cache::Dict{String, Tuple{Int, VariableData}})
+    data = variable.data
+    requested = get(subscriptions, qualified, nothing)
 
-    new_subvars = if isempty(variable.subvariables)
-        variable.subvariables
+    precision = if is_scalar_data(data)
+        nothing
+    elseif isnothing(requested)
+        METADATA_PRECISION
+    elseif should_compress(data)
+        Int(requested)
     else
-        kept = Dict{String, Any}()
-        for (subname, subvar) in variable.subvariables
-            qualified = "$(variable.name).$(subname)"
-            if is_scalar_data(subvar.data) || qualified in subscriptions
-                kept[subname] = subvar
-            else
-                kept[subname] = metadata_only(subvar)
-            end
-        end
-        kept
+        nothing
     end
 
-    if parent_keep && new_subvars === variable.subvariables
+    if !isnothing(precision)
+        hit = get(cache, qualified, nothing)
+        if !isnothing(hit) && hit[1] == precision
+            return hit[2]
+        end
+    end
+
+    new_data = if precision == METADATA_PRECISION
+        ArrayMetadata(eltype(data), collect(size(data)))
+    elseif !isnothing(precision)
+        ws = get!(() -> ZfpWorkspace(), state.zfp_workspaces, qualified)
+        compress_array(ws, data; precision)
+    else
+        data
+    end
+
+    view = if precision == METADATA_PRECISION
+        # Strip down to identity + shape; keep update_rate / subvariables but
+        # drop labels, axes etc. since the client only renders metadata.
+        VariableData(; tid=variable.tid, name=variable.name, data=new_data,
+                     subvariables=variable.subvariables, update_rate=variable.update_rate)
+    elseif new_data === data
+        variable
+    else
+        VariableData(; tid=variable.tid, name=variable.name, data=new_data,
+                     subvariables=variable.subvariables,
+                     title=variable.title, x_axis=variable.x_axis, y_axis=variable.y_axis,
+                     xlabel=variable.xlabel, ylabel=variable.ylabel, unit=variable.unit,
+                     fixed_aspect=variable.fixed_aspect, update_rate=variable.update_rate)
+    end
+
+    if !isnothing(precision)
+        cache[qualified] = (precision, view)
+    end
+    return view
+end
+
+# Build a TrainData payload for one client by composing per-(sub)variable views
+# from the shared cache. Falls through to the parent's existing subvariables
+# dict when nothing actually changed for any subvar (avoids an allocation).
+function build_client_view!(state::EngineState, variable::VariableData,
+                            subscriptions::Dict{String, Int},
+                            cache::Dict{String, Tuple{Int, VariableData}})
+    parent_view = client_view_for(state, variable, variable.name, subscriptions, cache)
+
+    if isempty(variable.subvariables)
+        return parent_view
+    end
+
+    new_subvars = Dict{String, Any}()
+    any_changed = false
+    for (subname, subvar) in variable.subvariables
+        qualified = "$(variable.name).$(subname)"
+        sub_view = client_view_for(state, subvar, qualified, subscriptions, cache)
+        any_changed |= sub_view !== subvar
+        new_subvars[subname] = sub_view
+    end
+
+    if !any_changed && parent_view === variable
         return variable
     end
 
-    if !parent_keep
-        return metadata_only(variable; subvariables=new_subvars)
-    end
-
-    return VariableData(; tid=variable.tid, name=variable.name, data=variable.data,
+    return VariableData(; tid=parent_view.tid, name=parent_view.name, data=parent_view.data,
                         subvariables=new_subvars,
-                        title=variable.title, x_axis=variable.x_axis, y_axis=variable.y_axis,
-                        xlabel=variable.xlabel, ylabel=variable.ylabel, unit=variable.unit,
-                        fixed_aspect=variable.fixed_aspect, update_rate=variable.update_rate)
+                        title=parent_view.title, x_axis=parent_view.x_axis,
+                        y_axis=parent_view.y_axis, xlabel=parent_view.xlabel,
+                        ylabel=parent_view.ylabel, unit=parent_view.unit,
+                        fixed_aspect=parent_view.fixed_aspect, update_rate=parent_view.update_rate)
 end
 
 function forward_output(state::EngineState, stream_output)
+    cache = Dict{String, Tuple{Int, VariableData}}()
     for data in stream_output
+        empty!(cache)
         for (id, client) in state.clients
-            filtered = filter_subscriptions(data, client.subscriptions)
             try
-                Protocol.server_send(client.websocket, TrainData([filtered]))
+                view = build_client_view!(state, data, client.subscriptions, cache)
+                Protocol.server_send(client.websocket, TrainData([view]))
             catch ex
                 @warn "Couldn't forward data to client '$(id)'" exception=ex
             end

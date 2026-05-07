@@ -57,15 +57,19 @@ end
 
 struct GetRoutingRules <: AbstractMessage end
 
+struct GetRemapRules <: AbstractMessage end
+
 struct SetRoutingRules <: AbstractMessage
     rules::Vector{RoutingRule}
 end
 
 # Tells the engine which array-valued variables this client wants forwarded.
 # Scalar variables are always sent; everything else is suppressed unless its
-# fully-qualified name (e.g. "var", "var.subvar") appears in this list.
+# fully-qualified name (e.g. "var", "var.subvar") is a key in this dict.
+# The value is the requested zfp precision for the compressed payload; -1
+# means "use the engine default".
 struct SetVariableSubscriptions <: AbstractMessage
-    variables::Set{String}
+    variables::Dict{String, Int}
 end
 
 struct Start <: AbstractMessage end

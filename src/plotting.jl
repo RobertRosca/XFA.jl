@@ -587,6 +587,30 @@ function apply_autoscale(plot)
     end
 end
 
+# Compression settings checkbox + (when expanded) zfp precision input, ratio,
+# and throughput readout. Reusable across plot window types — `id` namespaces
+# the imgui widgets, `name` is the qualified variable name to retune.
+function draw_compression_settings(id, name, show_settings::Ref{Bool},
+                                   precision::Ref{Cint}, store)
+    ig.Checkbox("Compression settings##$(id)", show_settings)
+    if show_settings[]
+        ig.SetNextItemWidth(120)
+        if ig.InputInt("zfp precision##$(id)", precision)
+            set_subscription_precision(state[], name, Int(precision[]))
+        end
+        if isfinite(store.compression_ratio)
+            ig.SameLine()
+            ig.AlignTextToFramePadding()
+            ig.TextDisabled(@sprintf("zfp: %.1fx", store.compression_ratio))
+        end
+        if store.received_bytes > 0
+            ig.SameLine()
+            ig.AlignTextToFramePadding()
+            ig.TextDisabled(@sprintf("%.1f MB/s @ 10Hz", store.received_bytes * 10 / 1e6))
+        end
+    end
+end
+
 function draw_plot(plot::Plot, store::Nothing, was_updated)
     ig.SetNextWindowSize((800, 500), ig.ImGuiCond_FirstUseEver)
 
@@ -721,6 +745,13 @@ function draw_plot(plot::Plot, store, was_updated)
             if data isa AbstractMatrix
                 ig.SameLine()
                 ig.Checkbox("Fixed aspect", plot.fixed_aspect)
+            end
+
+            if !is_scalar
+                ig.SameLine()
+                draw_compression_settings(plot.id, plot.name,
+                                          plot.show_compression_settings,
+                                          plot.precision, store)
             end
         end
     end

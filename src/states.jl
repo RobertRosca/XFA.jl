@@ -169,6 +169,14 @@ const SCALAR_BUFFER_CAPACITY = 10_000
     # Processing rate (Hz) reported by the engine.
     update_rate::Float64 = 0.0
 
+    # Compression ratio (uncompressed / compressed bytes) of the most recent
+    # payload. NaN when the variable arrived uncompressed.
+    compression_ratio::Float64 = NaN
+
+    # Size in bytes of the most recent array payload on the wire — the
+    # compressed size for compressed payloads, otherwise sizeof(data).
+    received_bytes::Int = 0
+
     # Metadata from VariableData
     title::String = ""
     x_axis::Maybe{AbstractVector} = nothing
@@ -240,6 +248,16 @@ end
 
 EngineLog(message::String, extra_details::Maybe{String}=nothing) = EngineLog(time(), message, extra_details)
 
+# Per-variable subscription state. `count` tracks open plots referencing the
+# variable; when it drops to zero we flip `active` off (so the engine stops
+# streaming) but keep the entry around to remember the user's chosen
+# `precision` for the next time a plot of this variable is opened.
+@kwdef mutable struct SubscriptionState
+    count::Int = 0
+    precision::Int = -1
+    active::Bool = true
+end
+
 @kwdef mutable struct ClientState
     client_id::String = ""
     worker_info::Dict = Dict()
@@ -307,11 +325,14 @@ EngineLog(message::String, extra_details::Maybe{String}=nothing) = EngineLog(tim
     plot_counter::Int = 0
     plots::Vector{Union{Plot, CorrelationPlot}} = Union{Plot, CorrelationPlot}[]
 
-    # Variable subscriptions, keyed by fully-qualified name. The value counts
-    # how many plots currently display that variable; entries are removed when
-    # the count drops to zero. The set of keys is what gets sent to the engine
-    # via SetVariableSubscriptions.
-    subscriptions::Dict{String, Int} = Dict{String, Int}()
+    # Variable subscriptions, keyed by fully-qualified name. Entries are
+    # removed when the open-plot count drops to zero. The keys (and each
+    # entry's precision) get sent to the engine via SetVariableSubscriptions.
+    subscriptions::Dict{String, SubscriptionState} = Dict{String, SubscriptionState}()
+
+    # One zfp workspace per qualified variable name, reused across trains so
+    # the decompression scratch buffers don't get resized on every payload.
+    zfp_workspaces::Dict{String, ZfpWorkspace} = Dict{String, ZfpWorkspace}()
 
     # Engine log messages
     engine_logs::Vector{EngineLog} = EngineLog[]
