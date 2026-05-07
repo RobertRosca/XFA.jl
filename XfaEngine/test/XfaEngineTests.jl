@@ -524,6 +524,10 @@ end
     # Round trip
     @test karabo_dependency(string(karabo"MID//foo.bar")) == karabo"MID//foo.bar"
     @test karabo_dependency(string(karabo"SA2//foo:output[bar]")) == karabo"SA2//foo:output[bar]"
+
+    # Proxy
+    @test karabo"MID//foo.bar@px" == karabo_dependency("MID", "foo", "bar", "px")
+    @test karabo_dependency(string(karabo"MID//foo:output[bar]@px")) == karabo"MID//foo:output[bar]@px"
 end
 
 # Helper module that defines variables for reference tests, defined in

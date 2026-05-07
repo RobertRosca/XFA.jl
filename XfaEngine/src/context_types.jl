@@ -22,6 +22,7 @@ end
     topic::Union{String, Nothing} = nothing
     source::Union{String, Nothing} = nothing
     property::Union{String, Nothing} = nothing
+    proxy::Union{String, Nothing} = nothing
 
     # Subvariable-specific
     parent::Union{String, Nothing} = nothing
@@ -84,32 +85,46 @@ const fast_data_re = r"^(\S+):(\S+)\[(\S+)\]$"
 const topic_prefix_re = r"^(\w+)//(.+)$"
 
 # Compute the string representation for a Karabo dependency
-function _karabo_dep_string(topic, source, property)
+function _karabo_dep_string(topic, source, property, proxy=nothing)
     device_str = if occursin(':', source)
         "$(source)[$(property)]"
     else
         "$(source).$(property)"
     end
 
-    if isnothing(topic)
-        return device_str
-    else
-        return "$(topic)//$(device_str)"
-    end
+    base = isnothing(topic) ? device_str : "$(topic)//$(device_str)"
+    return isnothing(proxy) ? base : "$(base)@$(proxy)"
+end
+
+# Source string for a Karabo dep as expected by the TrainMatcher's `sources`
+# field: `DEVICE:output` for fast/pipeline data, `DEVICE.property` for slow data.
+function trainmatcher_dep_string(dep::Dependency)
+    base = occursin(':', dep.source) ? dep.source : "$(dep.source).$(dep.property)"
+    isnothing(dep.proxy) ? base : "$(base)@$(dep.proxy)"
 end
 
 # Karabo dependency constructors
-karabo_dependency(source::AbstractString, property::AbstractString) = karabo_dependency(nothing, source, property)
+karabo_dependency(source::AbstractString, property::AbstractString) = karabo_dependency(nothing, source, property, nothing)
 
-function karabo_dependency(topic::Union{AbstractString, Nothing}, source::AbstractString, property::AbstractString)
-    name = _karabo_dep_string(topic, source, property)
+function karabo_dependency(topic::Union{AbstractString, Nothing}, source::AbstractString, property::AbstractString,
+                           proxy::Union{AbstractString, Nothing}=nothing)
+    name = _karabo_dep_string(topic, source, property, proxy)
     Dependency(kind=DepKind_Karabo, name=name,
                topic=isnothing(topic) ? nothing : String(topic),
-               source=String(source), property=String(property))
+               source=String(source), property=String(property),
+               proxy=isnothing(proxy) ? nothing : String(proxy))
 end
 
 function karabo_dependency(str::AbstractString)
     topic = nothing
+    proxy = nothing
+
+    proxy_idx = findlast('@', str)
+    if !isnothing(proxy_idx)
+        proxy = str[proxy_idx+1:end]
+        str = str[1:proxy_idx-1]
+    end
+
     m = match(topic_prefix_re, str)
     if !isnothing(m)
         topic = m.captures[1]
@@ -118,12 +133,12 @@ function karabo_dependency(str::AbstractString)
 
     m = match(slow_data_re, str)
     if !isnothing(m)
-        return karabo_dependency(topic, m.captures[1], m.captures[2])
+        return karabo_dependency(topic, m.captures[1], m.captures[2], proxy)
     end
 
     m = match(fast_data_re, str)
     if !isnothing(m)
-        return karabo_dependency(topic, "$(m.captures[1]):$(m.captures[2])", m.captures[3])
+        return karabo_dependency(topic, "$(m.captures[1]):$(m.captures[2])", m.captures[3], proxy)
     end
 
     throw(ArgumentError("'$(str)' is not a valid Karabo device property"))
