@@ -728,7 +728,7 @@ end
 function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50)
     ctx.stream_output = variable_channel()
     ctx.events_channel = RemoteChannel(() -> Channel(100))
-    ctx.output_forwarder_task = Threads.@spawn ctx.forwarder(ctx.stream_output)
+    ctx.output_forwarder_task = Threads.@spawn :samepool ctx.forwarder(ctx.stream_output)
     errormonitor(ctx.output_forwarder_task)
 
     global current_ctx = ctx
@@ -772,7 +772,7 @@ function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50)
         ctx.input_variable_channels[name] = downstream_neighbours
 
         ctx.input_rates[name] = 0.0
-        ctx.input_variables_tasks[name] = Threads.@spawn stream_input(name, ctx.input_channels[name], downstream_neighbours, ctx.input_rates)
+        ctx.input_variables_tasks[name] = Threads.@spawn :samepool stream_input(name, ctx.input_channels[name], downstream_neighbours, ctx.input_rates)
         errormonitor(ctx.input_variables_tasks[name])
     end
 
@@ -790,7 +790,7 @@ function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50)
         end
         ctx.external_dependency_channels[dep_name] = downstream_neighbours
 
-        ctx.external_dependency_tasks[dep_name] = Threads.@spawn stream_external_dependency(dep_name, input_neighbour, downstream_neighbours)
+        ctx.external_dependency_tasks[dep_name] = Threads.@spawn :samepool stream_external_dependency(dep_name, input_neighbour, downstream_neighbours)
         errormonitor(ctx.external_dependency_tasks[dep_name])
     end
 
@@ -845,7 +845,7 @@ function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50)
     end
 
     # Start the watcher task
-    ctx.watcher_task = Threads.@spawn watch_context(ctx)
+    ctx.watcher_task = Threads.@spawn :samepool watch_context(ctx)
     errormonitor(ctx.watcher_task)
 
     ctx.is_running[] = true
@@ -913,12 +913,12 @@ function run(f::Function, ctx::XfaContext; timeout=10, kwargs...)
     task = nothing
     timer = Timer(timeout) do _
         @warn "Function timed out, killing it"
-        Threads.@spawn Base.throwto(task, InterruptException())
+        Threads.@spawn :samepool Base.throwto(task, InterruptException())
     end
 
     parent_testset = get(task_local_storage(), :__BASETESTNEXT__, [])
     try
-        task = Threads.@spawn begin
+        task = Threads.@spawn :samepool begin
             # Set the parent testset so that all @test's get recorded properly
             task_local_storage(:__BASETESTNEXT__, parent_testset)
             f()

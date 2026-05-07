@@ -410,7 +410,7 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
         if msg.enable
             @info "Starting RemoteREPL"
             port, state.remoterepl_server = Sockets.listenany(27754)
-            state.remoterepl_task = Threads.@spawn RemoteREPL.serve_repl(state.remoterepl_server)
+            state.remoterepl_task = Threads.@spawn :samepool RemoteREPL.serve_repl(state.remoterepl_server)
             Protocol.server_send(ws, RemoteReplState(true, Int(port)); reply_to)
         else
             @info "Stopping RemoteREPL"
@@ -538,10 +538,10 @@ function main(stop_event=Base.Event(); info_path=nothing, wait=true)
 
     @info "Wrote worker information to $(info_path)"
 
-    state.channel_stats_task = Threads.@spawn broadcast_channel_stats(state)
+    state.channel_stats_task = Threads.@spawn :interactive broadcast_channel_stats(state)
     errormonitor(state.channel_stats_task)
 
-    state.stop_task = Threads.@spawn try
+    state.stop_task = Threads.@spawn :interactive try
         Base.wait(state.stop_event)
     catch ex
         if ex isa InterruptException

@@ -100,7 +100,7 @@ end
     # the output channel is closed while we're stuck waiting for the next bridge
     # message.
     bridge_msgs = Channel(10)
-    input_task = Threads.@spawn try
+    input_task = Threads.@spawn :samepool try
         while isopen(bridge_msgs)
             # take!() may throw an exception when the client is closed
             local msg
@@ -124,7 +124,7 @@ end
     errormonitor(input_task)
     bind(bridge_msgs, input_task)
 
-    output_task = Threads.@spawn for msg in bridge_msgs
+    output_task = Threads.@spawn :samepool for msg in bridge_msgs
         data, metadata = msg
         tid = first(values(metadata))["timestamp.tid"]
 

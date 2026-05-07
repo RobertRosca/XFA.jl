@@ -48,7 +48,7 @@ mutable struct ThreadsafeSocket
 
     function ThreadsafeSocket(socket; buffer_size=100)
         self = new(socket, Channel{IORequest}(buffer_size))
-        handler = Threads.@spawn handle_threadsafesocket(self)
+        handler = Threads.@spawn :samepool handle_threadsafesocket(self)
         self.handler = handler
         errormonitor(handler)
 
@@ -272,7 +272,7 @@ function startbridge(server::KaraboBridgeServer)
     end
 
     lock(start_condition)
-    server.server_task = Threads.@spawn begin
+    server.server_task = Threads.@spawn :samepool begin
         @lock start_condition notify(start_condition)
 
         fake_tid = 0
