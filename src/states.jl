@@ -184,7 +184,7 @@ const SCALAR_BUFFER_CAPACITY = 10_000
     xlabel::String = ""
     ylabel::String = ""
     unit::Maybe{String} = nothing
-    fixed_aspect::Bool = false
+    fixed_aspect::Bool = true
 end
 
 struct LinkInfo
