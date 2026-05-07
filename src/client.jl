@@ -613,6 +613,8 @@ function schema_property_names(schema::Dict)
     return DeviceProperties(sorted_slow, sorted_fast)
 end
 
+const NDARRAY_PROPERTIES = ("data", "shape", "type", "isBigEndian")
+
 function collect_properties!(props, prefix, node::Dict, target::PropertyList=props.slow)
     for (key, value) in node
         path = isempty(prefix) ? key : "$(prefix).$(key)"
@@ -625,6 +627,11 @@ function collect_properties!(props, prefix, node::Dict, target::PropertyList=pro
             elseif haskey(value, "noInputShared") && haskey(value, "schema")
                 pipeline_props = get!(props.fast, path, PropertyList())
                 collect_properties!(props, "", value["schema"], pipeline_props)
+            elseif issetequal(keys(value), NDARRAY_PROPERTIES)
+                push!(target.names, path)
+                push!(target.displayed_names, path)
+                push!(target.descriptions, "")
+                push!(target.value_types, "NDArray")
             else
                 collect_properties!(props, path, value, target)
             end
