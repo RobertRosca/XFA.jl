@@ -297,6 +297,9 @@ mutable struct GPUHeatmap
     # Reusable buffer for data that needs conversion (e.g. Float64 → Float32).
     # Avoids allocating a new array every frame.
     convert_buf::Vector{UInt8}
+    # Strided-sample scratch for approximate 1st/99th percentile estimation,
+    # avoiding a full copy + sort of the input every frame.
+    sample_buf::Vector{Float64}
     # Cached scale limits for the colorbar (1st/99th percentile)
     scale_min::Float64
     scale_max::Float64
@@ -315,7 +318,7 @@ function GPUHeatmap()
     glGenFramebuffers(1, fbo_ref)
     fbo = fbo_ref[]
 
-    return GPUHeatmap(data_tex, output_tex, fbo, 0, 0, false, UInt8[], 0.0, 1.0)
+    return GPUHeatmap(data_tex, output_tex, fbo, 0, 0, false, UInt8[], Float64[], 0.0, 1.0)
 end
 
 function destroy!(h::GPUHeatmap)
@@ -419,6 +422,35 @@ function upload_data!(h::GPUHeatmap, data::AbstractMatrix)
     end
 end
 
+# Approximate (p1, p99) of `data` via strided sampling (every 10th element for
+# inputs of >=1000 elements, non-finite values dropped) into `buf`, then two
+# quickselects sharing the partition. Returns `(0.0, 1.0)` if no finite samples;
+# always returns finite values.
+function sampled_pctile!(buf::Vector{Float64}, data::AbstractMatrix)
+    stride = length(data) < 1000 ? 1 : 10
+    resize!(buf, cld(length(data), stride))
+
+    n_valid = 0
+    @inbounds for i in 1:stride:length(data)
+        x = Float64(data[i])
+        if isfinite(x)
+            n_valid += 1
+            buf[n_valid] = x
+        end
+    end
+
+    if n_valid == 0
+        return (0.0, 1.0)
+    end
+
+    v = @view buf[1:n_valid]
+    k1 = clamp(round(Int, 0.01 * (n_valid - 1)) + 1, 1, n_valid)
+    k99 = clamp(round(Int, 0.99 * (n_valid - 1)) + 1, 1, n_valid)
+    p1 = partialsort!(v, k1)
+    p99 = k99 > k1 ? partialsort!(@view(v[k1+1:end]), k99 - k1) : p1
+    return (p1, p99)
+end
+
 """
 Render the colormapped heatmap into the output texture via the FBO. Binds the
 data texture (unit 0) and colormap texture (unit 1), draws a fullscreen quad
@@ -478,23 +510,28 @@ end
 
 # --- Plot struct with optional GPU heatmap ---
 
-mutable struct Plot
+@kwdef mutable struct Plot
     const name::String
     const id::String
-    const open::Ref{Bool}
-    const autoscale_x::Ref{Bool}
-    const autoscale_y::Ref{Bool}
-    const fixed_aspect::Ref{Bool}
+    const open::Ref{Bool} = Ref(true)
+    const autoscale_x::Ref{Bool} = Ref(true)
+    const autoscale_y::Ref{Bool} = Ref(true)
+    const fixed_aspect::Ref{Bool} = Ref(true)
+    const show_compression_settings::Ref{Bool} = Ref(false)
+    const precision::Ref{Cint} = Ref(Cint(-1))
 
-    gpu_heatmap::Union{Nothing, GPUHeatmap}
-    dock_id::UInt32
+    gpu_heatmap::Union{Nothing, GPUHeatmap} = nothing
+    dock_id::UInt32 = 0
 end
 
 Plot(name, counter::Int) = Plot(name, "$(name)##plot-$(counter)")
 
 function Plot(name, id::String, dock_id = 0)
-    subscribe_variable(state[], name)
-    Plot(name, id, Ref(true), Ref(true), Ref(true), Ref(true), nothing, UInt32(dock_id))
+    subscriptions = state[].client.subscriptions
+    precision = haskey(subscriptions, name) ? subscriptions[name].precision : -1
+    plot = Plot(; name, id, dock_id=UInt32(dock_id), precision=Ref(Cint(precision)))
+    subscribe_variable(state[], name; precision)
+    plot
 end
 
 function Base.close(plot::Plot)
@@ -683,10 +720,7 @@ function draw_plot(plot::Plot, store, was_updated)
 
             if was_updated || needs_initial_upload
                 upload_data!(gpu, data)
-                dmin = nanpctile(data, 1)
-                dmin = !isfinite(dmin) ? 1.0 : dmin
-                dmax = nanpctile(data, 99)
-                dmax = !isfinite(dmax) ? 1.0 : dmax
+                dmin, dmax = sampled_pctile!(gpu.sample_buf, data)
                 gpu.scale_min = dmin
                 gpu.scale_max = dmax
                 render_colormapped!(gpu, ctx, dmin, dmax)

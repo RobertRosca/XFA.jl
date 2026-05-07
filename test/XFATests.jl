@@ -372,6 +372,31 @@ end
     @test fmt("pos") == "MID_EXP/MOTOR/1.pos"
 end
 
+@testset "sampled_pctile!" begin
+    buf = Float64[]
+
+    # Small array (<1000): stride=1, picks the 2nd and 99th order statistics
+    small = reshape(collect(1.0:100.0), 10, 10)
+    @test XFA.sampled_pctile!(buf, small) == (2.0, 99.0)
+
+    # Large array (>=1000): strided, but a constant matrix gives exact result
+    large = fill(7.0, 100, 100)
+    @test XFA.sampled_pctile!(buf, large) == (7.0, 7.0)
+
+    # Mixed finite + NaN/Inf: non-finite values are dropped
+    mixed = [1.0 NaN Inf; 2.0 -Inf 99.0; 50.0 NaN 100.0]
+    p1, p99 = XFA.sampled_pctile!(buf, mixed)
+    @test isfinite(p1) && isfinite(p99)
+    @test p1 == 1.0 && p99 == 100.0
+
+    # All non-finite: fall back to (0.0, 1.0), still finite
+    nonfinite = [NaN Inf; -Inf NaN]
+    @test XFA.sampled_pctile!(buf, nonfinite) == (0.0, 1.0)
+
+    # Empty input: same fallback
+    @test XFA.sampled_pctile!(buf, Matrix{Float64}(undef, 0, 0)) == (0.0, 1.0)
+end
+
 @testset "GUI" begin
     config_dir = mktempdir()
     test_engine = te.CreateContext(; exit_on_completion=true)
