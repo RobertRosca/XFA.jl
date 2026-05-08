@@ -114,7 +114,23 @@ function draw_parameter_widget(name, param::Parameter{Int})
 end
 
 function draw_parameter_widget(name, param::Parameter{String})
-    SafeInputText(name; current_text=param.value)
+    edited, new_text = SafeInputText("##$(name)"; current_text=param.value)
+    if edited && is_group_param(state[].client, param.name)
+        state[].client.pending_source_edit = param.name
+    end
+    return edited, new_text
+end
+
+# True if `param_name` is a fully-qualified "<group>.<field>" name belonging to
+# a group node in the current context.
+function is_group_param(client, param_name::String)
+    dot = findfirst('.', param_name)
+    if isnothing(dot)
+        return false
+    end
+    group_name = param_name[1:dot-1]
+    var_data = get(client.context.context_state, group_name, nothing)
+    return !isnothing(var_data) && get(var_data, "type", nothing) === :group
 end
 
 function draw_parameter_widget(name, param::Parameter{Vector{String}})
@@ -228,11 +244,51 @@ function get_variable_typeinfo(name)
     variable_data = state[].client.variable_data
     if haskey(variable_data, name)
         data = variable_data[name].data
-        T = eltype(data)
-        return "$T$(size(data))"
+        if data isa ArrayMetadata
+            return "$(data.eltype)$(Tuple(data.size))"
+        else
+            T = eltype(data)
+            return "$T$(size(data))"
+        end
     else
         return ""
     end
+end
+
+# Number of dimensions of the array (or array metadata) backing a variable, or
+# nothing for non-array data (scalars).
+function variable_ndims(name)
+    variable_data = state[].client.variable_data
+    if !haskey(variable_data, name)
+        return nothing
+    end
+    data = variable_data[name].data
+    if data isa ArrayMetadata
+        return length(data.size)
+    elseif data isa CircularBuffer
+        return nothing
+    else
+        return ndims(data)
+    end
+end
+
+# Plot button that's disabled with a tooltip when the variable has more than
+# two dimensions. Returns true on click. `button` is the imgui button function
+# to use (e.g. ig.Button or ig.SmallButton).
+function plot_button(label, name; button=ig.Button)
+    nd = variable_ndims(name)
+    too_many_dims = !isnothing(nd) && nd > 2
+    if too_many_dims
+        ig.BeginDisabled()
+    end
+    clicked = button(label)
+    if too_many_dims
+        ig.EndDisabled()
+        if ig.IsItemHovered(ig.ImGuiHoveredFlags_AllowWhenDisabled)
+            ig.SetTooltip("Plotting arrays with more than 2 dimensions is not supported")
+        end
+    end
+    return clicked
 end
 
 function clear_variables()
@@ -336,7 +392,8 @@ function draw_variable(name, var_data)
     ig.PushID(name)
     ImNodes.BeginNode(var_data["id"])
 
-    disable_node = client.context.pipeline_status ∉ (PipelineStatus_Stopped, PipelineStatus_Started)
+    disable_node = client.context.pipeline_status ∉ (PipelineStatus_Stopped, PipelineStatus_Started) ||
+                   !isnothing(client.pending_parameter_change)
     @Disabled disable_node begin
         # Draw titlebar
         ImNodes.BeginNodeTitleBar()
@@ -381,7 +438,13 @@ function draw_variable(name, var_data)
             end
             edited, new_dep = draw_dep_editor("dep-$(dep_id)", dep, dep_id; variable_name=name)
             if edited
-                @guiasync rename_dep(state[], name, arg_name, dep, new_dep)
+                # For group nodes the kwarg in the constructor uses the group
+                # struct field name, not the @Variable's arg name.
+                target_arg = arg_name
+                if var_data["type"] == :group
+                    target_arg = get(var_data["dep_field_names"], dep_id, arg_name)
+                end
+                @guiasync rename_dep(state[], name, target_arg, dep, new_dep)
             end
             ImNodes.EndInputAttribute()
         end
@@ -459,7 +522,7 @@ function draw_variable(name, var_data)
                     typestr = get_variable_typeinfo(pp.name)
                     if !isempty(typestr)
                         ig.SameLine()
-                        if ig.SmallButton("$(typestr)$(pp.tree_id_suffix)_plot")
+                        if plot_button("$(typestr)$(pp.tree_id_suffix)_plot", pp.name; button=ig.SmallButton)
                             push!(client.plots, Plot(pp.name, client.plot_counter))
                             client.plot_counter += 1
                         end

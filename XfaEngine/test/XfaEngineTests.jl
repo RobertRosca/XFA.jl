@@ -223,9 +223,36 @@ end
                 @test haskey(msg.info["dag"], "x")
             end
 
-            # Test ChangeParameter
+            # Test ChangeParameter — engine should ack and then broadcast the
+            # new value back so all clients can sync.
             Protocol.client_send(ws, Protocol.ChangeParameter(Parameter("p", 1)))
-            @test Protocol.receive(ws).msg isa Protocol.Ack
+            ack = Protocol.receive(ws).msg
+            @test ack isa Protocol.Ack
+            @test isnothing(ack.error)
+            changed = Protocol.receive(ws).msg
+            @test changed isa Protocol.ParameterChanged
+            @test changed.parameter.name == "p"
+            @test changed.parameter.value == 1
+
+            # A failing update_handler must surface as Ack(error) and not emit
+            # a ParameterChanged broadcast.
+            mktemp() do path, io
+                write(path, """
+                            p = Parameter(0) do v
+                                error("boom")
+                            end
+                            @Variable x -> karabo"foo.bar"
+                            """)
+                Protocol.client_send(ws, Protocol.LoadContext(path))
+                msg = nothing
+                while !(msg isa Protocol.ContextInfo); msg = Protocol.receive(ws).msg end
+                @test msg.info isa Dict
+            end
+            Protocol.client_send(ws, Protocol.ChangeParameter(Parameter("p", 2)))
+            ack = Protocol.receive(ws).msg
+            @test ack isa Protocol.Ack
+            @test !isnothing(ack.error)
+            @test occursin("boom", ack.error.text)
 
             # Test ReviseCode
             Protocol.client_send(ws, Protocol.ReviseCode())

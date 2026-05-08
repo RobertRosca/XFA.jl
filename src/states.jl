@@ -359,6 +359,17 @@ end
     pending_requests::Dict{Int, PendingRequest} = Dict()
     engine_request_callbacks::Dict{Int, Function} = Dict()
 
+    # Name of the parameter currently being changed; the node graph is disabled
+    # while this is set so the user can't queue further changes mid-update.
+    # Cleared when the engine echoes a ParameterChanged or replies with an error.
+    pending_parameter_change::Maybe{String} = nothing
+
+    # Fully-qualified name of a parameter whose new value should be written
+    # back to the context file once the engine confirms the change. Set by the
+    # widget that initiated the edit, applied (write file, no reload) on the
+    # matching ParameterChanged echo, dropped on error.
+    pending_source_edit::Maybe{String} = nothing
+
     lock::ReentrantLock = ReentrantLock()
 end
 

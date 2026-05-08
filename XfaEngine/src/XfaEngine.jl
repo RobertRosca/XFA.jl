@@ -386,9 +386,25 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
         Protocol.server_send(ws, Ack(); reply_to)
     elseif msg isa ChangeParameter
         param = msg.parameter
-        Context.change_parameter(state.ctx, param)
-        @info "ChangeParameter of $(param.name) to $(param.value)"
-        Protocol.server_send(ws, Ack(); reply_to)
+        try
+            Context.change_parameter(state.ctx, param)
+            @info "ChangeParameter of $(param.name) to $(param.value)"
+            Protocol.server_send(ws, Ack(); reply_to)
+
+            # Broadcast the new value to all clients so they stay in sync and
+            # the originating client can confirm the engine accepted the value.
+            broadcast = ParameterChanged(param)
+            for (other_id, other) in state.clients
+                try
+                    Protocol.server_send(other.websocket, broadcast)
+                catch ex
+                    @warn "Failed to broadcast ParameterChanged to client '$(other_id)'" exception=ex
+                end
+            end
+        catch ex
+            @error "Failed to change parameter '$(param.name)'" exception=(ex, catch_backtrace())
+            Protocol.server_send(ws, Ack(Protocol.ExceptionMessage(ex, catch_backtrace())); reply_to)
+        end
     elseif msg isa Start
         @info "Starting pipeline..."
         try

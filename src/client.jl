@@ -759,6 +759,40 @@ function store_variable_data!(client, variable::VariableData)
     store.received_bytes = received_bytes
 end
 
+@enum ParameterOwnerKind ParameterOwner_Group ParameterOwner_Postprocessor
+
+struct ParameterOwner
+    kind::ParameterOwnerKind
+    var_name::String
+    pp_name::Maybe{String}
+    field_name::String
+end
+
+# Locate the node that owns a fully-qualified parameter in the loaded context.
+# Returns nothing if not found, otherwise a ParameterOwner describing where
+# the parameter lives.
+function find_parameter_owner(client, param_name::String)
+    for (var_name, var_data) in client.context.context_state
+        if var_data["type"] === :group
+            for (field_name, stored) in var_data["parameters"]
+                if stored.name == param_name
+                    return ParameterOwner(ParameterOwner_Group, var_name, nothing, field_name)
+                end
+            end
+        elseif var_data["type"] === :variable
+            for pp in var_data["postprocessors"]
+                for (field_name, stored) in pp.params
+                    if stored.name == param_name
+                        return ParameterOwner(ParameterOwner_Postprocessor,
+                                              var_name, pp.name, field_name)
+                    end
+                end
+            end
+        end
+    end
+    return nothing
+end
+
 function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothing)
     client = state.client
 
@@ -859,19 +893,38 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
         end
     elseif msg isa ParameterChanged
         param = msg.parameter
-        # Update the parameter in the context state. Parameter names are
-        # prefixed with the group name (e.g. "bridge.address").
-        parts = split(param.name, "."; limit=2)
-        if length(parts) == 2
-            group, param_name = parts
-            group = String(group)
-            param_name = String(param_name)
-            ctx_state = client.context.context_state
-            if haskey(ctx_state, group) && haskey(ctx_state[group], "parameters")
-                if haskey(ctx_state[group]["parameters"], param_name)
-                    ctx_state[group]["parameters"][param_name].value = param.value
+        # The same parameter may appear under a node's "parameters" dict (group
+        # params) or inside a postprocessor's `params`. Walk every node and
+        # update wherever the full name matches.
+        for var_data in values(client.context.context_state)
+            params = get(var_data, "parameters", nothing)
+            if params isa Dict
+                for stored in values(params)
+                    if stored isa Parameter && stored.name == param.name
+                        stored.value = param.value
+                    end
                 end
             end
+            for pp in get(var_data, "postprocessors", ())
+                for stored in values(pp.params)
+                    if stored isa Parameter && stored.name == param.name
+                        stored.value = param.value
+                    end
+                end
+            end
+        end
+
+        if client.pending_parameter_change == param.name
+            client.pending_parameter_change = nothing
+        end
+
+        if client.pending_source_edit == param.name
+            owner = find_parameter_owner(client, param.name)
+            if !isnothing(owner) && owner.kind == ParameterOwner_Group && param.value isa String
+                set_group_param(state, owner.var_name, owner.field_name,
+                                "\"$(escape_string(param.value))\""; reload=false)
+            end
+            client.pending_source_edit = nothing
         end
     elseif msg isa PipelineStats
         client.context.channel_stats = msg.channel_stats
@@ -891,6 +944,13 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
             else
                 client.context.pipeline_status = PipelineStatus_Stopped
             end
+        end
+
+        # On success, pending_parameter_change is cleared when the engine echoes
+        # back a ParameterChanged. On failure, no echo will arrive so clear here.
+        if !isnothing(replied_to) && replied_to.msg_type == ChangeParameter && !isnothing(msg.error)
+            client.pending_parameter_change = nothing
+            client.pending_source_edit = nothing
         end
     else
         @warn "Received unsupported message of type '$(typeof(msg))'"
@@ -1103,7 +1163,9 @@ function revise_engine(state)
 end
 
 function change_parameter(param::Parameter)
-    send(state[].client, ChangeParameter(param))
+    client = state[].client
+    send(client, ChangeParameter(param))
+    client.pending_parameter_change = param.name
 end
 
 function start(state)

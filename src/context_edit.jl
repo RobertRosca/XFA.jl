@@ -309,7 +309,8 @@ function replace_group_dep(source::String, group_name::String,
                               parameter_dep_to_source(new_dep))
 end
 
-function set_group_param(state, var_name::String, kwarg_name::String, new_value::String)
+function set_group_param(state, var_name::String, kwarg_name::String, new_value::String;
+                         reload::Bool=true)
     client = state.client
     source = client.context.source
 
@@ -331,7 +332,11 @@ function set_group_param(state, var_name::String, kwarg_name::String, new_value:
         end
     end
 
-    load_context(state)
+    if reload
+        load_context(state)
+    else
+        client.context.source = new_source
+    end
 end
 
 # Replace a dependency (Karabo or variable) in the source code and reload.

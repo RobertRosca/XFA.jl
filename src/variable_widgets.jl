@@ -70,8 +70,8 @@ function draw_variable_content(::Val{Symbol("XfaEngine.Context.KaraboBridge")}, 
                     gui_state.selected_output = idx[]
                     new_address = gui_state.zmq_outputs[idx[] + 1]
                     address_param = params["address"]
+                    client.pending_source_edit = address_param.name
                     change_parameter(Parameter(address_param.name, new_address))
-                    @guiasync set_group_param(state[], name, "address", "\"$(new_address)\"")
                 end
             else
                 ig.Text("No ZMQ outputs found")
