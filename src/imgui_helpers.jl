@@ -652,7 +652,6 @@ function KaraboDepText(label, text, dep_state::KaraboDepTextState,
 
             if isnothing(pending)
                 dep_state.proxy_property[] = nothing
-                @show new_source
                 return true, new_source
             end
 
