@@ -642,14 +642,25 @@ function draw_compression_settings(id, name, show_settings::Ref{Bool},
                                    precision::Ref{Cint}, store)
     ig.Checkbox("Compression settings##$(id)", show_settings)
     if show_settings[]
+        compressed = isfinite(store.compression_ratio)
+        if !compressed
+            ig.BeginDisabled()
+        end
         ig.SetNextItemWidth(120)
         if ig.InputInt("zfp precision##$(id)", precision)
             set_subscription_precision(state[], name, Int(precision[]))
         end
-        if isfinite(store.compression_ratio)
+        if !compressed
+            ig.EndDisabled()
+        end
+        if compressed
             ig.SameLine()
             ig.AlignTextToFramePadding()
             ig.TextDisabled(@sprintf("zfp: %.1fx", store.compression_ratio))
+        elseif store.received_bytes > 0
+            ig.SameLine()
+            ig.AlignTextToFramePadding()
+            ig.TextDisabled("Variable is not compressed")
         end
         if store.received_bytes > 0
             ig.SameLine()
