@@ -763,7 +763,7 @@ function draw_dag()
     # Timer to save the current settings periodically. Mostly useful for the
     # node positions.
     framerate = round(Int, unsafe_load(ig.GetIO().Framerate))
-    if ig.GetFrameCount() % (5 * framerate) == 0
+    if framerate > 0 && ig.GetFrameCount() % (5 * framerate) == 0
         if !isempty(ctx_state)
             save_settings(client)
         end
