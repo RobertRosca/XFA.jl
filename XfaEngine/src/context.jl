@@ -442,15 +442,11 @@ function change_parameter(ctx::XfaContext, new_param::Parameter)
     pause_pipeline() do
         ctx_param = worker_state.parameters[new_param.name]
         if !isnothing(ctx_param.update_handler)
-            try
-                owner = find_parameter_owner(ctx, new_param.name)
-                if !isnothing(owner)
-                    ctx_param.update_handler(owner, new_param.value)
-                else
-                    ctx_param.update_handler(new_param.value)
-                end
-            catch ex
-                @error "Exception in update handler for parameter '$(ctx_param.name)'" exception=ex
+            owner = find_parameter_owner(ctx, new_param.name)
+            if !isnothing(owner)
+                ctx_param.update_handler(owner, new_param.value)
+            else
+                ctx_param.update_handler(new_param.value)
             end
         end
 
@@ -735,6 +731,20 @@ function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50)
     errormonitor(ctx.output_forwarder_task)
 
     global current_ctx = ctx
+
+    # Run one-shot parameter initializers the first time the pipeline starts
+    # after loading. Cleared after running so repeat starts don't re-trigger.
+    for (name, param) in ctx.parameters
+        if !isnothing(param.initializer)
+            owner = find_parameter_owner(ctx, name)
+            if isnothing(owner)
+                param.initializer(param.value)
+            else
+                param.initializer(owner, param.value)
+            end
+            param.initializer = nothing
+        end
+    end
 
     # Verify all external deps are routed to an input
     unrouted = [string(dep) for dep in external_dependencies(ctx)

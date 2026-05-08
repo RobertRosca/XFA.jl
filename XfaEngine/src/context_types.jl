@@ -451,7 +451,7 @@ function Parameter(f::Base.Callable, value)
         throw(ArgumentError("Parameter update handler must be either `nothing` or a callable that takes one argument (value) or two arguments (group, value)"))
     end
 
-    Parameter("", value, false, f, nothing)
+    Parameter("", value, false, f, f)
 end
 
 function tryset(param::Parameter, value; force=false)
