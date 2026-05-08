@@ -38,6 +38,7 @@ EndNodeTitleBar = ig.imnodes_EndNodeTitleBar
 
 SetNodeGridSpacePos = ig.imnodes_SetNodeGridSpacePos
 GetNodeGridSpacePos = ig.imnodes_GetNodeGridSpacePos
+GetNodeDimensions = ig.imnodes_GetNodeDimensions
 
 function MiniMap()
     ig.imnodes_MiniMap(0.2, ImNodesMiniMapLocation_BottomRight, C_NULL, C_NULL)
