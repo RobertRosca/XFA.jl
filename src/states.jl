@@ -50,15 +50,21 @@ DeviceProperties() = DeviceProperties(PropertyList(), Dict{String, PropertyList}
     RemoteReplStatus_Stopped
 end
 
-mutable struct KaraboDepTextState
-    cursor_pos::Cint
-    device::Maybe{String}
+@kwdef mutable struct KaraboDepTextState
+    cursor_pos::Cint = -1
+    device::Maybe{String} = nothing
+
     # If set, the callback will replace the buffer contents with this text,
     # move the cursor to the end, and then clear it.
-    wanted_text::Maybe{String}
-end
+    wanted_text::Maybe{String} = nothing
 
-KaraboDepTextState() = KaraboDepTextState(-1, nothing, nothing)
+    # Set when a remap requires an async device-property lookup. The widget
+    # stays disabled until the request resolves, then re-runs the remap.
+    # `proxy_property` is filled in by the lookup's callback.
+    pending_remap_id::Maybe{Int} = nothing
+    pending_remap_source::Maybe{String} = nothing
+    proxy_property::Ref{Any} = Ref{Any}(nothing)
+end
 
 mutable struct DepTextState
     is_karabo::Bool
@@ -294,6 +300,10 @@ end
     routing_rules::Vector{RoutingRule} = RoutingRule[]
     routing_rules_request_status::RequestStatus = RequestStatus_Idle
     routing_rules_set_request::Maybe{Int} = nothing
+    # Effective remap rules supplied by the engine (user rules followed by
+    # builtins). Applied to source strings the user enters, in order; every
+    # matching rule fires, not just the first.
+    remap_rules::Vector{RemapRule} = RemapRule[]
     # Per-row source-autocomplete state for the rules table, keyed by row index.
     routing_rule_source_states::Dict{Int, KaraboDepTextState} = Dict{Int, KaraboDepTextState}()
     karabo_devices::Dict{String, Dict{String, Any}} = Dict()

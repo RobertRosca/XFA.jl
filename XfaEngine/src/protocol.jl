@@ -6,6 +6,7 @@ export AbstractMessage, Ping, Shutdown,
     GetDeviceProperty, DeviceProperty,
     GetEngineDir, EngineDir,
     GetRoutingRules, SetRoutingRules, RoutingRules,
+    GetRemapRules, RemapRules,
     SetVariableSubscriptions,
     ChangeParameter, Start, Stop,
     SetDebugMode, SetRemoteRepl,
@@ -20,7 +21,7 @@ import HTTP: WebSockets
 
 import ..Context
 using ..Context: XfaContext, VariableData, Parameter
-using ..XfaEngine: RoutingRule
+using ..XfaEngine: RoutingRule, RemapRule
 
 
 abstract type AbstractMessage end
@@ -96,6 +97,10 @@ end
 
 struct RoutingRules <: AbstractMessage
     rules::Vector{RoutingRule}
+end
+
+struct RemapRules <: AbstractMessage
+    rules::Vector{RemapRule}
 end
 
 struct EngineDir <: AbstractMessage

@@ -749,8 +749,10 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
 
     if msg isa Pong
         nothing
+
     elseif msg isa Stopped
         client.context.pipeline_status = PipelineStatus_Stopped
+
     elseif msg isa Devices
         if msg.device_names isa Exception
             @error "Error from server with DEVICES" exception=msg
@@ -785,8 +787,10 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
             client.sources_by_topic = sources_by_topic
             client.webproxy_status = RequestStatus_Idle
         end
+
     elseif msg isa EngineDir
         client.remote_engine_dir = msg.path
+
     elseif msg isa AvailableTrainmatchers
         trainmatchers = Dict{String, Vector{String}}()
         whitelisted = Set{KaraboDevice}()
@@ -803,14 +807,21 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
         client.trainmatchers = trainmatchers
         client.whitelisted_trainmatchers = whitelisted
         client.trainmatchers_request_status = RequestStatus_Idle
+
     elseif msg isa RoutingRules
         client.routing_rules = msg.rules
         client.routing_rules_request_status = RequestStatus_Idle
+
+    elseif msg isa RemapRules
+        client.remap_rules = msg.rules
+
     elseif msg isa DeviceSchema
         client.source_properties[(msg.topic, msg.name)] = schema_property_names(msg.schema)
         delete!(client.device_schema_requests, (msg.topic, msg.name))
+
     elseif msg isa DeviceProperty
         nothing
+
     elseif msg isa ContextInfo
         if msg.info isa Dict
             client.context.context_state = build_context_state(state, msg.info)
@@ -897,6 +908,7 @@ function handle_server(state)
                 get_devices(client)
                 get_trainmatchers(client)
                 get_routing_rules(client)
+                send(client, GetRemapRules())
 
                 for msg_bytes in ws
                     buffer = IOBuffer(msg_bytes)
@@ -976,6 +988,90 @@ end
 function get_routing_rules(client)
     send(client, GetRoutingRules())
     client.routing_rules_request_status = RequestStatus_Waiting
+end
+
+# Returns (topic, device, classId) for the device referenced by `source`, or
+# ("", device, "") if the device isn't in the loaded topology.
+function source_device_info(client::ClientState, source::String)
+    sep = find_separator(source)
+    device = strip_topic(isnothing(sep) ? source : source[1:sep-1])
+    for (topic, devices) in client.karabo_devices
+        if haskey(devices, device)
+            return topic, device, get(devices[device], "classId", "")
+        end
+    end
+    return "", device, ""
+end
+
+source_device_class(client::ClientState, source::String) = source_device_info(client, source)[3]
+
+# Apply a single rule to `source`. Returns the rewritten string, or nothing
+# if the rule's source/device_class regexes don't both match.
+# Returns (rewritten, pending). `rewritten` is the new source if the rule
+# matched and produced a result, else nothing. `pending` is a request ID if
+# the rule needs an in-flight device-property lookup to resolve.
+function apply_remap_rule(client::ClientState, rule::RemapRule, source::String,
+                          topic::String, device::String, device_class::String,
+                          property_ref::Ref{Any})
+    if !occursin(Regex(rule.device_class), device_class)
+        return nothing, nothing
+    end
+    pattern = Regex(rule.source)
+    if !occursin(pattern, source)
+        return nothing, nothing
+    end
+
+    return apply_remap_rule(Val(rule.kind), client, rule, source, topic, device, pattern, property_ref)
+end
+
+apply_remap_rule(::Val{RemapKind_Simple}, client, rule, source, topic, device, pattern, property_ref) =
+    replace(source, pattern => SubstitutionString(rule.replacement)), nothing
+
+# Rewrite `dev:output[prop]` to `<fast>[prop]@dev:output`, where `<fast>` is
+# the sole entry of the device's `fastSources` property. Returns a pending
+# request ID instead of a rewrite while the lookup is in flight; the response
+# callback writes the value into `property_ref`.
+function apply_remap_rule(::Val{RemapKind_Proxy}, client::ClientState, rule, source,
+                          topic, device, pattern, property_ref::Ref{Any})
+    if isnothing(property_ref[])
+        id = send_with_callback(
+            client, GetDeviceProperty(topic, device, "fastSources"),
+            msg -> property_ref[] = msg.value)
+        return nothing, id
+    end
+
+    value = property_ref[]
+    if value isa Exception || !(value isa AbstractVector) || isempty(value)
+        return nothing, nothing
+    end
+
+    bracket = findfirst('[', source)
+    if isnothing(bracket)
+        return nothing, nothing
+    end
+
+    proxied_source = string(value[1], source[bracket:end], "@", source[1:bracket-1])
+
+    return proxied_source, nothing
+end
+
+# Walks the remap rules in order, applying every rule that matches
+# cumulatively. Returns (source, pending); if pending is non-nothing the
+# caller should wait for that request before re-running the remap. Proxy
+# rules deposit the looked-up property value into `property_ref`.
+function remap_source(client::ClientState, source::String, property_ref::Ref{Any})
+    topic, device, device_class = source_device_info(client, source)
+    for rule in client.remap_rules
+        result, pending = apply_remap_rule(client, rule, source, topic, device, device_class,
+                                           property_ref)
+        if !isnothing(pending)
+            return source, pending
+        end
+        if !isnothing(result)
+            source = result
+        end
+    end
+    return source, nothing
 end
 
 function load_context(state)

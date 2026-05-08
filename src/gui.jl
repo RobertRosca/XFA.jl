@@ -16,9 +16,10 @@ include("plotting.jl")
 
 using LibSSH: LibSSH as ssh
 using HTTP: HTTP, WebSockets
-using XfaEngine: EngineState, getavailableport, RoutingRule
+using XfaEngine: EngineState, getavailableport, RoutingRule, RemapRule, RemapKind,
+    RemapKind_Simple, RemapKind_Proxy
 using Dates: Dates, unix2datetime, @dateformat_str
-using XfaEngine.Context: Parameter, OptionalDims, KaraboDevice
+using XfaEngine.Context: Parameter, OptionalDims, KaraboDevice, Dependency, karabo_dependency
 using XfaEngine.ZfpWorkspaces: ZfpWorkspace, CompressedArray, decompress_array,
     decompress_array!, allocate_array
 include("states.jl")
@@ -30,7 +31,7 @@ using Serialization
 using XfaEngine.Protocol
 using XfaEngine: XfaEngine, Protocol
 using XfaEngine.Context: Dependency, DependencyKind, DepKind_Variable, DepKind_Karabo, DepKind_Group,
-    karabo_dependency, Parameter, KaraboDevice, VariableData, ArrayMetadata, OptionalDims
+    karabo_dependency, karabo_dep_string, Parameter, KaraboDevice, VariableData, ArrayMetadata, OptionalDims
 
 include("imgui_helpers.jl")
 include("state_inspector.jl")
@@ -173,7 +174,7 @@ function draw_parameter_widget(name, param::Parameter{KaraboDevice})
     device = param.value
     text = "$(device.topic)//$(device.name)"
     edited, new_text = KaraboDepText("param-$(param.name)", text, dep_state,
-                                     client.source_list, device_props; device_only=true)
+                                     client.source_list, device_props, client; device_only=true)
     if edited
         new_device = KaraboDevice(new_text)
         if isempty(new_device.topic)
@@ -202,8 +203,8 @@ function draw_dep_editor(label, dep::Dependency, dep_id::Integer;
     else
         get_source_properties(client, dep_state.karabo_state.device)
     end
-    DepText(label, dep, dep_state, client.source_list, device_props,
-            client.variable_names; device_only, variable_name)
+    return DepText(label, dep, dep_state, client.source_list, device_props,
+                   client.variable_names, client; device_only, variable_name)
 end
 
 function draw_parameter_widget(name, param::Parameter{Dependency})
@@ -304,6 +305,7 @@ function draw_parameter(name, param; min_node_width=150)
     if modified
         change_parameter(Parameter(param.name, new_value))
     end
+    return modified, new_value
 end
 
 # Draw the parameters section of a variable node. Can be called from custom
@@ -596,7 +598,7 @@ function draw_routing_rules()
                 end
                 filtered_sources = get(client.sources_by_topic, rule.topic, SourceInfo[])
                 edited, new_source = KaraboDepText("##rule-source-$i", rule.source, src_state,
-                                                   filtered_sources, src_props;
+                                                   filtered_sources, src_props, client;
                                                    allow_slow=false)
                 if edited
                     client.routing_rules[i] = RoutingRule(rule.topic, new_source, rule.input)

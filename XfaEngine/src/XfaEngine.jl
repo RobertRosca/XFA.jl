@@ -79,6 +79,7 @@ end
 
     webproxies::Dict{String, WebProxy} = Dict()
     routing_rules::Vector{RoutingRule} = RoutingRule[]
+    remap_rules::Vector{RemapRule} = copy(BUILTIN_REMAP_RULES)
 
     remoterepl_server::TCPServer = TCPServer()
     remoterepl_task::Union{Task, Nothing} = nothing
@@ -289,8 +290,13 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
         @info "Received shutdown request from client $(id)"
         shutdown(state)
         notify(state.stop_event)
+
     elseif msg isa GetRoutingRules
         Protocol.server_send(ws, RoutingRules(state.routing_rules); reply_to)
+
+    elseif msg isa GetRemapRules
+        Protocol.server_send(ws, RemapRules(state.remap_rules); reply_to)
+
     elseif msg isa SetRoutingRules
         state.routing_rules = msg.rules
         write_routing_rules(msg.rules)
@@ -309,6 +315,7 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
                 @warn "Failed to broadcast routing rules to client '$(other_id)'" exception=ex
             end
         end
+
     elseif msg isa GetDevices
         try
             devices = if isnothing(msg.topic)
@@ -322,10 +329,12 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
             @error "Error in 'GetDevices', requested by $(id)" exception=(ex, catch_backtrace())
             Protocol.server_send(ws, Devices(ex); reply_to)
         end
+
     elseif msg isa GetDeviceSchema
         schema = get_schema(KaraboDevice(msg.topic, msg.name))
         Protocol.server_send(ws, DeviceSchema(msg.topic, msg.name, schema); reply_to)
         @info "Responded to 'GetDeviceSchema' from $(id)"
+
     elseif msg isa GetDeviceProperty
         try
             wp = get_webproxy(KaraboDevice(msg.topic, msg.device))
@@ -338,9 +347,11 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
         end
     elseif msg isa GetEngineDir
         Protocol.server_send(ws, EngineDir(pkgdir(XfaEngine)); reply_to)
+
     elseif msg isa GetTrainmatchers
         trainmatchers = get_all_trainmatchers(state.webproxies)
         Protocol.server_send(ws, AvailableTrainmatchers(trainmatchers); reply_to)
+
     elseif msg isa LoadContext
         path = abspath(expanduser(msg.path))
 
@@ -492,6 +503,9 @@ function main(stop_event=Base.Event(); info_path=nothing, wait=true)
         state.routing_rules = loaded
         @info "Loaded routing rules" n=length(loaded) path=engine_settings_path()
     end
+
+    state.remap_rules = load_remap_rules()
+    @info "Loaded remap rules" n=length(state.remap_rules) path=engine_settings_path()
 
     ws_server = WebSockets.listen!("0.0.0.0", state.websocket_port) do ws
         id = create_id()

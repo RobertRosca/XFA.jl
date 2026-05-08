@@ -147,13 +147,7 @@ end
 
 # Return the string content inside a Karabo string macro literal, i.e. the
 # dependency string without the topic prefix.
-function karabo_dep_content(dep::Dependency)
-    if occursin(':', dep.source)
-        "$(dep.source)[$(dep.property)]"
-    else
-        "$(dep.source).$(dep.property)"
-    end
-end
+karabo_dep_content(dep::Dependency) = karabo_dep_string(nothing, dep.source, dep.property, dep.proxy)
 
 # Convert a Dependency to its source code representation.
 function dep_to_source(dep::Dependency)

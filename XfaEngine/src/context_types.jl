@@ -85,7 +85,7 @@ const fast_data_re = r"^(\S+):(\S+)\[(\S+)\]$"
 const topic_prefix_re = r"^(\w+)//(.+)$"
 
 # Compute the string representation for a Karabo dependency
-function _karabo_dep_string(topic, source, property, proxy=nothing)
+function karabo_dep_string(topic, source, property, proxy=nothing)
     device_str = if occursin(':', source)
         "$(source)[$(property)]"
     else
@@ -106,9 +106,8 @@ end
 # Karabo dependency constructors
 karabo_dependency(source::AbstractString, property::AbstractString) = karabo_dependency(nothing, source, property, nothing)
 
-function karabo_dependency(topic::Union{AbstractString, Nothing}, source::AbstractString, property::AbstractString,
-                           proxy::Union{AbstractString, Nothing}=nothing)
-    name = _karabo_dep_string(topic, source, property, proxy)
+function karabo_dependency(topic, source, property, proxy=nothing)
+    name = karabo_dep_string(topic, source, property, proxy)
     Dependency(kind=DepKind_Karabo, name=name,
                topic=isnothing(topic) ? nothing : String(topic),
                source=String(source), property=String(property),

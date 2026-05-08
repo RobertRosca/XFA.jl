@@ -372,6 +372,45 @@ end
     @test fmt("pos") == "MID_EXP/MOTOR/1.pos"
 end
 
+@testset "remap_source" begin
+    client = XFA.ClientState()
+    client.karabo_devices = Dict{String, Dict{String, Any}}(
+        "MID" => Dict{String, Any}("camera" => Dict("classId" => "AravisBaslerCamera"),
+                                   "motor"  => Dict("classId" => "Motor")))
+
+    camera_rule = XFA.RemapRule(XFA.RemapKind_Simple,
+                                raw"^(.*):output\[data\.image\.pixels\]$",
+                                "AravisBaslerCamera",
+                                raw"\1:output[data.image.data]")
+    client.remap_rules = [camera_rule]
+
+    # Matching device class + matching source: rewritten
+    @test XFA.remap_source(client, "camera:output[data.image.pixels]", Ref{Any}(nothing)) ==
+          ("camera:output[data.image.data]", nothing)
+
+    # Wrong device class: pass through
+    @test XFA.remap_source(client, "motor:output[data.image.pixels]", Ref{Any}(nothing)) ==
+          ("motor:output[data.image.pixels]", nothing)
+
+    # Source regex doesn't match: pass through
+    @test XFA.remap_source(client, "camera.something", Ref{Any}(nothing)) == ("camera.something", nothing)
+
+    # Unknown device (no classId resolved): camera_rule's class regex still
+    # only matches "AravisBaslerCamera", so pass through.
+    @test XFA.remap_source(client, "ghost:output[data.image.pixels]", Ref{Any}(nothing)) ==
+          ("ghost:output[data.image.pixels]", nothing)
+
+    # All matching rules apply in order, cumulatively
+    push!(client.remap_rules,
+          XFA.RemapRule(XFA.RemapKind_Simple, raw"data\.image\.data", "", "data.image.foo"))
+    @test XFA.remap_source(client, "camera:output[data.image.pixels]", Ref{Any}(nothing)) ==
+          ("camera:output[data.image.foo]", nothing)
+
+    # Empty source + empty device_class is rejected — it would match every
+    # source unconditionally, which is almost certainly a config mistake.
+    @test_throws ArgumentError XFA.RemapRule(XFA.RemapKind_Simple, "", "", "REPLACED")
+end
+
 @testset "sampled_pctile!" begin
     buf = Float64[]
 
