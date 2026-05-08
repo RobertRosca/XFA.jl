@@ -1798,7 +1798,24 @@ end
                                                             "bridge.trainmatcher" => Parameter("bridge.trainmatcher", KaraboDevice("", "")),
                                                             "bridge.manual_configuration" => Parameter("bridge.manual_configuration", false)),
                                        "dep_to_input" => Dict("xgm.intensity" => "bridge.stream"),
+                                       "group_parameter_args" => Dict(),
                                        "path" => "")
+
+    # Group variables that reference a group Parameter field record the
+    # arg_name -> field mapping so the client can rewrite the right kwarg.
+    ctx = Context.load_from_string(raw"""
+        @Group mutable struct Foo
+            source::Parameter{Dependency}
+        end
+
+        @Variable function foo(::Foo, data -> Foo.source)
+            data
+        end
+
+        foo_group = Foo(; source=karabo"motor1.pos")
+        """)
+    @test Context.to_dict(ctx)["group_parameter_args"] ==
+        Dict("foo_group.foo" => Dict("data" => "source"))
 end
 
 @testset "ZfpWorkspace" begin

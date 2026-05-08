@@ -11,6 +11,7 @@ using DistributedNext: DistributedNext, RemoteChannel, remote_do, remoteref_id, 
 import MacroTools
 import MacroTools: @capture, postwalk, prettify
 import OrderedCollections: OrderedDict
+using Accessors: @set
 import DimensionalData as DD
 import ..XfaEngine
 
@@ -337,7 +338,39 @@ function to_dict(ctx::XfaContext)
         parameters[name] = Parameter(; name=param.name, value=param.value, set_by_user=param.set_by_user)
     end
 
-    return Dict("dag" => ctx.dag,
+    # group_type holds a DataType that may live in the context's anonymous
+    # module, which doesn't exist on the client and would break deserialization.
+    dag = Dict{String, OrderedDict}()
+    for (name, deps) in ctx.dag
+        dag[name] = OrderedDict{Any, Any}(k => v isa Dependency && !isnothing(v.group_type) ?
+                                          (@set v.group_type = nothing) : v
+                                          for (k, v) in deps)
+    end
+
+    # For group variables, recover the original arg_name => group field mapping
+    # from variable_dependencies. The DAG stores the resolved Dependency value,
+    # losing the field name needed for source rewriting on the client.
+    group_parameter_args = Dict{String, Dict{String, String}}()
+    for (var_name, func) in ctx.functions
+        # Only group-instance variables (e.g. "foo_group.foo") need the mapping;
+        # the unbound function entry (e.g. "foo") shares the same dep methods
+        # but isn't tied to a constructor the client could rewrite.
+        if !occursin('.', var_name) || !@invokelatest(applicable(variable_dependencies, func))
+            continue
+        end
+
+        mapping = Dict{String, String}()
+        for (arg_name, dep) in @invokelatest variable_dependencies(func)
+            if dep isa Dependency && dep.kind == DepKind_GroupParameter
+                mapping[arg_name] = dep.parameter
+            end
+        end
+        if !isempty(mapping)
+            group_parameter_args[var_name] = mapping
+        end
+    end
+
+    return Dict("dag" => dag,
                 "subvariables" => ctx.subvariables,
                 "postprocessors" => ctx.variable_postprocessors,
                 "parameters" => parameters,
@@ -345,6 +378,7 @@ function to_dict(ctx::XfaContext)
                 "groups" => groups,
                 "origins" => origins,
                 "dep_to_input" => ctx.dep_to_input,
+                "group_parameter_args" => group_parameter_args,
                 "path" => ctx.path)
 end
 

@@ -4,6 +4,7 @@ version = "0.1.0"
 authors = ["JamesWrigley <james.wrigley@xfel.eu>"]
 
 [deps]
+Accessors = "7d9f7c33-5ae7-4f3b-8dc6-eff91059b697"
 DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
 DimensionalData = "0703355e-b756-11e9-17c0-8b28908087d0"
 DistributedNext = "fab6aee4-877b-4bac-a744-3eca44acbb6f"
@@ -25,7 +26,11 @@ TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 ZMQ = "c2297ded-f4af-51ae-bb23-16f91089e4e1"
 ZfpCompression = "43441a71-1662-41c6-b8ea-40ed1525242b"
 
+[sources]
+ZfpCompression = {rev = "promotion", url = "https://github.com/JamesWrigley/ZfpCompression.jl"}
+
 [compat]
+Accessors = "0.1.44"
 DataStructures = "0.19.4"
 DimensionalData = "0.30"
 DistributedNext = "1.0.0"
@@ -34,6 +39,3 @@ Glob = "1"
 NaNStatistics = "0.6.55"
 RemoteREPL = "0.3.0"
 Revise = "3"
-
-[sources]
-ZfpCompression = {url="https://github.com/JamesWrigley/ZfpCompression.jl", rev="promotion"}

@@ -361,7 +361,12 @@ node_hash(x) = reinterpret(Cint, crc32c(x))
 
 function build_context_state(state, ctx_info)
     ctx_state = Dict{String, Any}()
+    # Drop all per-widget editing state so freshly-loaded parameter values
+    # overwrite anything the user had typed but not committed.
     empty!(state.client.parameter_states)
+    empty!(state.client.karabo_dep_states)
+    empty!(state.client.dep_text_states)
+    empty!(safe_input_text_cache)
 
     group_names = Set(ctx_info["groups"])
     is_group_var(name) = any(startswith(name, "$(g).") for g in group_names)
@@ -429,6 +434,13 @@ function build_context_state(state, ctx_info)
         ctx_state[name]["draw_parameters"] = true
         ctx_state[name]["links"] = LinkInfo[]
         ctx_state[name]["parameters"] = Dict{String, Any}()
+        # Maps attr_id -> group struct field name, for arg_names that bind to a
+        # Parameter{Dependency} field of the group. The client uses the field
+        # name (not the @Variable's arg_name) when rewriting the constructor
+        # kwarg in source.
+        ctx_state[name]["dep_field_names"] = Dict{Int, String}()
+
+        group_param_args = get(ctx_info, "group_parameter_args", Dict{String, Dict{String, String}}())
 
         # Add dependencies from group member variables as inputs on the group node
         dep_param_names = Set{String}()
@@ -436,6 +448,7 @@ function build_context_state(state, ctx_info)
             if !group_filter(var_name)
                 continue
             end
+
             for (arg_name, dep) in deps
                 if dep isa Dependency && dep.kind == DepKind_Group
                     continue
@@ -445,7 +458,13 @@ function build_context_state(state, ctx_info)
                 end
                 attr_id = node_hash("$(var_name).dependencies.$(arg_name => dep)")
                 push!(ctx_state[name]["dependencies"], (attr_id, arg_name => dep))
-                push!(dep_param_names, arg_name)
+                field_name = get(get(group_param_args, var_name, Dict{String, String}()), arg_name, nothing)
+                if !isnothing(field_name)
+                    ctx_state[name]["dep_field_names"][attr_id] = field_name
+                    push!(dep_param_names, field_name)
+                else
+                    push!(dep_param_names, arg_name)
+                end
             end
         end
 
