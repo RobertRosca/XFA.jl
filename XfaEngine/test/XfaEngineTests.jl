@@ -1724,24 +1724,33 @@ end
     @test f.data.size == [3]
     @test build_client_view!(state, array, sub("a" => -1), cache()) === array
 
-    # Subvariables follow the same rule under their qualified name.
+    # Subvariables follow the same rule under their qualified name. The
+    # subvariables dict is keyed by the qualified name (as produced by
+    # @add_subvariable), and subscriptions must look it up under that same key.
     parent = VariableData(; tid=0, name="p", data=[1, 2],
                           subvariables=Dict{String, Any}(
-                              "scalar" => VariableData(0, "scalar", 1.5),
-                              "arr" => VariableData(0, "arr", [4, 5])))
+                              "p.scalar" => VariableData(0, "p.scalar", 1.5),
+                              "p.arr" => VariableData(0, "p.arr", [4, 5])))
     f = build_client_view!(state, parent, sub(), cache())
     @test f.data isa ArrayMetadata
-    @test keyset(f.subvariables) == Set(["scalar", "arr"])
-    @test f.subvariables["scalar"].data == 1.5
-    @test f.subvariables["arr"].data isa ArrayMetadata
+    @test keyset(f.subvariables) == Set(["p.scalar", "p.arr"])
+    @test f.subvariables["p.scalar"].data == 1.5
+    @test f.subvariables["p.arr"].data isa ArrayMetadata
 
+    # Subscribing to the qualified subvariable name delivers the real array.
     f = build_client_view!(state, parent, sub("p.arr" => -1), cache())
     @test f.data isa ArrayMetadata
-    @test f.subvariables["arr"].data == [4, 5]
+    @test f.subvariables["p.arr"].data == [4, 5]
 
+    # Subscribing to the parent does not implicitly subscribe its subvariables.
     f = build_client_view!(state, parent, sub("p" => -1), cache())
     @test f.data == [1, 2]
-    @test f.subvariables["arr"].data isa ArrayMetadata
+    @test f.subvariables["p.arr"].data isa ArrayMetadata
+
+    # Re-prepending the parent name (the historical bug) would look up
+    # "p.p.arr" and miss the subscription — make sure that doesn't happen.
+    f = build_client_view!(state, parent, sub("p.p.arr" => -1), cache())
+    @test f.subvariables["p.arr"].data isa ArrayMetadata
 
     # Compressible payload: a long enough Float array triggers ZFP. With two
     # clients sharing the same precision the cache reuses the compressed view.

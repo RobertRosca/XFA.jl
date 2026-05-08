@@ -181,11 +181,10 @@ function build_client_view!(state::EngineState, variable::VariableData,
 
     new_subvars = Dict{String, Any}()
     any_changed = false
-    for (subname, subvar) in variable.subvariables
-        qualified = "$(variable.name).$(subname)"
+    for (qualified, subvar) in variable.subvariables
         sub_view = client_view_for(state, subvar, qualified, subscriptions, cache)
         any_changed |= sub_view !== subvar
-        new_subvars[subname] = sub_view
+        new_subvars[qualified] = sub_view
     end
 
     if !any_changed && parent_view === variable
