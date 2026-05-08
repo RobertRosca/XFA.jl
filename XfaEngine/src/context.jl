@@ -86,6 +86,9 @@ include("context_types.jl")
 include("trainmatching.jl")
 
 import ..KaraboBridge: KaraboBridgeClient, BufferPool
+using DataStructures: CircularBuffer
+using FHist: Hist2D, bincounts, binedges
+using NaNStatistics: NaNStatistics, nanmean, nansum, nanmean!, nansum!, allocate_nanmean, allocate_nansum
 include("context_builtins.jl")
 
 @kwdef mutable struct WorkerState
@@ -967,6 +970,8 @@ function load_from_string(ctx_str::AbstractString; routing_rules=nothing)
 
     ctx_module = Module(Symbol(:XfaContext, gensym()))
     init_expr = quote
+        using XfaEngine.Context.NaNStatistics
+
         using XfaEngine.Context
         using XfaEngine.Context: VariableData, Parameter, KaraboBridge, Meta
     end

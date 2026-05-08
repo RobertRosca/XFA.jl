@@ -1,7 +1,3 @@
-using DataStructures: CircularBuffer
-using FHist: Hist2D, bincounts, binedges
-using NaNStatistics: nanmean, nansum, nanmean!, nansum!, allocate_nanmean, allocate_nansum
-
 @Group struct MockInput end
 
 update_sources(::MockInput, _) = nothing
