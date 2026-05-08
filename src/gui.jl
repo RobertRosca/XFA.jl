@@ -397,10 +397,10 @@ function draw_variable(name, var_data)
     ig.Dummy(min_node_width, 2)
 
     # Draw outputs
-    for (output_id, output) in var_data["outputs"]
-        label = string(output)
+    for output in var_data["outputs"]
+        label = output.label
         output_name = isempty(label) ? name : "$(name).$(label)"
-        ImNodes.BeginOutputAttribute(output_id, ImNodes.ImNodesPinShape_CircleFilled)
+        ImNodes.BeginOutputAttribute(output.id, ImNodes.ImNodesPinShape_CircleFilled)
 
         typestr = get_variable_typeinfo(output_name)
         if !isempty(typestr)
@@ -409,7 +409,7 @@ function draw_variable(name, var_data)
 
         if !isempty(label)
             if haskey(client.variable_data, output_name)
-                if ig.Button("$(label)###plot_button")
+                if plot_button("$(label)###plot_button", output_name)
                     push!(client.plots, Plot(output_name, client.plot_counter))
                     client.plot_counter += 1
                 end
@@ -418,14 +418,16 @@ function draw_variable(name, var_data)
             end
         end
 
-        rate = if haskey(client.variable_data, output_name)
-            client.variable_data[output_name].update_rate
-        else
-            get(client.context.input_rates, output_name, nothing)
-        end
-        if !isnothing(rate)
-            ig.SameLine()
-            ig.TextDisabled(@sprintf "%.2f Hz" rate)
+        if !output.is_subvariable
+            rate = if haskey(client.variable_data, output_name)
+                client.variable_data[output_name].update_rate
+            else
+                get(client.context.input_rates, output_name, nothing)
+            end
+            if !isnothing(rate)
+                ig.SameLine()
+                ig.TextDisabled(@sprintf "%.2f Hz" rate)
+            end
         end
 
         ImNodes.EndOutputAttribute()

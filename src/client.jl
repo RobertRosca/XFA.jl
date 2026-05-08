@@ -395,7 +395,7 @@ function build_context_state(state, ctx_info)
         end
 
         # The variable itself is always the first output
-        push!(ctx_state[name]["outputs"], (node_hash("$(name).outputs."), ""))
+        push!(ctx_state[name]["outputs"], OutputPin(node_hash("$(name).outputs."), ""))
 
         pp_names = Set(get(postprocessors_info, name, String[]))
         for subvar in ctx_info["subvariables"][name]
@@ -417,7 +417,7 @@ function build_context_state(state, ctx_info)
                     params = pp_params,
                 ))
             else
-                push!(ctx_state[name]["outputs"], (subvar_id, subvar))
+                push!(ctx_state[name]["outputs"], OutputPin(subvar_id, chopprefix(subvar, "$(name)."), true))
             end
         end
     end
@@ -472,7 +472,7 @@ function build_context_state(state, ctx_info)
         inputs = filter(group_filter, keys(ctx_info["inputs"]))
         for input_name in inputs
             stripped_name = chopprefix(input_name, "$(name).")
-            push!(ctx_state[name]["outputs"], (node_hash(input_name), stripped_name))
+            push!(ctx_state[name]["outputs"], OutputPin(node_hash(input_name), stripped_name))
         end
 
         # Add group variables from the DAG as outputs
@@ -484,12 +484,12 @@ function build_context_state(state, ctx_info)
 
             # The variable itself
             attr_id = node_hash("$(var_name).outputs.")
-            push!(ctx_state[name]["outputs"], (attr_id, stripped_name))
+            push!(ctx_state[name]["outputs"], OutputPin(attr_id, stripped_name))
 
             # Its subvariables
             for subvar in ctx_info["subvariables"][var_name]
                 subvar_id = node_hash("$(var_name).outputs.$(subvar)")
-                push!(ctx_state[name]["outputs"], (subvar_id, subvar))
+                push!(ctx_state[name]["outputs"], OutputPin(subvar_id, chopprefix(subvar, "$(name)."), true))
             end
         end
 
@@ -512,7 +512,7 @@ function build_context_state(state, ctx_info)
         if !haskey(ctx_info, name)
             ctx_state[name] = Dict{String, Any}("id" => node_hash(name))
             ctx_state[name]["dependencies"] = []
-            ctx_state[name]["outputs"] = [(node_hash(name), name)]
+            ctx_state[name]["outputs"] = [OutputPin(node_hash(name), name)]
             ctx_state[name]["type"] = :input
             ctx_state[name]["links"] = LinkInfo[]
         end
@@ -539,7 +539,7 @@ function build_context_state(state, ctx_info)
                     link_start_id = node_hash("$(dep.name).outputs.")
                     dep_node = group_of(dep.name)
                 else
-                    link_start_id = ctx_state[dep.name]["outputs"][1][1]
+                    link_start_id = ctx_state[dep.name]["outputs"][1].id
                     dep_node = dep.name
                 end
                 link_id = node_hash("$(link_start_id)->$(link_end_id)")

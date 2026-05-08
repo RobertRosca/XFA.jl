@@ -200,6 +200,13 @@ struct LinkInfo
     channel_key::Tuple{String, String}
 end
 
+struct OutputPin
+    id::Cint
+    label::String
+    is_subvariable::Bool
+end
+OutputPin(id, label) = OutputPin(id, label, false)
+
 @kwdef mutable struct ContextState
     context_state::Dict{String, Any} = Dict()
     context_path::String = ""
