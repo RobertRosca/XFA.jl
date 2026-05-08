@@ -520,6 +520,17 @@ end
     const show_compression_settings::Ref{Bool} = Ref(false)
     const precision::Ref{Cint} = Ref(Cint(-1))
 
+    # Colorbar interaction state. `clip_min`/`clip_max` are the values fed to
+    # the colormap shader; `display_min`/`display_max` are the visible range
+    # shown on the colorbar axis (>= clip range, controlled by mouse wheel).
+    const autoscale_colorbar::Ref{Bool} = Ref(true)
+    const colorbar_clip_min::Ref{Cdouble} = Ref(0.0)
+    const colorbar_clip_max::Ref{Cdouble} = Ref(1.0)
+    const colorbar_display_min::Ref{Cdouble} = Ref(0.0)
+    const colorbar_display_max::Ref{Cdouble} = Ref(1.0)
+    colorbar_drag::Symbol = :none
+    colorbar_display_zoomed::Bool = false
+
     gpu_heatmap::Union{Nothing, GPUHeatmap} = nothing
     dock_id::UInt32 = 0
 end
@@ -648,6 +659,116 @@ function draw_compression_settings(id, name, show_settings::Ref{Bool},
     end
 end
 
+# Interactive colorbar. Draws ImPlot.ColormapScale spanning the display range
+# and overlays two horizontal handles at clip_min/clip_max. Returns true when
+# the clip range changed and the colormap output needs re-rendering.
+#
+# Hovering: drag a handle to set clip_min/clip_max (disables colorbar
+# autoscale); mouse wheel zooms the display range around the cursor.
+function interactive_colorbar(plot::Plot, size::ImVec2)
+    display_min = plot.colorbar_display_min[]
+    display_max = plot.colorbar_display_max[]
+    clip_min = plot.colorbar_clip_min[]
+    clip_max = plot.colorbar_clip_max[]
+
+    # ColormapScale itself does not consume mouse input — without an overlay
+    # button, clicks fall through to the parent window and start a window
+    # move. Mark it as overlap-allowed and stack an InvisibleButton on top to
+    # capture clicks/drags for the handles.
+    ig.SetNextItemAllowOverlap()
+    start_pos = ig.GetCursorScreenPos()
+    ImPlot.ColormapScale("##colorbar_$(plot.id)",
+                         display_min, display_max,
+                         size, "%g",
+                         ImPlot.ImPlotColormapScaleFlags_None,
+                         ImPlot.ImPlotColormap_Viridis)
+    rect_min = ig.GetItemRectMin()
+    rect_max = ig.GetItemRectMax()
+
+    ig.SetCursorScreenPos(start_pos)
+    ig.InvisibleButton("##colorbar_input_$(plot.id)",
+                       ImVec2(rect_max.x - rect_min.x, rect_max.y - rect_min.y))
+    hovered = ig.IsItemHovered()
+    active = ig.IsItemActive()
+
+    # ColormapScale insets the gradient bar by PlotPadding inside its frame
+    pad_y = unsafe_load(ImPlot.GetStyle().PlotPadding).y
+    bar_top = rect_min.y + pad_y
+    bar_bot = rect_max.y - pad_y
+    bar_h = max(bar_bot - bar_top, 1.0f0)
+    span = display_max - display_min
+    safe_span = span == 0 ? 1.0 : span
+
+    value_to_y(v) = bar_bot - Float32(clamp((v - display_min) / safe_span, 0.0, 1.0)) * bar_h
+    y_to_value(y) = display_min + clamp((bar_bot - y) / bar_h, 0.0f0, 1.0f0) * safe_span
+
+    y_min_px = value_to_y(clip_min)
+    y_max_px = value_to_y(clip_max)
+
+    # Highlight the handle nearest the cursor while hovered/active
+    threshold = 8.0f0
+    near_handle = :none
+    if hovered || active
+        mouse_y = ig.GetMousePos().y
+        d_min = abs(mouse_y - y_min_px)
+        d_max = abs(mouse_y - y_max_px)
+        if active && plot.colorbar_drag !== :none
+            near_handle = plot.colorbar_drag
+        elseif d_min <= d_max && d_min < threshold
+            near_handle = :min
+        elseif d_max < threshold
+            near_handle = :max
+        end
+    end
+
+    draw = ig.GetWindowDrawList()
+    base_color = ig.GetColorU32(ig.ImGuiCol_Text, 0.5f0)
+    hover_color = ig.GetColorU32(ImVec4(1.0f0, 0.2f0, 0.2f0, 0.5f0))
+    thickness = 5.0f0
+    min_color = near_handle === :min ? hover_color : base_color
+    max_color = near_handle === :max ? hover_color : base_color
+    ig.AddLine(draw, ImVec2(rect_min.x, y_min_px), ImVec2(rect_max.x, y_min_px), min_color, thickness)
+    ig.AddLine(draw, ImVec2(rect_min.x, y_max_px), ImVec2(rect_max.x, y_max_px), max_color, thickness)
+
+    changed = false
+
+    if ig.IsItemActivated()
+        mouse_y = ig.GetMousePos().y
+        d_min = abs(mouse_y - y_min_px)
+        d_max = abs(mouse_y - y_max_px)
+        plot.colorbar_drag = d_min <= d_max ? :min : :max
+    end
+
+    if active && plot.colorbar_drag !== :none
+        mouse_y = ig.GetMousePos().y
+        new_v = y_to_value(mouse_y)
+        eps = 1e-9 * max(abs(safe_span), 1.0)
+        if plot.colorbar_drag === :min
+            plot.colorbar_clip_min[] = min(new_v, plot.colorbar_clip_max[] - eps)
+        else
+            plot.colorbar_clip_max[] = max(new_v, plot.colorbar_clip_min[] + eps)
+        end
+        plot.autoscale_colorbar[] = false
+        changed = true
+    elseif !active
+        plot.colorbar_drag = :none
+    end
+
+    if hovered && !active
+        wheel = unsafe_load(ig.GetIO().MouseWheel)
+        if wheel != 0
+            mouse_y = ig.GetMousePos().y
+            anchor = y_to_value(mouse_y)
+            factor = wheel > 0 ? 0.85 : 1 / 0.85
+            plot.colorbar_display_min[] = anchor + (display_min - anchor) * factor
+            plot.colorbar_display_max[] = anchor + (display_max - anchor) * factor
+            plot.colorbar_display_zoomed = true
+        end
+    end
+
+    return changed
+end
+
 function draw_plot(plot::Plot, store::Nothing, was_updated)
     ig.SetNextWindowSize((800, 500), ig.ImGuiCond_FirstUseEver)
 
@@ -723,7 +844,20 @@ function draw_plot(plot::Plot, store, was_updated)
                 dmin, dmax = sampled_pctile!(gpu.sample_buf, data)
                 gpu.scale_min = dmin
                 gpu.scale_max = dmax
-                render_colormapped!(gpu, ctx, dmin, dmax)
+                if needs_initial_upload || plot.autoscale_colorbar[]
+                    plot.colorbar_clip_min[] = dmin
+                    plot.colorbar_clip_max[] = dmax
+                    # Don't stomp a manual zoom — only reset the visible range
+                    # if the user has not adjusted it themselves.
+                    if needs_initial_upload || !plot.colorbar_display_zoomed
+                        margin = 0.1 * (dmax - dmin)
+                        plot.colorbar_display_min[] = dmin - margin
+                        plot.colorbar_display_max[] = dmax + margin
+                    end
+                end
+                render_colormapped!(gpu, ctx,
+                                    plot.colorbar_clip_min[],
+                                    plot.colorbar_clip_max[])
             end
 
             # Reserve space for the colorbar on the right
@@ -765,12 +899,11 @@ function draw_plot(plot::Plot, store, was_updated)
             end
 
             ig.SameLine()
-            ImPlot.ColormapScale("##colorbar_$(plot.id)",
-                                 gpu.scale_min, gpu.scale_max,
-                                 ImVec2(colorbar_width, plot_size.y),
-                                 "%g",
-                                 ImPlot.ImPlotColormapScaleFlags_None,
-                                 ImPlot.ImPlotColormap_Viridis)
+            if interactive_colorbar(plot, ImVec2(colorbar_width, plot_size.y))
+                render_colormapped!(gpu, ctx,
+                                    plot.colorbar_clip_min[],
+                                    plot.colorbar_clip_max[])
+            end
         end
 
         if !no_data
@@ -779,6 +912,13 @@ function draw_plot(plot::Plot, store, was_updated)
             if data isa AbstractMatrix
                 ig.SameLine()
                 ig.Checkbox("Fixed aspect", plot.fixed_aspect)
+                ig.SameLine()
+                if toggle_button("Auto colorbar##$(plot.id)", plot.autoscale_colorbar[])
+                    plot.autoscale_colorbar[] = !plot.autoscale_colorbar[]
+                    if plot.autoscale_colorbar[]
+                        plot.colorbar_display_zoomed = false
+                    end
+                end
             end
 
             if !is_scalar
