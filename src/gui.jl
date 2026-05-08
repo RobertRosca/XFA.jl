@@ -1076,11 +1076,15 @@ function draw_engine_logs()
         ig.SameLine(ig.CalcTextSize("0000-00-00 00:00:00  ").x)
 
         if !isnothing(log.extra_details)
+            CopyButton("log", log.message * "\n" * log.extra_details)
+            ig.SameLine()
             if ig.TreeNode(log.message)
                 ig.TextUnformatted(log.extra_details)
                 ig.TreePop()
             end
         else
+            CopyButton("log", log.message)
+            ig.SameLine()
             ig.BulletText(log.message)
         end
 
