@@ -29,6 +29,11 @@ function peekall(buffer::IOBuffer)
     return String(take!(copy(buffer)))
 end
 
+# Single ping with a 1s timeout; used to detect whether we can skip bastion/gateway jumps.
+function is_directly_reachable(address::AbstractString)
+    success(pipeline(`ping -c 1 -W 1 $address`; stdout=devnull, stderr=devnull))
+end
+
 function ssh_initialize(state::GuiState)
     client = state.client
     client.status = RemoteStatus_Connecting
@@ -38,7 +43,7 @@ function ssh_initialize(state::GuiState)
         user, address = split(address, "@")
     end
 
-    if endswith(address, ".desy.de") && address != GATEWAY && address != BASTION
+    if endswith(address, ".desy.de") && address != GATEWAY && address != BASTION && !is_directly_reachable(address)
         push!(client.ssh_hops, SshState(; address=BASTION))
         push!(client.ssh_hops, SshState(; address=GATEWAY))
     end
