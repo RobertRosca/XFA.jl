@@ -1152,11 +1152,19 @@ function draw_gui()
                     env_edited, new_environment = SafeInputText("##engine-environment";
                                                                 current_text=default(state[].engine_environment))
 
+                    ig.Text("Working directory:")
+                    ig.SameLine()
+                    wd_edited, new_working_dir = SafeInputText("##engine-working-dir";
+                                                               current_text=default(state[].engine_working_dir))
+
                     if edited
                         state[].address = new_address
                     end
                     if env_edited
                         state[].engine_environment = new_environment
+                    end
+                    if wd_edited
+                        state[].engine_working_dir = new_working_dir
                     end
                 end
             end

@@ -221,7 +221,7 @@ function initialize_engine(state)
             ssh_state = client.ssh_hops[end]
             session = ssh_state.session
 
-            working_dir = is_local ? pwd() : "/scratch/xfa"
+            working_dir = is_local ? pwd() : state.engine_working_dir
             bootstrap_jl = joinpath(working_dir, "bootstrap.jl")
             code = read(joinpath(@__DIR__, "bootstrap.jl"))
 
