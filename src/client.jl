@@ -681,20 +681,16 @@ function store_variable_data!(client, variable::VariableData)
         data = decompressed
     end
 
-    # Unsubscribed array variables arrive as shape-only metadata. We keep a
-    # placeholder array of the right type/shape so plot buttons and type
-    # labels work, but skip the data-flow updates — real data only arrives
-    # after the user subscribes by opening a plot. Reallocate the placeholder
-    # if the shape/eltype changed (dynamically-shaped variable, or first
-    # metadata after a subscribed payload had a different shape).
+    # Unsubscribed array variables arrive as shape-only metadata. We store the
+    # ArrayMetadata directly so plot buttons and type labels can read the
+    # shape; real data only arrives after the user subscribes by opening a
+    # plot. Skip data-flow updates in this path.
     if data isa ArrayMetadata
         if !haskey(client.variable_data, name)
-            client.variable_data[name] = VariableStore(; data=Array{data.eltype}(undef, data.size...))
+            client.variable_data[name] = VariableStore(; data)
         end
         store = client.variable_data[name]
-        if eltype(store.data) != data.eltype || collect(size(store.data)) != data.size
-            store.data = Array{data.eltype}(undef, data.size...)
-        end
+        store.data = data
         store.type = length(data.size) == 1 ? VariableType_Vector : VariableType_Array
         store.update_rate = variable.update_rate
         store.compression_ratio = compression_ratio

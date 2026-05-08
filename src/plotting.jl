@@ -788,15 +788,18 @@ function draw_plot(plot::Plot, store, was_updated)
         plot.dock_id = ig.GetWindowDockID()
         is_dimarray = data isa DimArray
         is_scalar = data isa CircularBuffer
+        is_metadata = data isa ArrayMetadata
         label = store.title
 
         apply_autoscale(plot)
 
         region_avail = ig.GetContentRegionAvail()
         plot_size = ImVec2(region_avail.x, max(region_avail.y - 30, 100))
-        no_data = length(data) == 0
+        no_data = is_metadata || length(data) == 0
 
-        if no_data
+        if is_metadata
+            ig.Text("Waiting for data: $(plot.name)")
+        elseif no_data
             ig.Text("Array has length 0, nothing to plot")
         elseif data isa AbstractVector
             if ImPlot.BeginPlot(store.title, store.xlabel, store.ylabel, plot_size)
@@ -975,7 +978,8 @@ function var_type_label(store)
     elseif store.type == VariableType_Vector
         "vector"
     elseif store.type == VariableType_Array
-        """array $(join(size(store.data), "×"))"""
+        sz = store.data isa ArrayMetadata ? store.data.size : size(store.data)
+        """array $(join(sz, "×"))"""
     else
         ""
     end

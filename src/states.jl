@@ -158,7 +158,7 @@ const SCALAR_BUFFER_CAPACITY = 10_000
 
 @kwdef mutable struct VariableStore
     const updates::Channel = Channel(100)
-    data::Union{Vector, Matrix, DimVector, DimMatrix, CircularBuffer}
+    data::Union{AbstractArray, CircularBuffer, ArrayMetadata}
     type::VariableType = VariableType_Unknown
 
     # This field is only used for non-scalar data. Scalar data is stored as a

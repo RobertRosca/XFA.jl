@@ -19,7 +19,8 @@ using HTTP: HTTP, WebSockets
 using XfaEngine: EngineState, getavailableport, RoutingRule, RemapRule, RemapKind,
     RemapKind_Simple, RemapKind_Proxy
 using Dates: Dates, unix2datetime, @dateformat_str
-using XfaEngine.Context: Parameter, OptionalDims, KaraboDevice, Dependency, karabo_dependency
+using XfaEngine.Context: Parameter, OptionalDims, KaraboDevice, Dependency, karabo_dependency,
+    ArrayMetadata
 using XfaEngine.ZfpWorkspaces: ZfpWorkspace, CompressedArray, decompress_array,
     decompress_array!, allocate_array
 include("states.jl")
