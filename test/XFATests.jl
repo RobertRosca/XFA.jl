@@ -220,6 +220,15 @@ end
             1
         end
         """
+
+        # Variable-reference shorthand with an inline argument remap: only the
+        # inner arg's karabo dep should change, not the entire RHS.
+        source = """
+        @Variable jf2 -> jf1(data -> karabo"A/B:daqOutput[data.adc]@A/CAL:dataOutput")
+        """
+        @test XFA.replace_dep(source, "jf2", "data", karabo"C/D:daqOutput[data.adc]@C/CAL:dataOutput") == """
+        @Variable jf2 -> jf1(data -> karabo"C/D:daqOutput[data.adc]@C/CAL:dataOutput")
+        """
     end
 
     @testset "Change group dependency" begin
@@ -336,6 +345,34 @@ end
         @test_logs (:warn, r"Could not find constructor.*") begin
             @test XFA.replace_constructor_kwarg(source, "other", "address", "\"tcp://foo:1234\"") == source
         end
+    end
+
+    @testset "Edit string group parameter" begin
+        # Replace an existing string kwarg on a generic group constructor
+        source = """
+        my_group = MyGroup(; label="old", count=3)
+        """
+        @test XFA.replace_constructor_kwarg(source, "my_group", "label", "\"new\"") == """
+        my_group = MyGroup(; label="new", count=3)
+        """
+
+        # Append the kwarg when the group has no parameter section yet
+        source = """
+        my_group = MyGroup()
+        """
+        @test XFA.replace_constructor_kwarg(source, "my_group", "label", "\"hello\"") == """
+        my_group = MyGroup(; label="hello")
+        """
+
+        # Strings with quotes and backslashes round-trip through escape_string
+        new_value = "with \"quotes\" and \\ slash"
+        source = """
+        my_group = MyGroup(; label="plain")
+        """
+        @test XFA.replace_constructor_kwarg(source, "my_group", "label",
+                                            "\"$(escape_string(new_value))\"") == """
+        my_group = MyGroup(; label="with \\"quotes\\" and \\\\ slash")
+        """
     end
 end
 
