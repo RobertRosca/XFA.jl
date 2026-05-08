@@ -726,9 +726,12 @@ function store_variable_data!(client, variable::VariableData)
     store.unit = variable.unit
     store.fixed_aspect = variable.fixed_aspect
 
-    # Use explicit labels if provided, otherwise derive from DimArray or data type
+    # Use explicit labels if provided, otherwise derive from DimArray or data type.
+    # For 2D DimArrays the heatmap maps dim 1 → Y (rows) and dim 2 → X (cols).
     store.xlabel = if !isnothing(variable.xlabel)
         variable.xlabel
+    elseif data isa DimMatrix
+        DD.label(DD.dims(data)[2])
     elseif data isa DimArray
         DD.label(DD.dims(data)[1])
     elseif data isa Number
@@ -738,6 +741,8 @@ function store_variable_data!(client, variable::VariableData)
     end
     store.ylabel = if !isnothing(variable.ylabel)
         variable.ylabel
+    elseif data isa DimMatrix
+        DD.label(DD.dims(data)[1])
     elseif data isa DimArray
         DD.label(data)
     else
