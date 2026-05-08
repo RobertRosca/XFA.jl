@@ -13,7 +13,7 @@ export AbstractMessage, Ping, Shutdown,
     Pong, AvailableTrainmatchers,
     Started, Stopped, Devices,
     ContextInfo, ParameterChanged, TrainData, RemoteReplState,
-    PipelineStats, Ack, Envelope, MessageId, client_send, server_send
+    PipelineStats, Ack, Envelope, MessageId, ExceptionMessage, client_send, server_send
 
 import Serialization: serialize, deserialize
 
@@ -25,6 +25,15 @@ using ..XfaEngine: RoutingRule, RemapRule
 
 
 abstract type AbstractMessage end
+
+# Wraps a printed exception + stacktrace as a plain string so the client
+# never has to deserialize Exception subtypes whose modules it may not have
+# loaded.
+struct ExceptionMessage
+    text::String
+end
+ExceptionMessage(ex, bt) = ExceptionMessage(sprint(showerror, ex, bt))
+ExceptionMessage(ex::Exception) = ExceptionMessage(sprint(showerror, ex))
 
 # Messages that a client can send
 struct Ping <: AbstractMessage end
@@ -111,7 +120,7 @@ struct Started <: AbstractMessage end
 struct Stopped <: AbstractMessage end
 
 struct Devices <: AbstractMessage
-    device_names::Union{Dict{String, Dict{String, Any}}, Exception}
+    device_names::Union{Dict{String, Dict{String, Any}}, ExceptionMessage}
 end
 
 struct DeviceSchema <: AbstractMessage
@@ -128,7 +137,7 @@ struct DeviceProperty <: AbstractMessage
 end
 
 struct ContextInfo <: AbstractMessage
-    info::Union{Dict, Exception}
+    info::Union{Dict, ExceptionMessage}
     is_running::Bool
     source::String
 end
@@ -159,7 +168,7 @@ struct PipelineStats <: AbstractMessage
 end
 
 struct Ack <: AbstractMessage
-    error::Union{Exception, Nothing}
+    error::Union{ExceptionMessage, Nothing}
 end
 Ack() = Ack(nothing)
 

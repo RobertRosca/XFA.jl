@@ -773,9 +773,9 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
         client.context.pipeline_status = PipelineStatus_Stopped
 
     elseif msg isa Devices
-        if msg.device_names isa Exception
-            @error "Error from server with DEVICES" exception=msg
-            log_engine_error(state, "Failed to get devices", sprint(showerror, msg.device_names))
+        if msg.device_names isa ExceptionMessage
+            @error "Error from server with DEVICES" exception=msg.device_names.text
+            log_engine_error(state, "Failed to get devices", msg.device_names.text)
             client.webproxy_status = RequestStatus_Error
         else
             client.karabo_devices = msg.device_names
@@ -849,7 +849,7 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
             filter!(kv -> haskey(client.context.context_state, kv.first), client.variable_data)
         else
             @error "Context failed to load"
-            log_engine_error(state, "Context failed to load", sprint(showerror, msg.info))
+            log_engine_error(state, "Context failed to load", msg.info.text)
         end
 
         client.context.pipeline_status = msg.is_running ? PipelineStatus_Started : PipelineStatus_Stopped
@@ -885,8 +885,8 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
         client.remoterepl_status = msg.enabled ? RemoteReplStatus_Running : RemoteReplStatus_Stopped
     elseif msg isa Ack
         if !isnothing(msg.error)
-            @error "Server reported an error" exception=msg.error
-            log_engine_error(state, "Server reported an error", sprint(showerror, msg.error))
+            @error "Server reported an error" exception=msg.error.text
+            log_engine_error(state, "Server reported an error", msg.error.text)
         end
 
         if !isnothing(replied_to) && replied_to.msg_type == Start

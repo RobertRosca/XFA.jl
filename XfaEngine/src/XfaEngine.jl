@@ -326,7 +326,7 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
             @info "Responded to 'GetDevices' from $(id)"
         catch ex
             @error "Error in 'GetDevices', requested by $(id)" exception=(ex, catch_backtrace())
-            Protocol.server_send(ws, Devices(ex); reply_to)
+            Protocol.server_send(ws, Devices(Protocol.ExceptionMessage(ex, catch_backtrace())); reply_to)
         end
 
     elseif msg isa GetDeviceSchema
@@ -342,7 +342,7 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
             @info "Responded to 'GetDeviceProperty' ($(msg.device).$(msg.property)) from $(id)"
         catch ex
             @error "Error in 'GetDeviceProperty', requested by $(id)" exception=(ex, catch_backtrace())
-            Protocol.server_send(ws, DeviceProperty(msg.topic, msg.device, msg.property, ex); reply_to)
+            Protocol.server_send(ws, DeviceProperty(msg.topic, msg.device, msg.property, Protocol.ExceptionMessage(ex, catch_backtrace())); reply_to)
         end
     elseif msg isa GetEngineDir
         Protocol.server_send(ws, EngineDir(pkgdir(XfaEngine)); reply_to)
@@ -364,7 +364,7 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
             ctx.forwarder = Base.Fix1(forward_output, state)
             ctx
         catch ex
-            ex
+            Protocol.ExceptionMessage(ex, catch_backtrace())
         end
 
         if new_ctx_or_ex isa XfaContext
@@ -396,7 +396,7 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
             Protocol.server_send(ws, Ack(); reply_to)
         catch ex
                 @error "Failed to start pipeline" exception=(ex, catch_backtrace())
-            Protocol.server_send(ws, Ack(ex); reply_to)
+            Protocol.server_send(ws, Ack(Protocol.ExceptionMessage(ex, catch_backtrace())); reply_to)
         end
         @info "Started"
     elseif msg isa Stop
