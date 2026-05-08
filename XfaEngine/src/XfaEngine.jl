@@ -448,19 +448,21 @@ function handle_client(state::EngineState, id)
         Protocol.server_send(ws, ContextInfo(state.ctx, read(state.ctx.path, String)))
     end
 
-    for msg_bytes in ws
-        buffer = IOBuffer(msg_bytes)
-        envelope = deserialize(buffer)::Envelope
+    try
+        for msg_bytes in ws
+            buffer = IOBuffer(msg_bytes)
+            envelope = deserialize(buffer)::Envelope
 
-        try
-            @invokelatest handle_message(envelope.msg, state, id, envelope.id)
-        catch ex
-            @error "Caught exception when handling message from $(id)" exception=(ex, catch_backtrace())
+            try
+                @invokelatest handle_message(envelope.msg, state, id, envelope.id)
+            catch ex
+                @error "Caught exception when handling message from $(id)" exception=(ex, catch_backtrace())
+            end
         end
+    finally
+        delete!(state.clients, id)
+        @info "Disconnected from client $(id)"
     end
-
-    delete!(state.clients, id)
-    @info "Disconnected from client $(id)"
 end
 
 # Helper variables/functions to create amusing client IDs
