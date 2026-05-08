@@ -1095,9 +1095,8 @@ source_device_class(client::ClientState, source::String) = source_device_info(cl
 # Returns (rewritten, pending). `rewritten` is the new source if the rule
 # matched and produced a result, else nothing. `pending` is a request ID if
 # the rule needs an in-flight device-property lookup to resolve.
-function apply_remap_rule(client::ClientState, rule::RemapRule, source::String,
-                          topic::String, device::String, device_class::String,
-                          property_ref::Ref{Any})
+function apply_remap_rule(client::ClientState, rule::RemapRule, source,
+                          topic, device, device_class, property_ref::Ref{Any})
     if !occursin(Regex(rule.device_class), device_class)
         return nothing, nothing
     end
