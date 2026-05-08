@@ -45,6 +45,11 @@ function get_sources(bridge::KaraboBridge)
         return bridge._mock_sources
     end
 
+    if isnothing(XfaEngine.current_engine_state)
+        @warn "Engine is not initialized, skipping source discovery for KaraboBridge"
+        return String[]
+    end
+
     try
         wp = XfaEngine.get_webproxy(bridge.trainmatcher[])
         devices = XfaEngine.get_devices(wp)

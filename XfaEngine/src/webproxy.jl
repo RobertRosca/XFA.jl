@@ -68,7 +68,12 @@ function get_webproxy(device::AbstractString)
     error("No webproxy found for device '$device'")
 end
 
-get_webproxy(device::KaraboDevice) = current_engine_state.webproxies[device.topic]
+function get_webproxy(device::KaraboDevice)
+    if isnothing(current_engine_state)
+        error("Engine is not initialized, cannot get a WebProxy")
+    end
+    current_engine_state.webproxies[device.topic]
+end
 
 # Flatten the returned dict a bit by removing timestamp and tid entries for each
 # node.
