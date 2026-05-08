@@ -11,7 +11,7 @@ export ZfpWorkspace, CompressedArray, compress_array,
 const COMPRESSION_THRESHOLD = 500
 
 default_precision(::Type{<:Integer}) = 11
-default_precision(::Type{<:AbstractFloat}) = 15
+default_precision(::Type{<:AbstractFloat}) = 7
 const NONFINITE_RADIUS = 5  # half-window: ~10 surrounding elements total
 
 const LowBitInt = Union{Int8, UInt8, Int16, UInt16}
