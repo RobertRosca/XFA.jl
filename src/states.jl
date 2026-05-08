@@ -50,15 +50,21 @@ DeviceProperties() = DeviceProperties(PropertyList(), Dict{String, PropertyList}
     RemoteReplStatus_Stopped
 end
 
-mutable struct KaraboDepTextState
-    cursor_pos::Cint
-    device::Maybe{String}
+@kwdef mutable struct KaraboDepTextState
+    cursor_pos::Cint = -1
+    device::Maybe{String} = nothing
+
     # If set, the callback will replace the buffer contents with this text,
     # move the cursor to the end, and then clear it.
-    wanted_text::Maybe{String}
-end
+    wanted_text::Maybe{String} = nothing
 
-KaraboDepTextState() = KaraboDepTextState(-1, nothing, nothing)
+    # Set when a remap requires an async device-property lookup. The widget
+    # stays disabled until the request resolves, then re-runs the remap.
+    # `proxy_property` is filled in by the lookup's callback.
+    pending_remap_id::Maybe{Int} = nothing
+    pending_remap_source::Maybe{String} = nothing
+    proxy_property::Ref{Any} = Ref{Any}(nothing)
+end
 
 mutable struct DepTextState
     is_karabo::Bool
@@ -152,7 +158,7 @@ const SCALAR_BUFFER_CAPACITY = 10_000
 
 @kwdef mutable struct VariableStore
     const updates::Channel = Channel(100)
-    data::Union{Vector, Matrix, DimVector, DimMatrix, CircularBuffer}
+    data::Union{AbstractArray, CircularBuffer, ArrayMetadata}
     type::VariableType = VariableType_Unknown
 
     # This field is only used for non-scalar data. Scalar data is stored as a
@@ -166,9 +172,16 @@ const SCALAR_BUFFER_CAPACITY = 10_000
     const scalar_data_cache::Vector{Float64} = Float64[]
     const scalar_tids_cache::Vector{Float64} = Float64[]
 
-    # Timestamps of recent updates for computing average rate (updates/sec)
-    const update_timestamps::Vector{Float64} = Float64[]
+    # Processing rate (Hz) reported by the engine.
     update_rate::Float64 = 0.0
+
+    # Compression ratio (uncompressed / compressed bytes) of the most recent
+    # payload. NaN when the variable arrived uncompressed.
+    compression_ratio::Float64 = NaN
+
+    # Size in bytes of the most recent array payload on the wire — the
+    # compressed size for compressed payloads, otherwise sizeof(data).
+    received_bytes::Int = 0
 
     # Metadata from VariableData
     title::String = ""
@@ -177,7 +190,7 @@ const SCALAR_BUFFER_CAPACITY = 10_000
     xlabel::String = ""
     ylabel::String = ""
     unit::Maybe{String} = nothing
-    fixed_aspect::Bool = false
+    fixed_aspect::Bool = true
 end
 
 struct LinkInfo
@@ -186,6 +199,13 @@ struct LinkInfo
     end_id::Cint
     channel_key::Tuple{String, String}
 end
+
+struct OutputPin
+    id::Cint
+    label::String
+    is_subvariable::Bool
+end
+OutputPin(id, label) = OutputPin(id, label, false)
 
 @kwdef mutable struct ContextState
     context_state::Dict{String, Any} = Dict()
@@ -197,6 +217,10 @@ end
     # Latest per-channel (drops, size, capacity) snapshot from the engine,
     # keyed by (producer, consumer). Updated roughly once per second.
     channel_stats::Dict{Tuple{String, String}, XfaEngine.Context.ChannelStat} = Dict()
+
+    # Latest smoothed Hz at which each input is pushing data, keyed by input
+    # name. Updated roughly once per second alongside `channel_stats`.
+    input_rates::Dict{String, Float64} = Dict()
 
     lock::ReentrantLock = ReentrantLock()
 end
@@ -237,6 +261,16 @@ end
 
 EngineLog(message::String, extra_details::Maybe{String}=nothing) = EngineLog(time(), message, extra_details)
 
+# Per-variable subscription state. `count` tracks open plots referencing the
+# variable; when it drops to zero we flip `active` off (so the engine stops
+# streaming) but keep the entry around to remember the user's chosen
+# `precision` for the next time a plot of this variable is opened.
+@kwdef mutable struct SubscriptionState
+    count::Int = 0
+    precision::Int = -1
+    active::Bool = true
+end
+
 @kwdef mutable struct ClientState
     client_id::String = ""
     worker_info::Dict = Dict()
@@ -273,6 +307,10 @@ EngineLog(message::String, extra_details::Maybe{String}=nothing) = EngineLog(tim
     routing_rules::Vector{RoutingRule} = RoutingRule[]
     routing_rules_request_status::RequestStatus = RequestStatus_Idle
     routing_rules_set_request::Maybe{Int} = nothing
+    # Effective remap rules supplied by the engine (user rules followed by
+    # builtins). Applied to source strings the user enters, in order; every
+    # matching rule fires, not just the first.
+    remap_rules::Vector{RemapRule} = RemapRule[]
     # Per-row source-autocomplete state for the rules table, keyed by row index.
     routing_rule_source_states::Dict{Int, KaraboDepTextState} = Dict{Int, KaraboDepTextState}()
     karabo_devices::Dict{String, Dict{String, Any}} = Dict()
@@ -304,6 +342,15 @@ EngineLog(message::String, extra_details::Maybe{String}=nothing) = EngineLog(tim
     plot_counter::Int = 0
     plots::Vector{Union{Plot, CorrelationPlot}} = Union{Plot, CorrelationPlot}[]
 
+    # Variable subscriptions, keyed by fully-qualified name. Entries are
+    # removed when the open-plot count drops to zero. The keys (and each
+    # entry's precision) get sent to the engine via SetVariableSubscriptions.
+    subscriptions::Dict{String, SubscriptionState} = Dict{String, SubscriptionState}()
+
+    # One zfp workspace per qualified variable name, reused across trains so
+    # the decompression scratch buffers don't get resized on every payload.
+    zfp_workspaces::Dict{String, ZfpWorkspace} = Dict{String, ZfpWorkspace}()
+
     # Engine log messages
     engine_logs::Vector{EngineLog} = EngineLog[]
     log_dateformat::Dates.DateFormat = dateformat"yyyy-mm-dd HH:MM:SS"
@@ -311,6 +358,17 @@ EngineLog(message::String, extra_details::Maybe{String}=nothing) = EngineLog(tim
     # Message tracking
     pending_requests::Dict{Int, PendingRequest} = Dict()
     engine_request_callbacks::Dict{Int, Function} = Dict()
+
+    # Name of the parameter currently being changed; the node graph is disabled
+    # while this is set so the user can't queue further changes mid-update.
+    # Cleared when the engine echoes a ParameterChanged or replies with an error.
+    pending_parameter_change::Maybe{String} = nothing
+
+    # Fully-qualified name of a parameter whose new value should be written
+    # back to the context file once the engine confirms the change. Set by the
+    # widget that initiated the edit, applied (write file, no reload) on the
+    # matching ParameterChanged echo, dropped on error.
+    pending_source_edit::Maybe{String} = nothing
 
     lock::ReentrantLock = ReentrantLock()
 end

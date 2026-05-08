@@ -23,6 +23,7 @@ Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 XfaEngine = "df4d7780-7f2f-4694-8ef1-2cbac230b49a"
+ZfpCompression = "43441a71-1662-41c6-b8ea-40ed1525242b"
 
 [sources]
 XfaEngine = {path = "XfaEngine"}

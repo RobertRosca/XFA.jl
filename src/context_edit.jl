@@ -147,13 +147,7 @@ end
 
 # Return the string content inside a Karabo string macro literal, i.e. the
 # dependency string without the topic prefix.
-function karabo_dep_content(dep::Dependency)
-    if occursin(':', dep.source)
-        "$(dep.source)[$(dep.property)]"
-    else
-        "$(dep.source).$(dep.property)"
-    end
-end
+karabo_dep_content(dep::Dependency) = karabo_dep_string(nothing, dep.source, dep.property, dep.proxy)
 
 # Convert a Dependency to its source code representation.
 function dep_to_source(dep::Dependency)
@@ -182,22 +176,33 @@ end
 
 # Find the arrow node for a specific argument in a @Variable definition.
 function find_arg_arrow(var_node::SyntaxNode, variable_name::String, arg_name::String)
-    arrow_nodes = find_nodes(var_node) do node
-        kind(node) == K"->" || return false
+    # LHS leaf symbol of an arrow node, or nothing if not a simple arrow.
+    arrow_lhs_sym(node) = begin
+        kind(node) == K"->" || return nothing
         cs = children(node)
-        isnothing(cs) && return false
-
+        isnothing(cs) && return nothing
         lhs = cs[1]
         if kind(lhs) == K"tuple"
             tuple_cs = children(lhs)
-            !isnothing(tuple_cs) && !isempty(tuple_cs) &&
-                is_leaf(tuple_cs[1]) && tuple_cs[1].val in (Symbol(arg_name), Symbol(variable_name))
+            (isnothing(tuple_cs) || isempty(tuple_cs) || !is_leaf(tuple_cs[1])) && return nothing
+            tuple_cs[1].val
+        elseif is_leaf(lhs)
+            lhs.val
         else
-            is_leaf(lhs) && lhs.val == Symbol(arg_name)
+            nothing
         end
     end
 
-    return isempty(arrow_nodes) ? nothing : arrow_nodes[1]
+    # Prefer an arrow whose LHS is the requested arg_name. Fall back to a
+    # variable_name match only for the shorthand `@Variable name -> ...` form
+    # (where the caller may pass a placeholder arg_name like "data"), and only
+    # when no arg_name match exists — otherwise a nested `arg -> karabo"..."`
+    # inside the body would lose to the outer arrow.
+    by_arg = find_nodes(n -> arrow_lhs_sym(n) == Symbol(arg_name), var_node)
+    !isempty(by_arg) && return by_arg[1]
+
+    by_var = find_nodes(n -> arrow_lhs_sym(n) == Symbol(variable_name), var_node)
+    return isempty(by_var) ? nothing : by_var[1]
 end
 
 """
@@ -315,7 +320,8 @@ function replace_group_dep(source::String, group_name::String,
                               parameter_dep_to_source(new_dep))
 end
 
-function set_group_param(state, var_name::String, kwarg_name::String, new_value::String)
+function set_group_param(state, var_name::String, kwarg_name::String, new_value::String;
+                         reload::Bool=true)
     client = state.client
     source = client.context.source
 
@@ -337,7 +343,11 @@ function set_group_param(state, var_name::String, kwarg_name::String, new_value:
         end
     end
 
-    load_context(state)
+    if reload
+        load_context(state)
+    else
+        client.context.source = new_source
+    end
 end
 
 # Replace a dependency (Karabo or variable) in the source code and reload.

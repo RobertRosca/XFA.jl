@@ -6,12 +6,14 @@ export AbstractMessage, Ping, Shutdown,
     GetDeviceProperty, DeviceProperty,
     GetEngineDir, EngineDir,
     GetRoutingRules, SetRoutingRules, RoutingRules,
+    GetRemapRules, RemapRules,
+    SetVariableSubscriptions,
     ChangeParameter, Start, Stop,
     SetDebugMode, SetRemoteRepl,
     Pong, AvailableTrainmatchers,
     Started, Stopped, Devices,
     ContextInfo, ParameterChanged, TrainData, RemoteReplState,
-    ChannelStats, Ack, Envelope, MessageId, client_send, server_send
+    PipelineStats, Ack, Envelope, MessageId, ExceptionMessage, client_send, server_send
 
 import Serialization: serialize, deserialize
 
@@ -19,10 +21,19 @@ import HTTP: WebSockets
 
 import ..Context
 using ..Context: XfaContext, VariableData, Parameter
-using ..XfaEngine: RoutingRule
+using ..XfaEngine: RoutingRule, RemapRule
 
 
 abstract type AbstractMessage end
+
+# Wraps a printed exception + stacktrace as a plain string so the client
+# never has to deserialize Exception subtypes whose modules it may not have
+# loaded.
+struct ExceptionMessage
+    text::String
+end
+ExceptionMessage(ex, bt) = ExceptionMessage(sprint(showerror, ex, bt))
+ExceptionMessage(ex::Exception) = ExceptionMessage(sprint(showerror, ex))
 
 # Messages that a client can send
 struct Ping <: AbstractMessage end
@@ -56,8 +67,19 @@ end
 
 struct GetRoutingRules <: AbstractMessage end
 
+struct GetRemapRules <: AbstractMessage end
+
 struct SetRoutingRules <: AbstractMessage
     rules::Vector{RoutingRule}
+end
+
+# Tells the engine which array-valued variables this client wants forwarded.
+# Scalar variables are always sent; everything else is suppressed unless its
+# fully-qualified name (e.g. "var", "var.subvar") is a key in this dict.
+# The value is the requested zfp precision for the compressed payload; -1
+# means "use the engine default".
+struct SetVariableSubscriptions <: AbstractMessage
+    variables::Dict{String, Int}
 end
 
 struct Start <: AbstractMessage end
@@ -86,6 +108,10 @@ struct RoutingRules <: AbstractMessage
     rules::Vector{RoutingRule}
 end
 
+struct RemapRules <: AbstractMessage
+    rules::Vector{RemapRule}
+end
+
 struct EngineDir <: AbstractMessage
     path::String
 end
@@ -94,7 +120,7 @@ struct Started <: AbstractMessage end
 struct Stopped <: AbstractMessage end
 
 struct Devices <: AbstractMessage
-    device_names::Union{Dict{String, Dict{String, Any}}, Exception}
+    device_names::Union{Dict{String, Dict{String, Any}}, ExceptionMessage}
 end
 
 struct DeviceSchema <: AbstractMessage
@@ -111,7 +137,7 @@ struct DeviceProperty <: AbstractMessage
 end
 
 struct ContextInfo <: AbstractMessage
-    info::Union{Dict, Exception}
+    info::Union{Dict, ExceptionMessage}
     is_running::Bool
     source::String
 end
@@ -131,15 +157,18 @@ struct RemoteReplState <: AbstractMessage
     port::Int
 end
 
-# Per-channel snapshots keyed by (producer, consumer). Producer is either an
-# external dependency name (e.g. "motor.pos") or a variable name; consumer is
-# always the downstream variable name.
-struct ChannelStats <: AbstractMessage
-    stats::Dict{Tuple{String, String}, Context.ChannelStat}
+# Periodic pipeline metrics broadcast. `channel_stats` holds per-channel
+# snapshots keyed by (producer, consumer); producer is either an external
+# dependency name (e.g. "motor.pos") or a variable name, consumer is always
+# the downstream variable name. `input_rates` is the smoothed Hz at which
+# each input is pushing data, keyed by input name.
+struct PipelineStats <: AbstractMessage
+    channel_stats::Dict{Tuple{String, String}, Context.ChannelStat}
+    input_rates::Dict{String, Float64}
 end
 
 struct Ack <: AbstractMessage
-    error::Union{Exception, Nothing}
+    error::Union{ExceptionMessage, Nothing}
 end
 Ack() = Ack(nothing)
 

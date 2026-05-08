@@ -11,6 +11,7 @@ using DistributedNext: DistributedNext, RemoteChannel, remote_do, remoteref_id, 
 import MacroTools
 import MacroTools: @capture, postwalk, prettify
 import OrderedCollections: OrderedDict
+using Accessors: @set
 import DimensionalData as DD
 import ..XfaEngine
 
@@ -19,7 +20,7 @@ include("circular_channel.jl")
 
 # Factory for RemoteChannels carrying per-train variable data. Oldest items
 # are overwritten when a consumer falls behind; drops are counted per channel.
-variable_channel() = RemoteChannel(() -> CircularChannel{VariableData}(100))
+variable_channel() = RemoteChannel(() -> CircularChannel{VariableData}(XfaEngine.VARIABLE_CHANNEL_SIZE))
 
 struct ChannelStat
     drops::Int
@@ -85,7 +86,10 @@ end
 include("context_types.jl")
 include("trainmatching.jl")
 
-import ..KaraboBridge: KaraboBridgeClient
+import ..KaraboBridge: KaraboBridgeClient, BufferPool
+using DataStructures: CircularBuffer
+using FHist: Hist2D, bincounts, binedges
+using NaNStatistics: NaNStatistics, nanmean, nansum, nanmean!, nansum!, allocate_nanmean, allocate_nansum
 include("context_builtins.jl")
 
 @kwdef mutable struct WorkerState
@@ -121,6 +125,11 @@ end
 
     variable_tasks::Dict{String, Task} = Dict()
     variable_channels::Dict{String, Dict{String, RemoteChannel}} = Dict()
+
+    # Smoothed Hz at which inputs and external dependencies are pushing data,
+    # keyed by input/dep name. Variable rates are sent piggy-backed on
+    # `VariableData.update_rate` instead.
+    input_rates::Dict{String, Float64} = Dict()
 
     stream_output::Union{RemoteChannel, Nothing} = nothing
     forwarder::Function = Returns(nothing)
@@ -329,7 +338,39 @@ function to_dict(ctx::XfaContext)
         parameters[name] = Parameter(; name=param.name, value=param.value, set_by_user=param.set_by_user)
     end
 
-    return Dict("dag" => ctx.dag,
+    # group_type holds a DataType that may live in the context's anonymous
+    # module, which doesn't exist on the client and would break deserialization.
+    dag = Dict{String, OrderedDict}()
+    for (name, deps) in ctx.dag
+        dag[name] = OrderedDict{Any, Any}(k => v isa Dependency && !isnothing(v.group_type) ?
+                                          (@set v.group_type = nothing) : v
+                                          for (k, v) in deps)
+    end
+
+    # For group variables, recover the original arg_name => group field mapping
+    # from variable_dependencies. The DAG stores the resolved Dependency value,
+    # losing the field name needed for source rewriting on the client.
+    group_parameter_args = Dict{String, Dict{String, String}}()
+    for (var_name, func) in ctx.functions
+        # Only group-instance variables (e.g. "foo_group.foo") need the mapping;
+        # the unbound function entry (e.g. "foo") shares the same dep methods
+        # but isn't tied to a constructor the client could rewrite.
+        if !occursin('.', var_name) || !@invokelatest(applicable(variable_dependencies, func))
+            continue
+        end
+
+        mapping = Dict{String, String}()
+        for (arg_name, dep) in @invokelatest variable_dependencies(func)
+            if dep isa Dependency && dep.kind == DepKind_GroupParameter
+                mapping[arg_name] = dep.parameter
+            end
+        end
+        if !isempty(mapping)
+            group_parameter_args[var_name] = mapping
+        end
+    end
+
+    return Dict("dag" => dag,
                 "subvariables" => ctx.subvariables,
                 "postprocessors" => ctx.variable_postprocessors,
                 "parameters" => parameters,
@@ -337,6 +378,7 @@ function to_dict(ctx::XfaContext)
                 "groups" => groups,
                 "origins" => origins,
                 "dep_to_input" => ctx.dep_to_input,
+                "group_parameter_args" => group_parameter_args,
                 "path" => ctx.path)
 end
 
@@ -434,15 +476,11 @@ function change_parameter(ctx::XfaContext, new_param::Parameter)
     pause_pipeline() do
         ctx_param = worker_state.parameters[new_param.name]
         if !isnothing(ctx_param.update_handler)
-            try
-                owner = find_parameter_owner(ctx, new_param.name)
-                if !isnothing(owner)
-                    ctx_param.update_handler(owner, new_param.value)
-                else
-                    ctx_param.update_handler(new_param.value)
-                end
-            catch ex
-                @error "Exception in update handler for parameter '$(ctx_param.name)'" exception=ex
+            owner = find_parameter_owner(ctx, new_param.name)
+            if !isnothing(owner)
+                ctx_param.update_handler(owner, new_param.value)
+            else
+                ctx_param.update_handler(new_param.value)
             end
         end
 
@@ -482,26 +520,14 @@ function input_wrapper(name, group, channel)
     end
 end
 
-function wrap_result(result, tid, name; subvariables=Dict{String, Any}())
+function wrap_result(result, tid, name; subvariables=Dict{String, Any}(), update_rate=0.0)
     if result isa VariableData
         VariableData(; tid, name, data=result.data, subvariables,
                      title=result.title, x_axis=result.x_axis, y_axis=result.y_axis,
                      xlabel=result.xlabel, ylabel=result.ylabel, unit=result.unit,
-                     fixed_aspect=result.fixed_aspect)
+                     fixed_aspect=result.fixed_aspect, update_rate)
     else
-        VariableData(; tid, name, data=result, subvariables)
-    end
-end
-
-function maybe_send_output(channel, data::VariableData)
-    # Semi-arbitrarily set a threshold of 30MB, which is just under twice the
-    # size of a Float32 2k camera.
-    threshold = 30_000_000
-
-    if Base.summarysize(data) < threshold
-        put!(channel, data)
-    else
-        put!(channel, VariableData(data.tid, nothing, :threshold_exceeded))
+        VariableData(; tid, name, data=result, subvariables, update_rate)
     end
 end
 
@@ -511,10 +537,14 @@ function putall!(channels, value)
     end
 end
 
-function stream_input(name, channel, downstream_neighbours)
+function stream_input(name, channel, downstream_neighbours, rates)
+    rate = RunningRate()
     try
         while isopen(channel) || isready(channel)
             tid, sources = take!(channel)
+
+            tick!(rate)
+            rates[name] = isnan(rate.value) ? 0.0 : rate.value
 
             putall!(values(downstream_neighbours), VariableData(; tid=Int(tid), data=sources))
             @debug "Pushed input data from '$(name)' to: $(keys(downstream_neighbours))"
@@ -576,6 +606,9 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
     matcher = Trainmatcher(k for (k, v) in upstream if v isa RemoteChannel)
     matched_trains = Dict{Int, Any}()
     args = Vector{Any}(undef, length(deps))
+
+    # Smoothed processing rate (Hz), reported to the client on each output.
+    rate = RunningRate()
     try
         while true
             while isempty(matched_trains)
@@ -627,6 +660,10 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
                 continue
             end
 
+            if !isnothing(out)
+                tick!(rate)
+            end
+
             # Run postprocessors on the variable output
             if !isempty(postprocessors)
                 raw_out = out isa VariableData ? out.data : out
@@ -644,9 +681,10 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
                 subvar_values[subvar_name] = wrap_result(subvar_value, tid, subvar_name)
             end
 
-            # Send output
-            out = wrap_result(out, tid, name; subvariables=subvar_values)
-            maybe_send_output(stream_output, out)
+            # Send output (NaN rate before the second tick → report 0)
+            update_rate = isnan(rate.value) ? 0.0 : rate.value
+            out = wrap_result(out, tid, name; subvariables=subvar_values, update_rate)
+            put!(stream_output, out)
             putall!(values(downstream), out)
             @debug "Pushed output from '$(name)' to: $(keys(downstream))"
         end
@@ -705,7 +743,7 @@ function update_input_sources(ctx::XfaContext)
 
         input_deps = [dep for dep in deps
                       if get(ctx.dep_to_input, string(dep), nothing) == input_name]
-        sources = [dep.source for dep in input_deps]
+        sources = [trainmatcher_dep_string(dep) for dep in input_deps]
         update_sources(group, sources)
     end
 end
@@ -723,10 +761,24 @@ end
 function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50)
     ctx.stream_output = variable_channel()
     ctx.events_channel = RemoteChannel(() -> Channel(100))
-    ctx.output_forwarder_task = Threads.@spawn ctx.forwarder(ctx.stream_output)
+    ctx.output_forwarder_task = Threads.@spawn :samepool ctx.forwarder(ctx.stream_output)
     errormonitor(ctx.output_forwarder_task)
 
     global current_ctx = ctx
+
+    # Run one-shot parameter initializers the first time the pipeline starts
+    # after loading. Cleared after running so repeat starts don't re-trigger.
+    for (name, param) in ctx.parameters
+        if !isnothing(param.initializer)
+            owner = find_parameter_owner(ctx, name)
+            if isnothing(owner)
+                param.initializer(param.value)
+            else
+                param.initializer(owner, param.value)
+            end
+            param.initializer = nothing
+        end
+    end
 
     # Verify all external deps are routed to an input
     unrouted = [string(dep) for dep in external_dependencies(ctx)
@@ -766,7 +818,8 @@ function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50)
         end
         ctx.input_variable_channels[name] = downstream_neighbours
 
-        ctx.input_variables_tasks[name] = Threads.@spawn stream_input(name, ctx.input_channels[name], downstream_neighbours)
+        ctx.input_rates[name] = 0.0
+        ctx.input_variables_tasks[name] = Threads.@spawn :samepool stream_input(name, ctx.input_channels[name], downstream_neighbours, ctx.input_rates)
         errormonitor(ctx.input_variables_tasks[name])
     end
 
@@ -784,7 +837,7 @@ function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50)
         end
         ctx.external_dependency_channels[dep_name] = downstream_neighbours
 
-        ctx.external_dependency_tasks[dep_name] = Threads.@spawn stream_external_dependency(dep_name, input_neighbour, downstream_neighbours)
+        ctx.external_dependency_tasks[dep_name] = Threads.@spawn :samepool stream_external_dependency(dep_name, input_neighbour, downstream_neighbours)
         errormonitor(ctx.external_dependency_tasks[dep_name])
     end
 
@@ -839,7 +892,7 @@ function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50)
     end
 
     # Start the watcher task
-    ctx.watcher_task = Threads.@spawn watch_context(ctx)
+    ctx.watcher_task = Threads.@spawn :samepool watch_context(ctx)
     errormonitor(ctx.watcher_task)
 
     ctx.is_running[] = true
@@ -907,12 +960,12 @@ function run(f::Function, ctx::XfaContext; timeout=10, kwargs...)
     task = nothing
     timer = Timer(timeout) do _
         @warn "Function timed out, killing it"
-        Threads.@spawn Base.throwto(task, InterruptException())
+        Threads.@spawn :samepool Base.throwto(task, InterruptException())
     end
 
     parent_testset = get(task_local_storage(), :__BASETESTNEXT__, [])
     try
-        task = Threads.@spawn begin
+        task = Threads.@spawn :samepool begin
             # Set the parent testset so that all @test's get recorded properly
             task_local_storage(:__BASETESTNEXT__, parent_testset)
             f()
@@ -961,6 +1014,8 @@ function load_from_string(ctx_str::AbstractString; routing_rules=nothing)
 
     ctx_module = Module(Symbol(:XfaContext, gensym()))
     init_expr = quote
+        using XfaEngine.Context.NaNStatistics
+
         using XfaEngine.Context
         using XfaEngine.Context: VariableData, Parameter, KaraboBridge, Meta
     end

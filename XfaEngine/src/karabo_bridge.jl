@@ -3,7 +3,35 @@ module KaraboBridge
 import ZMQ
 import MsgPack
 import Sockets
-import Sockets
+using ..XfaEngine: VARIABLE_CHANNEL_SIZE
+
+# Per-(source, path) ring of reusable Vector{T} buffers for receiving Karabo
+# array payloads without aliasing libzmq memory. Depth matches the inter-task
+# variable channels so a buffer is only recycled after a full window of trains
+# has had a chance to drain through every consumer.
+mutable struct BufferRing{T}
+    buffers::Vector{Vector{T}}
+    next::Int
+end
+BufferRing{T}() where {T} =
+    BufferRing{T}([Vector{T}() for _ in 1:VARIABLE_CHANNEL_SIZE], 1)
+
+const BufferPool = Dict{Tuple{String, String}, BufferRing}
+
+function get_pooled_buffer(pool::BufferPool, key::Tuple{String, String},
+                           ::Type{T}, n::Int) where {T}
+    if !haskey(pool, key) || !(pool[key] isa BufferRing{T})
+        pool[key] = BufferRing{T}()
+    end
+    ring = pool[key]::BufferRing{T}
+
+    buf = ring.buffers[ring.next]
+    resize!(buf, n)
+    ring.next = mod1(ring.next + 1, VARIABLE_CHANNEL_SIZE)
+    return buf
+end
+
+get_pooled_buffer(::Nothing, _, ::Type{T}, n::Int) where {T} = Vector{T}(undef, n)
 
 @kwdef mutable struct IORequest
     type::Symbol
@@ -20,7 +48,7 @@ mutable struct ThreadsafeSocket
 
     function ThreadsafeSocket(socket; buffer_size=100)
         self = new(socket, Channel{IORequest}(buffer_size))
-        handler = Threads.@spawn handle_threadsafesocket(self)
+        handler = Threads.@spawn :samepool handle_threadsafesocket(self)
         self.handler = handler
         errormonitor(handler)
 
@@ -244,7 +272,7 @@ function startbridge(server::KaraboBridgeServer)
     end
 
     lock(start_condition)
-    server.server_task = Threads.@spawn begin
+    server.server_task = Threads.@spawn :samepool begin
         @lock start_condition notify(start_condition)
 
         fake_tid = 0
@@ -315,7 +343,7 @@ Base.put!(server::KaraboBridgeServer, data, metadata=nothing) = put!(server.chan
 
 Get the next message from a bridge client.
 """
-function Base.take!(client::KaraboBridgeClient)
+function Base.take!(client::KaraboBridgeClient, pool::Union{BufferPool, Nothing}=nothing)
     if !client.ready
         ZMQ.send(client.socket, "next")
         client.ready = true
@@ -324,7 +352,7 @@ function Base.take!(client::KaraboBridgeClient)
     msgs = ZMQ.recv_multipart(client.socket)
     client.ready = false
 
-    return deserialize(msgs)
+    return deserialize(msgs, pool)
 end
 
 """
@@ -389,7 +417,7 @@ end
 
 Deserialize ZMQ messages in the Karabo bridge protocol to a Dict of data.
 """
-function deserialize(msgs::Vector{ZMQ.Message})
+function deserialize(msgs::Vector{ZMQ.Message}, pool::Union{BufferPool, Nothing}=nothing)
     data = Dict()
     meta = Dict()
 
@@ -403,8 +431,8 @@ function deserialize(msgs::Vector{ZMQ.Message})
         if content == "msgpack"
             data[source] = MsgPack.unpack(payload)
             for (name, value) in data[source]
-                if value isa Vector{Any} && !isempty(value)
-                    T = mapreduce(typeof, promote_type, value)
+                if value isa Vector{Any}
+                    T = isempty(value) ? Float64 : mapreduce(typeof, promote_type, value)
                     if T !== Any
                         data[source][name] = Vector{T}(value)
                     end
@@ -414,18 +442,20 @@ function deserialize(msgs::Vector{ZMQ.Message})
         elseif content == "array"
             shape = tuple(Int.(header["shape"])...)
             dtype = dtype_str_to_type(header["dtype"])
+            path = header["path"]
+            rank = length(shape)
+            # Karabo data comes over the wire row-major, so dimensions are reversed.
+            dims = rank == 1 ? (Int(shape[1]),) : reverse(shape)
+            n = prod(dims)
 
-            array = let rank = length(shape)
-                if rank == 1
-                    reinterpret(dtype, payload)
-                else
-                    # The data coming over the wire is row-major, so at first we
-                    # load it into an array with reversed dimensions.
-                    reshape(reinterpret(dtype, payload), reverse(shape))
-                end
-            end
+            # Copy the libzmq-owned buffer into a Julia-owned Vector{dtype}
+            # drawn from the pool. After this the ZMQ.Message can be freed
+            # safely; no Julia reference into its memory survives.
+            buf = get_pooled_buffer(pool, (source, path), dtype, n)
+            src_ptr = Ptr{dtype}(Base.unsafe_convert(Ptr{UInt8}, payload))
+            GC.@preserve payload unsafe_copyto!(pointer(buf), src_ptr, n)
 
-            data[source][header["path"]] = array
+            data[source][path] = rank == 1 ? buf : reshape(buf, dims)
         else
             error("Unknown header type of Karabo bridge message: '$(content)'. Expected either 'msgpack' or 'array'")
         end

@@ -14,7 +14,10 @@ using OrderedCollections: OrderedDict as OD
 using DataStructures: CircularBuffer, capacity
 using FHist: bincounts, binedges
 
-using XfaEngine: XfaEngine, Context, KaraboBridge, Protocol, RoutingRule, match_rule
+using XfaEngine: XfaEngine, Context, KaraboBridge, Protocol, RoutingRule, match_rule,
+    build_client_view!, is_scalar_data, ArrayMetadata, EngineState
+using XfaEngine.ZfpWorkspaces: ZfpWorkspace, CompressedArray, compress_array,
+    decompress_array, decompress_array!, allocate_array, should_compress
 using XfaEngine.Context: @Variable, @karabo_str, VariableData, Dependency, DependencyKind,
     DepKind_Variable, DepKind_Subvariable, DepKind_Karabo, DepKind_Group, DepKind_GroupParameter,
     karabo_dependency, subvariable_dependency, group_dependency, group_parameter_dependency,
@@ -220,9 +223,36 @@ end
                 @test haskey(msg.info["dag"], "x")
             end
 
-            # Test ChangeParameter
+            # Test ChangeParameter — engine should ack and then broadcast the
+            # new value back so all clients can sync.
             Protocol.client_send(ws, Protocol.ChangeParameter(Parameter("p", 1)))
-            @test Protocol.receive(ws).msg isa Protocol.Ack
+            ack = Protocol.receive(ws).msg
+            @test ack isa Protocol.Ack
+            @test isnothing(ack.error)
+            changed = Protocol.receive(ws).msg
+            @test changed isa Protocol.ParameterChanged
+            @test changed.parameter.name == "p"
+            @test changed.parameter.value == 1
+
+            # A failing update_handler must surface as Ack(error) and not emit
+            # a ParameterChanged broadcast.
+            mktemp() do path, io
+                write(path, """
+                            p = Parameter(0) do v
+                                error("boom")
+                            end
+                            @Variable x -> karabo"foo.bar"
+                            """)
+                Protocol.client_send(ws, Protocol.LoadContext(path))
+                msg = nothing
+                while !(msg isa Protocol.ContextInfo); msg = Protocol.receive(ws).msg end
+                @test msg.info isa Dict
+            end
+            Protocol.client_send(ws, Protocol.ChangeParameter(Parameter("p", 2)))
+            ack = Protocol.receive(ws).msg
+            @test ack isa Protocol.Ack
+            @test !isnothing(ack.error)
+            @test occursin("boom", ack.error.text)
 
             # Test ReviseCode
             Protocol.client_send(ws, Protocol.ReviseCode())
@@ -245,7 +275,7 @@ end
 
 
     @testset "Channel stats" begin
-        # End-to-end check that the engine periodically pushes a ChannelStats
+        # End-to-end check that the engine periodically pushes a PipelineStats
         # message summarising drops/size/capacity for each variable channel.
         # A slow downstream variable guarantees drops accumulate.
         log = TestLogger()
@@ -275,15 +305,15 @@ end
                 Protocol.client_send(ws, Protocol.Start())
                 while !(Protocol.receive(ws).msg isa Protocol.Ack) end
 
-                # Collect messages until we get a ChannelStats with a non-zero
+                # Collect messages until we get a PipelineStats with a non-zero
                 # drop count on the (motor.pos, slow) channel, or time out.
                 key = ("motor.pos", "slow")
-                stats = nothing # Context.ChannelStat(0, 0, 0)
+                stats = nothing
                 deadline = time() + 10.0
                 while isnothing(stats) || (time() < deadline && stats.drops == 0)
                     msg = Protocol.receive(ws).msg
-                    if msg isa Protocol.ChannelStats && msg.stats[key].drops > 0
-                        stats = msg.stats[key]
+                    if msg isa Protocol.PipelineStats && msg.channel_stats[key].drops > 0
+                        stats = msg.channel_stats[key]
                     end
                 end
 
@@ -443,6 +473,37 @@ end
             @test dummy_data == data
         end
     end
+
+    @testset "BufferPool" begin
+        karabo_bridge_test_state(endpoint) do client, server
+            KaraboBridge.startbridge(server)
+            pool = KaraboBridge.BufferPool()
+
+            send_payload = Dict("src" => Dict("arr" => UInt16[1, 2, 3, 4, 5]))
+            put!(server, send_payload)
+            data, _ = take!(client, pool)
+            @test data == send_payload
+
+            # Same (source, path) should reuse the same underlying Vector
+            # across rotations within VARIABLE_CHANNEL_SIZE trains.
+            ring = pool[("src", "arr")]
+            buf_first_round = ring.buffers[1]
+
+            for _ in 1:XfaEngine.VARIABLE_CHANNEL_SIZE
+                put!(server, send_payload)
+                take!(client, pool)
+            end
+            @test ring.buffers[1] === buf_first_round
+
+            # A different (source, path) gets its own ring.
+            other = Dict("other" => Dict("v" => Float32[1.0, 2.0]))
+            put!(server, other)
+            data, _ = take!(client, pool)
+            @test data == other
+            @test haskey(pool, ("other", "v"))
+            @test pool[("other", "v")] isa KaraboBridge.BufferRing{Float32}
+        end
+    end
 end
 
 @testset "Trainmatching" begin
@@ -490,6 +551,10 @@ end
     # Round trip
     @test karabo_dependency(string(karabo"MID//foo.bar")) == karabo"MID//foo.bar"
     @test karabo_dependency(string(karabo"SA2//foo:output[bar]")) == karabo"SA2//foo:output[bar]"
+
+    # Proxy
+    @test karabo"MID//foo.bar@px" == karabo_dependency("MID", "foo", "bar", "px")
+    @test karabo_dependency(string(karabo"MID//foo:output[bar]@px")) == karabo"MID//foo:output[bar]@px"
 end
 
 # Helper module that defines variables for reference tests, defined in
@@ -1664,6 +1729,71 @@ end
     end
 end
 
+@testset "Subscription filtering" begin
+    @test is_scalar_data(1.0)
+    @test is_scalar_data("foo")
+    @test is_scalar_data(fill(1.0))
+    @test !is_scalar_data([1, 2, 3])
+
+    state = EngineState()
+    cache() = Dict{String, Tuple{Int, VariableData}}()
+    sub(pairs::Pair{String, Int}...) = Dict{String, Int}(pairs...)
+
+    # Scalars always pass through. Non-compressible arrays (Int, length below
+    # the compression threshold) round-trip raw when subscribed, and become
+    # ArrayMetadata when not.
+    scalar = VariableData(0, "s", 42)
+    array = VariableData(0, "a", [1, 2, 3])
+    @test build_client_view!(state, scalar, sub(), cache()) === scalar
+    f = build_client_view!(state, array, sub(), cache())
+    @test f.data isa ArrayMetadata
+    @test f.data.eltype === Int
+    @test f.data.size == [3]
+    @test build_client_view!(state, array, sub("a" => -1), cache()) === array
+
+    # Subvariables follow the same rule under their qualified name. The
+    # subvariables dict is keyed by the qualified name (as produced by
+    # @add_subvariable), and subscriptions must look it up under that same key.
+    parent = VariableData(; tid=0, name="p", data=[1, 2],
+                          subvariables=Dict{String, Any}(
+                              "p.scalar" => VariableData(0, "p.scalar", 1.5),
+                              "p.arr" => VariableData(0, "p.arr", [4, 5])))
+    f = build_client_view!(state, parent, sub(), cache())
+    @test f.data isa ArrayMetadata
+    @test keyset(f.subvariables) == Set(["p.scalar", "p.arr"])
+    @test f.subvariables["p.scalar"].data == 1.5
+    @test f.subvariables["p.arr"].data isa ArrayMetadata
+
+    # Subscribing to the qualified subvariable name delivers the real array.
+    f = build_client_view!(state, parent, sub("p.arr" => -1), cache())
+    @test f.data isa ArrayMetadata
+    @test f.subvariables["p.arr"].data == [4, 5]
+
+    # Subscribing to the parent does not implicitly subscribe its subvariables.
+    f = build_client_view!(state, parent, sub("p" => -1), cache())
+    @test f.data == [1, 2]
+    @test f.subvariables["p.arr"].data isa ArrayMetadata
+
+    # Re-prepending the parent name (the historical bug) would look up
+    # "p.p.arr" and miss the subscription — make sure that doesn't happen.
+    f = build_client_view!(state, parent, sub("p.p.arr" => -1), cache())
+    @test f.subvariables["p.arr"].data isa ArrayMetadata
+
+    # Compressible payload: a long enough Float array triggers ZFP. With two
+    # clients sharing the same precision the cache reuses the compressed view.
+    big = VariableData(; tid=0, name="big", data=randn(Float64, 600))
+    c = cache()
+    a = build_client_view!(state, big, sub("big" => -1), c)
+    b = build_client_view!(state, big, sub("big" => -1), c)
+    @test a.data isa CompressedArray
+    @test a === b
+    # A different precision recompresses and overwrites the cache slot.
+    d = build_client_view!(state, big, sub("big" => 8), c)
+    @test d.data isa CompressedArray
+    @test d !== a
+    @test c["big"][1] == 8
+end
+
 @testset "Serialization" begin
     ctx = Context.load_from_string(raw"""
         using Main.PostprocessorLibrary: TestWindow
@@ -1704,7 +1834,104 @@ end
                                                             "bridge.trainmatcher" => Parameter("bridge.trainmatcher", KaraboDevice("", "")),
                                                             "bridge.manual_configuration" => Parameter("bridge.manual_configuration", false)),
                                        "dep_to_input" => Dict("xgm.intensity" => "bridge.stream"),
+                                       "group_parameter_args" => Dict(),
                                        "path" => "")
+
+    # Group variables that reference a group Parameter field record the
+    # arg_name -> field mapping so the client can rewrite the right kwarg.
+    ctx = Context.load_from_string(raw"""
+        @Group mutable struct Foo
+            source::Parameter{Dependency}
+        end
+
+        @Variable function foo(::Foo, data -> Foo.source)
+            data
+        end
+
+        foo_group = Foo(; source=karabo"motor1.pos")
+        """)
+    @test Context.to_dict(ctx)["group_parameter_args"] ==
+        Dict("foo_group.foo" => Dict("data" => "source"))
+end
+
+@testset "ZfpWorkspace" begin
+    ws = ZfpWorkspace()
+
+    @testset "should_compress" begin
+        @test should_compress(zeros(600))
+        @test should_compress(rand(UInt8, 500))
+        @test !should_compress(zeros(100))
+        @test !should_compress("string")
+        @test !should_compress(zeros(Bool, 600))
+    end
+
+    @testset "Float round-trip (all finite)" begin
+        for T in (Float32, Float64), shape in ((1000,), (40, 40))
+            arr = randn(T, shape)
+            ca = compress_array(ws, arr)
+            @test !ca.promoted && isnothing(ca.nonfinite_mask)
+            @test ca.original_eltype === T && Tuple(ca.shape) == shape
+            out = decompress_array(ws, ca)
+            @test eltype(out) === T && size(out) == shape
+            @test maximum(abs, arr - out) < 1e-2
+        end
+    end
+
+    @testset "Float round-trip with non-finites" begin
+        a = rand(Float32, 2000)
+        a[10] = NaN32
+        a[100] = Inf32
+        a[200] = -Inf32
+        a[1500] = NaN32
+
+        ca = compress_array(ws, a)
+        @test !isnothing(ca.nonfinite_mask)
+        out = decompress_array(ws, ca)
+        @test isnan(out[10]) && out[100] == Inf32 && out[200] == -Inf32 && isnan(out[1500])
+        fin = isfinite.(a)
+        @test maximum(abs, a[fin] - out[fin]) < 1e-2
+    end
+
+    # Int round-trip uses precision=0 (lossless) to exercise the
+    # promote/demote machinery; the default lossy precision=15 would zero
+    # out small integer values and obscure whether promotion is correct.
+    @testset "Low-bit int promote/demote" begin
+        for T in (Int8, UInt8, Int16, UInt16)
+            arr = T.(rand(0:50, 800))
+            ca = compress_array(ws, arr; precision=0)
+            @test ca.promoted && ca.original_eltype === T
+            out = decompress_array(ws, ca)
+            @test eltype(out) === T && out == arr
+        end
+    end
+
+    @testset "Native int (no promotion)" begin
+        arr = Int32.(rand(-100:100, 1000))
+        ca = compress_array(ws, arr; precision=0)
+        @test !ca.promoted && !ca.clamped
+        @test decompress_array(ws, ca) == arr
+    end
+
+    @testset "Native int out-of-range gets clamped" begin
+        mag = Int32(2)^30 - one(Int32)
+        arr = Int32[0, 1, -2, typemax(Int32), typemin(Int32), 100]
+        ca = compress_array(ws, arr; precision=0)
+        @test ca.clamped
+        out = decompress_array(ws, ca)
+        @test out == Int32[0, 1, -2, mag, -mag, 100]
+    end
+
+    @testset "decompress_array! into provided buffer" begin
+        arr = randn(Float64, 800)
+        ca = compress_array(ws, arr)
+        out = allocate_array(ca)
+        @test eltype(out) === Float64 && size(out) == size(arr)
+        decompress_array!(ws, out, ca)
+        @test maximum(abs, arr - out) < 1e-2
+
+        @test_throws ArgumentError decompress_array!(ws, zeros(Float32, 800), ca)
+        @test_throws DimensionMismatch decompress_array!(ws, zeros(801), ca)
+    end
 end
 
 end

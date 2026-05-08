@@ -1,7 +1,3 @@
-using DataStructures: CircularBuffer
-using FHist: Hist2D, bincounts, binedges
-using NaNStatistics: nanmean, nansum, nanmean!, nansum!, allocate_nanmean, allocate_nansum
-
 @Group struct MockInput end
 
 update_sources(::MockInput, _) = nothing
@@ -30,6 +26,10 @@ end
 
     sources::Vector{String} = String[]
 
+    # Reusable receive buffers for array payloads, keyed by (source, path).
+    # See karabo_bridge.jl BufferRing for the rotation policy.
+    buffer_pool::BufferPool = BufferPool()
+
     # Internal field for testing: when set, get_sources() returns this
     # instead of querying the WebProxy.
     _mock_sources::Union{Vector{String}, Nothing} = nothing
@@ -43,6 +43,11 @@ end
 function get_sources(bridge::KaraboBridge)
     if !isnothing(bridge._mock_sources)
         return bridge._mock_sources
+    end
+
+    if isnothing(XfaEngine.current_engine_state)
+        @warn "Engine is not initialized, skipping source discovery for KaraboBridge"
+        return String[]
     end
 
     try
@@ -96,12 +101,12 @@ end
     # the output channel is closed while we're stuck waiting for the next bridge
     # message.
     bridge_msgs = Channel(10)
-    input_task = Threads.@spawn try
+    input_task = Threads.@spawn :samepool try
         while isopen(bridge_msgs)
             # take!() may throw an exception when the client is closed
             local msg
             try
-                msg = take!(client)
+                msg = take!(client, bridge.buffer_pool)
             catch
                 break
             end
@@ -120,7 +125,7 @@ end
     errormonitor(input_task)
     bind(bridge_msgs, input_task)
 
-    output_task = Threads.@spawn for msg in bridge_msgs
+    output_task = Threads.@spawn :samepool for msg in bridge_msgs
         data, metadata = msg
         tid = first(values(metadata))["timestamp.tid"]
 

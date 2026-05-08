@@ -220,6 +220,15 @@ end
             1
         end
         """
+
+        # Variable-reference shorthand with an inline argument remap: only the
+        # inner arg's karabo dep should change, not the entire RHS.
+        source = """
+        @Variable jf2 -> jf1(data -> karabo"A/B:daqOutput[data.adc]@A/CAL:dataOutput")
+        """
+        @test XFA.replace_dep(source, "jf2", "data", karabo"C/D:daqOutput[data.adc]@C/CAL:dataOutput") == """
+        @Variable jf2 -> jf1(data -> karabo"C/D:daqOutput[data.adc]@C/CAL:dataOutput")
+        """
     end
 
     @testset "Change group dependency" begin
@@ -337,6 +346,34 @@ end
             @test XFA.replace_constructor_kwarg(source, "other", "address", "\"tcp://foo:1234\"") == source
         end
     end
+
+    @testset "Edit string group parameter" begin
+        # Replace an existing string kwarg on a generic group constructor
+        source = """
+        my_group = MyGroup(; label="old", count=3)
+        """
+        @test XFA.replace_constructor_kwarg(source, "my_group", "label", "\"new\"") == """
+        my_group = MyGroup(; label="new", count=3)
+        """
+
+        # Append the kwarg when the group has no parameter section yet
+        source = """
+        my_group = MyGroup()
+        """
+        @test XFA.replace_constructor_kwarg(source, "my_group", "label", "\"hello\"") == """
+        my_group = MyGroup(; label="hello")
+        """
+
+        # Strings with quotes and backslashes round-trip through escape_string
+        new_value = "with \"quotes\" and \\ slash"
+        source = """
+        my_group = MyGroup(; label="plain")
+        """
+        @test XFA.replace_constructor_kwarg(source, "my_group", "label",
+                                            "\"$(escape_string(new_value))\"") == """
+        my_group = MyGroup(; label="with \\"quotes\\" and \\\\ slash")
+        """
+    end
 end
 
 @testset "Dependency completions" begin
@@ -370,6 +407,70 @@ end
     @test items == ["pos", "velocity"]
     @test query == "vel"
     @test fmt("pos") == "MID_EXP/MOTOR/1.pos"
+end
+
+@testset "remap_source" begin
+    client = XFA.ClientState()
+    client.karabo_devices = Dict{String, Dict{String, Any}}(
+        "MID" => Dict{String, Any}("camera" => Dict("classId" => "AravisBaslerCamera"),
+                                   "motor"  => Dict("classId" => "Motor")))
+
+    camera_rule = XFA.RemapRule(XFA.RemapKind_Simple,
+                                raw"^(.*):output\[data\.image\.pixels\]$",
+                                "AravisBaslerCamera",
+                                raw"\1:output[data.image.data]")
+    client.remap_rules = [camera_rule]
+
+    # Matching device class + matching source: rewritten
+    @test XFA.remap_source(client, "camera:output[data.image.pixels]", Ref{Any}(nothing)) ==
+          ("camera:output[data.image.data]", nothing)
+
+    # Wrong device class: pass through
+    @test XFA.remap_source(client, "motor:output[data.image.pixels]", Ref{Any}(nothing)) ==
+          ("motor:output[data.image.pixels]", nothing)
+
+    # Source regex doesn't match: pass through
+    @test XFA.remap_source(client, "camera.something", Ref{Any}(nothing)) == ("camera.something", nothing)
+
+    # Unknown device (no classId resolved): camera_rule's class regex still
+    # only matches "AravisBaslerCamera", so pass through.
+    @test XFA.remap_source(client, "ghost:output[data.image.pixels]", Ref{Any}(nothing)) ==
+          ("ghost:output[data.image.pixels]", nothing)
+
+    # All matching rules apply in order, cumulatively
+    push!(client.remap_rules,
+          XFA.RemapRule(XFA.RemapKind_Simple, raw"data\.image\.data", "", "data.image.foo"))
+    @test XFA.remap_source(client, "camera:output[data.image.pixels]", Ref{Any}(nothing)) ==
+          ("camera:output[data.image.foo]", nothing)
+
+    # Empty source + empty device_class is rejected — it would match every
+    # source unconditionally, which is almost certainly a config mistake.
+    @test_throws ArgumentError XFA.RemapRule(XFA.RemapKind_Simple, "", "", "REPLACED")
+end
+
+@testset "sampled_pctile!" begin
+    buf = Float64[]
+
+    # Small array (<1000): stride=1, picks the 2nd and 99th order statistics
+    small = reshape(collect(1.0:100.0), 10, 10)
+    @test XFA.sampled_pctile!(buf, small) == (2.0, 99.0)
+
+    # Large array (>=1000): strided, but a constant matrix gives exact result
+    large = fill(7.0, 100, 100)
+    @test XFA.sampled_pctile!(buf, large) == (7.0, 7.0)
+
+    # Mixed finite + NaN/Inf: non-finite values are dropped
+    mixed = [1.0 NaN Inf; 2.0 -Inf 99.0; 50.0 NaN 100.0]
+    p1, p99 = XFA.sampled_pctile!(buf, mixed)
+    @test isfinite(p1) && isfinite(p99)
+    @test p1 == 1.0 && p99 == 100.0
+
+    # All non-finite: fall back to (0.0, 1.0), still finite
+    nonfinite = [NaN Inf; -Inf NaN]
+    @test XFA.sampled_pctile!(buf, nonfinite) == (0.0, 1.0)
+
+    # Empty input: same fallback
+    @test XFA.sampled_pctile!(buf, Matrix{Float64}(undef, 0, 0)) == (0.0, 1.0)
 end
 
 @testset "GUI" begin

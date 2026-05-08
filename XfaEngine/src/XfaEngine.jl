@@ -1,5 +1,11 @@
 module XfaEngine
 
+# Capacity of the per-train variable channels (see Context.variable_channel).
+# Used as the depth of the Karabo recv buffer pool too, so a recycled buffer
+# has had a full window of trains to drain through every consumer.
+const VARIABLE_CHANNEL_SIZE = 100
+
+include("zfp_workspace.jl")
 include("karabo_bridge.jl")
 include("context.jl")
 
@@ -24,7 +30,8 @@ import RemoteREPL
 using DimensionalData: DimArray
 
 using .Protocol
-import .Context: XfaContext
+using .ZfpWorkspaces: ZfpWorkspace, CompressedArray, compress_array, should_compress
+import .Context: XfaContext, VariableData, ArrayMetadata
 
 
 """Find the closest available port to `port_hint`."""
@@ -57,6 +64,11 @@ end
     last_heartbeat::Float64
     handler_task::Union{Task, Nothing} = nothing
     # heartbeat_task::Task
+
+    # Fully-qualified names of array-valued variables this client wants
+    # forwarded, mapped to the requested zfp precision (-1 for default).
+    # Updated via `SetVariableSubscriptions`.
+    subscriptions::Dict{String, Int} = Dict{String, Int}()
 end
 
 @kwdef mutable struct EngineState
@@ -67,11 +79,17 @@ end
 
     webproxies::Dict{String, WebProxy} = Dict()
     routing_rules::Vector{RoutingRule} = RoutingRule[]
+    remap_rules::Vector{RemapRule} = copy(BUILTIN_REMAP_RULES)
 
     remoterepl_server::TCPServer = TCPServer()
     remoterepl_task::Union{Task, Nothing} = nothing
 
     ctx::XfaContext = XfaContext()
+
+    # One zfp workspace per qualified variable name. Sized to the variable's
+    # data on first use and reused across trains; switching precision on the
+    # same variable just runs zfp again over the same buffers.
+    zfp_workspaces::Dict{String, ZfpWorkspace} = Dict{String, ZfpWorkspace}()
 
     channel_stats_task::Union{Task, Nothing} = nothing
 
@@ -81,11 +99,114 @@ end
 
 current_engine_state::Union{EngineState, Nothing} = nothing
 
+# 0-D values (numbers, strings, scalar arrays) are cheap to ship and always
+# forwarded; multi-element arrays must be opted into via subscription.
+is_scalar_data(x) = !(x isa AbstractArray) || ndims(x) == 0
+
+# Sentinel precision used to cache the metadata-only view of a non-subscribed
+# array payload. Real precisions are >= 0 (and -1 maps to the per-eltype
+# default inside compress_array), so this never collides with a real client request.
+const METADATA_PRECISION = typemin(Int)
+
+# Build (or fetch from `cache`) the per-client view of a single (sub)variable:
+# scalars pass through, non-subscribed arrays become ArrayMetadata, subscribed
+# compressible arrays become a CompressedArray at the requested precision, and
+# subscribed non-compressible arrays pass through raw. The cache stores at most
+# one (precision, VariableData) per qualified name; if a client asks for a
+# different precision than the cached one we just recompress and overwrite.
+function client_view_for(state::EngineState, variable::VariableData, qualified::String,
+                         subscriptions::Dict{String, Int},
+                         cache::Dict{String, Tuple{Int, VariableData}})
+    data = variable.data
+    requested = get(subscriptions, qualified, nothing)
+
+    precision = if is_scalar_data(data)
+        nothing
+    elseif isnothing(requested)
+        METADATA_PRECISION
+    elseif should_compress(data)
+        Int(requested)
+    else
+        nothing
+    end
+
+    if !isnothing(precision)
+        hit = get(cache, qualified, nothing)
+        if !isnothing(hit) && hit[1] == precision
+            return hit[2]
+        end
+    end
+
+    new_data = if precision == METADATA_PRECISION
+        ArrayMetadata(eltype(data), collect(size(data)))
+    elseif !isnothing(precision)
+        ws = get!(() -> ZfpWorkspace(), state.zfp_workspaces, qualified)
+        compress_array(ws, data; precision)
+    else
+        data
+    end
+
+    view = if precision == METADATA_PRECISION
+        # Strip down to identity + shape; keep update_rate / subvariables but
+        # drop labels, axes etc. since the client only renders metadata.
+        VariableData(; tid=variable.tid, name=variable.name, data=new_data,
+                     subvariables=variable.subvariables, update_rate=variable.update_rate)
+    elseif new_data === data
+        variable
+    else
+        VariableData(; tid=variable.tid, name=variable.name, data=new_data,
+                     subvariables=variable.subvariables,
+                     title=variable.title, x_axis=variable.x_axis, y_axis=variable.y_axis,
+                     xlabel=variable.xlabel, ylabel=variable.ylabel, unit=variable.unit,
+                     fixed_aspect=variable.fixed_aspect, update_rate=variable.update_rate)
+    end
+
+    if !isnothing(precision)
+        cache[qualified] = (precision, view)
+    end
+    return view
+end
+
+# Build a TrainData payload for one client by composing per-(sub)variable views
+# from the shared cache. Falls through to the parent's existing subvariables
+# dict when nothing actually changed for any subvar (avoids an allocation).
+function build_client_view!(state::EngineState, variable::VariableData,
+                            subscriptions::Dict{String, Int},
+                            cache::Dict{String, Tuple{Int, VariableData}})
+    parent_view = client_view_for(state, variable, variable.name, subscriptions, cache)
+
+    if isempty(variable.subvariables)
+        return parent_view
+    end
+
+    new_subvars = Dict{String, Any}()
+    any_changed = false
+    for (qualified, subvar) in variable.subvariables
+        sub_view = client_view_for(state, subvar, qualified, subscriptions, cache)
+        any_changed |= sub_view !== subvar
+        new_subvars[qualified] = sub_view
+    end
+
+    if !any_changed && parent_view === variable
+        return variable
+    end
+
+    return VariableData(; tid=parent_view.tid, name=parent_view.name, data=parent_view.data,
+                        subvariables=new_subvars,
+                        title=parent_view.title, x_axis=parent_view.x_axis,
+                        y_axis=parent_view.y_axis, xlabel=parent_view.xlabel,
+                        ylabel=parent_view.ylabel, unit=parent_view.unit,
+                        fixed_aspect=parent_view.fixed_aspect, update_rate=parent_view.update_rate)
+end
+
 function forward_output(state::EngineState, stream_output)
+    cache = Dict{String, Tuple{Int, VariableData}}()
     for data in stream_output
+        empty!(cache)
         for (id, client) in state.clients
             try
-                Protocol.server_send(client.websocket, TrainData([data]))
+                view = build_client_view!(state, data, client.subscriptions, cache)
+                Protocol.server_send(client.websocket, TrainData([view]))
             catch ex
                 @warn "Couldn't forward data to client '$(id)'" exception=ex
             end
@@ -134,12 +255,12 @@ function broadcast_channel_stats(state::EngineState; period=1.0)
             continue
         end
 
-        msg = Protocol.ChannelStats(stats)
+        msg = Protocol.PipelineStats(stats, copy(ctx.input_rates))
         for client in values(state.clients)
             try
                 Protocol.server_send(client.websocket, msg)
             catch ex
-                @debug "Failed to send ChannelStats to client" exception=(ex, catch_backtrace())
+                @debug "Failed to send PipelineStats to client" exception=(ex, catch_backtrace())
             end
         end
     end
@@ -168,8 +289,13 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
         @info "Received shutdown request from client $(id)"
         shutdown(state)
         notify(state.stop_event)
+
     elseif msg isa GetRoutingRules
         Protocol.server_send(ws, RoutingRules(state.routing_rules); reply_to)
+
+    elseif msg isa GetRemapRules
+        Protocol.server_send(ws, RemapRules(state.remap_rules); reply_to)
+
     elseif msg isa SetRoutingRules
         state.routing_rules = msg.rules
         write_routing_rules(msg.rules)
@@ -188,6 +314,7 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
                 @warn "Failed to broadcast routing rules to client '$(other_id)'" exception=ex
             end
         end
+
     elseif msg isa GetDevices
         try
             devices = if isnothing(msg.topic)
@@ -199,12 +326,14 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
             @info "Responded to 'GetDevices' from $(id)"
         catch ex
             @error "Error in 'GetDevices', requested by $(id)" exception=(ex, catch_backtrace())
-            Protocol.server_send(ws, Devices(ex); reply_to)
+            Protocol.server_send(ws, Devices(Protocol.ExceptionMessage(ex, catch_backtrace())); reply_to)
         end
+
     elseif msg isa GetDeviceSchema
         schema = get_schema(KaraboDevice(msg.topic, msg.name))
         Protocol.server_send(ws, DeviceSchema(msg.topic, msg.name, schema); reply_to)
         @info "Responded to 'GetDeviceSchema' from $(id)"
+
     elseif msg isa GetDeviceProperty
         try
             wp = get_webproxy(KaraboDevice(msg.topic, msg.device))
@@ -213,13 +342,15 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
             @info "Responded to 'GetDeviceProperty' ($(msg.device).$(msg.property)) from $(id)"
         catch ex
             @error "Error in 'GetDeviceProperty', requested by $(id)" exception=(ex, catch_backtrace())
-            Protocol.server_send(ws, DeviceProperty(msg.topic, msg.device, msg.property, ex); reply_to)
+            Protocol.server_send(ws, DeviceProperty(msg.topic, msg.device, msg.property, Protocol.ExceptionMessage(ex, catch_backtrace())); reply_to)
         end
     elseif msg isa GetEngineDir
         Protocol.server_send(ws, EngineDir(pkgdir(XfaEngine)); reply_to)
+
     elseif msg isa GetTrainmatchers
         trainmatchers = get_all_trainmatchers(state.webproxies)
         Protocol.server_send(ws, AvailableTrainmatchers(trainmatchers); reply_to)
+
     elseif msg isa LoadContext
         path = abspath(expanduser(msg.path))
 
@@ -233,7 +364,7 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
             ctx.forwarder = Base.Fix1(forward_output, state)
             ctx
         catch ex
-            ex
+            Protocol.ExceptionMessage(ex, catch_backtrace())
         end
 
         if new_ctx_or_ex isa XfaContext
@@ -255,9 +386,25 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
         Protocol.server_send(ws, Ack(); reply_to)
     elseif msg isa ChangeParameter
         param = msg.parameter
-        Context.change_parameter(state.ctx, param)
-        @info "ChangeParameter of $(param.name) to $(param.value)"
-        Protocol.server_send(ws, Ack(); reply_to)
+        try
+            Context.change_parameter(state.ctx, param)
+            @info "ChangeParameter of $(param.name) to $(param.value)"
+            Protocol.server_send(ws, Ack(); reply_to)
+
+            # Broadcast the new value to all clients so they stay in sync and
+            # the originating client can confirm the engine accepted the value.
+            broadcast = ParameterChanged(param)
+            for (other_id, other) in state.clients
+                try
+                    Protocol.server_send(other.websocket, broadcast)
+                catch ex
+                    @warn "Failed to broadcast ParameterChanged to client '$(other_id)'" exception=ex
+                end
+            end
+        catch ex
+            @error "Failed to change parameter '$(param.name)'" exception=(ex, catch_backtrace())
+            Protocol.server_send(ws, Ack(Protocol.ExceptionMessage(ex, catch_backtrace())); reply_to)
+        end
     elseif msg isa Start
         @info "Starting pipeline..."
         try
@@ -265,7 +412,7 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
             Protocol.server_send(ws, Ack(); reply_to)
         catch ex
                 @error "Failed to start pipeline" exception=(ex, catch_backtrace())
-            Protocol.server_send(ws, Ack(ex); reply_to)
+            Protocol.server_send(ws, Ack(Protocol.ExceptionMessage(ex, catch_backtrace())); reply_to)
         end
         @info "Started"
     elseif msg isa Stop
@@ -273,6 +420,9 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
         Context.stop_pipeline(state.ctx)
         Protocol.server_send(ws, Stopped(); reply_to)
         @info "Stopped"
+    elseif msg isa SetVariableSubscriptions
+        client_state.subscriptions = msg.variables
+        Protocol.server_send(ws, Ack(); reply_to)
     elseif msg isa SetDebugMode
         @info "Setting debug mode: $(msg.enable)"
         if msg.enable
@@ -286,7 +436,7 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
         if msg.enable
             @info "Starting RemoteREPL"
             port, state.remoterepl_server = Sockets.listenany(27754)
-            state.remoterepl_task = Threads.@spawn RemoteREPL.serve_repl(state.remoterepl_server)
+            state.remoterepl_task = Threads.@spawn :samepool RemoteREPL.serve_repl(state.remoterepl_server)
             Protocol.server_send(ws, RemoteReplState(true, Int(port)); reply_to)
         else
             @info "Stopping RemoteREPL"
@@ -313,19 +463,21 @@ function handle_client(state::EngineState, id)
         Protocol.server_send(ws, ContextInfo(state.ctx, read(state.ctx.path, String)))
     end
 
-    for msg_bytes in ws
-        buffer = IOBuffer(msg_bytes)
-        envelope = deserialize(buffer)::Envelope
+    try
+        for msg_bytes in ws
+            buffer = IOBuffer(msg_bytes)
+            envelope = deserialize(buffer)::Envelope
 
-        try
-            @invokelatest handle_message(envelope.msg, state, id, envelope.id)
-        catch ex
-            @error "Caught exception when handling message from $(id)" exception=(ex, catch_backtrace())
+            try
+                @invokelatest handle_message(envelope.msg, state, id, envelope.id)
+            catch ex
+                @error "Caught exception when handling message from $(id)" exception=(ex, catch_backtrace())
+            end
         end
+    finally
+        delete!(state.clients, id)
+        @info "Disconnected from client $(id)"
     end
-
-    delete!(state.clients, id)
-    @info "Disconnected from client $(id)"
 end
 
 # Helper variables/functions to create amusing client IDs
@@ -368,6 +520,9 @@ function main(stop_event=Base.Event(); info_path=nothing, wait=true)
         state.routing_rules = loaded
         @info "Loaded routing rules" n=length(loaded) path=engine_settings_path()
     end
+
+    state.remap_rules = load_remap_rules()
+    @info "Loaded remap rules" n=length(state.remap_rules) path=engine_settings_path()
 
     ws_server = WebSockets.listen!("0.0.0.0", state.websocket_port) do ws
         id = create_id()
@@ -414,10 +569,10 @@ function main(stop_event=Base.Event(); info_path=nothing, wait=true)
 
     @info "Wrote worker information to $(info_path)"
 
-    state.channel_stats_task = Threads.@spawn broadcast_channel_stats(state)
+    state.channel_stats_task = Threads.@spawn :interactive broadcast_channel_stats(state)
     errormonitor(state.channel_stats_task)
 
-    state.stop_task = Threads.@spawn try
+    state.stop_task = Threads.@spawn :interactive try
         Base.wait(state.stop_event)
     catch ex
         if ex isa InterruptException

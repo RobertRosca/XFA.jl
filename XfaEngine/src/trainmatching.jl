@@ -1,3 +1,33 @@
+# Stand-in payload sent in place of an unsubscribed array. Carries just enough
+# shape info for the client to display plot buttons / type labels without
+# needing the full data.
+struct ArrayMetadata
+    eltype::DataType
+    size::Vector{Int}
+end
+
+# Exponentially-weighted running estimate of an event rate (Hz). Call
+# `tick!(rr)` on each event; `value` is NaN until the second tick (a single
+# event has no inter-arrival interval). The first interval seeds the EMA
+# directly so it doesn't have to ramp up from zero.
+mutable struct RunningRate
+    α::Float64
+    last_ts::Float64
+    value::Float64
+end
+RunningRate(α::Real=0.2) = RunningRate(α, NaN, NaN)
+
+function tick!(rr::RunningRate)
+    now_ts = time()
+    if !isnan(rr.last_ts) && now_ts > rr.last_ts
+        instantaneous = 1 / (now_ts - rr.last_ts)
+        rr.value = isnan(rr.value) ? instantaneous :
+            rr.α * instantaneous + (1 - rr.α) * rr.value
+    end
+    rr.last_ts = now_ts
+    return rr.value
+end
+
 @kwdef struct VariableData{T}
     tid::Int = 0
     name::Union{String, Nothing} = nothing
@@ -10,11 +40,14 @@
     ylabel::Union{String, Nothing} = nothing
     unit::Union{String, Nothing} = nothing
     fixed_aspect::Bool = true
+    update_rate::Float64 = 0.0
 end
 
 VariableData(tid, name, data) = VariableData(; tid=Int(tid), name, data)
 VariableData(tid, name, data, subvariables) = VariableData(; tid=Int(tid), name, data, subvariables)
 
+# `update_rate` is a runtime metric, not part of value identity, so it's
+# excluded from equality and hashing.
 function Base.:(==)(x::VariableData{T}, y::VariableData{T}) where {T}
     (x.tid == y.tid && x.name == y.name && x.data == y.data && x.subvariables == y.subvariables
      && x.title == y.title && x.x_axis == y.x_axis && x.y_axis == y.y_axis

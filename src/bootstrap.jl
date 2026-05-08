@@ -25,9 +25,9 @@ if !isfile(toml_path)
     import XfaEngine
     launcher_script = joinpath(dirname(pathof(XfaEngine)), "launcher.jl")
     mkpath(working_dir)
-    nthreads = cld(Sys.CPU_THREADS, 2)
+    nthreads = max(10, cld(Sys.CPU_THREADS, 8))
     cd(working_dir) do
-        cmd = `$(julia_binary) --project="$(environment)" --color=no --startup-file=no -t $(nthreads) $(launcher_script)`
+        cmd = `$(julia_binary) --project="$(environment)" --color=no --startup-file=no -t $(nthreads),4 $(launcher_script)`
         println("Launching: " * string(cmd))
         run(detach(cmd); wait=false)
     end

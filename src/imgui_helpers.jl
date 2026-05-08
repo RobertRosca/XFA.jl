@@ -637,9 +637,33 @@ after each call to determine which source's `DeviceProperties` to pass on the
 next frame.
 """
 function KaraboDepText(label, text, dep_state::KaraboDepTextState,
-                       source_list, device_props::DeviceProperties;
+                       source_list, device_props::DeviceProperties,
+                       client::ClientState;
                        device_only::Bool=false, allow_slow::Bool=true,
                        focus::Bool=false)
+    # If a previous edit kicked off an async remap, either resolve it now or
+    # show a disabled spinner placeholder until the request lands.
+    if !isnothing(dep_state.pending_remap_id)
+        if !is_pending(client, dep_state.pending_remap_id)
+            pending_source = dep_state.pending_remap_source
+            dep_state.pending_remap_id = nothing
+            dep_state.pending_remap_source = nothing
+            new_source, pending = remap_source(client, pending_source, dep_state.proxy_property)
+
+            if isnothing(pending)
+                dep_state.proxy_property[] = nothing
+                return true, new_source
+            end
+
+            dep_state.pending_remap_id = pending
+            dep_state.pending_remap_source = pending_source
+        end
+        @Disabled true ig.Text(@something(dep_state.pending_remap_source, ""))
+        ig.SameLine()
+        Spinner("Resolving proxy...")
+        return false, text
+    end
+
     id = ig.GetID(label)
 
     cb = @cfunction(dep_text_callback, Cint, (Ptr{ig.ImGuiInputTextCallbackData},))
@@ -680,7 +704,14 @@ function KaraboDepText(label, text, dep_state::KaraboDepTextState,
         if is_complete
             dep_state.cursor_pos = -1
             dep_state.device = nothing
-            return true, new_text
+            new_source, pending = remap_source(client, new_text, dep_state.proxy_property)
+            if !isnothing(pending)
+                dep_state.pending_remap_id = pending
+                dep_state.pending_remap_source = new_text
+                return false, text
+            end
+            dep_state.proxy_property[] = nothing
+            return true, new_source
         else
             # Incomplete — stay in edit mode (e.g. source or pipeline selected)
             if has_colon && !occursin('[', new_text)
@@ -721,7 +752,7 @@ end
 # - `device_only`: if true, Karabo mode only completes device names (no property)
 function DepText(label, dep::Dependency, dep_state::DepTextState,
                  source_list, device_props::DeviceProperties,
-                 variable_names::Vector{String};
+                 variable_names::Vector{String}, client::ClientState;
                  device_only::Bool=false, variable_name::String="")
     # Type selector combo
     dep_kinds = ["Karabo", "Variable"]
@@ -750,7 +781,7 @@ function DepText(label, dep::Dependency, dep_state::DepTextState,
         text = dep.kind == DepKind_Karabo ? string(dep) : ""
         focus &= isempty(text)
         edited, new_text = KaraboDepText(label, text, dep_state.karabo_state,
-                                         source_list, device_props;
+                                         source_list, device_props, client;
                                          device_only, focus)
         if edited
             return true, karabo_dependency(new_text)

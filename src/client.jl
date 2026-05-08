@@ -361,7 +361,12 @@ node_hash(x) = reinterpret(Cint, crc32c(x))
 
 function build_context_state(state, ctx_info)
     ctx_state = Dict{String, Any}()
+    # Drop all per-widget editing state so freshly-loaded parameter values
+    # overwrite anything the user had typed but not committed.
     empty!(state.client.parameter_states)
+    empty!(state.client.karabo_dep_states)
+    empty!(state.client.dep_text_states)
+    empty!(safe_input_text_cache)
 
     group_names = Set(ctx_info["groups"])
     is_group_var(name) = any(startswith(name, "$(g).") for g in group_names)
@@ -390,7 +395,7 @@ function build_context_state(state, ctx_info)
         end
 
         # The variable itself is always the first output
-        push!(ctx_state[name]["outputs"], (node_hash("$(name).outputs."), ""))
+        push!(ctx_state[name]["outputs"], OutputPin(node_hash("$(name).outputs."), ""))
 
         pp_names = Set(get(postprocessors_info, name, String[]))
         for subvar in ctx_info["subvariables"][name]
@@ -412,7 +417,7 @@ function build_context_state(state, ctx_info)
                     params = pp_params,
                 ))
             else
-                push!(ctx_state[name]["outputs"], (subvar_id, subvar))
+                push!(ctx_state[name]["outputs"], OutputPin(subvar_id, chopprefix(subvar, "$(name)."), true))
             end
         end
     end
@@ -429,6 +434,13 @@ function build_context_state(state, ctx_info)
         ctx_state[name]["draw_parameters"] = true
         ctx_state[name]["links"] = LinkInfo[]
         ctx_state[name]["parameters"] = Dict{String, Any}()
+        # Maps attr_id -> group struct field name, for arg_names that bind to a
+        # Parameter{Dependency} field of the group. The client uses the field
+        # name (not the @Variable's arg_name) when rewriting the constructor
+        # kwarg in source.
+        ctx_state[name]["dep_field_names"] = Dict{Int, String}()
+
+        group_param_args = get(ctx_info, "group_parameter_args", Dict{String, Dict{String, String}}())
 
         # Add dependencies from group member variables as inputs on the group node
         dep_param_names = Set{String}()
@@ -436,6 +448,7 @@ function build_context_state(state, ctx_info)
             if !group_filter(var_name)
                 continue
             end
+
             for (arg_name, dep) in deps
                 if dep isa Dependency && dep.kind == DepKind_Group
                     continue
@@ -445,7 +458,13 @@ function build_context_state(state, ctx_info)
                 end
                 attr_id = node_hash("$(var_name).dependencies.$(arg_name => dep)")
                 push!(ctx_state[name]["dependencies"], (attr_id, arg_name => dep))
-                push!(dep_param_names, arg_name)
+                field_name = get(get(group_param_args, var_name, Dict{String, String}()), arg_name, nothing)
+                if !isnothing(field_name)
+                    ctx_state[name]["dep_field_names"][attr_id] = field_name
+                    push!(dep_param_names, field_name)
+                else
+                    push!(dep_param_names, arg_name)
+                end
             end
         end
 
@@ -453,7 +472,7 @@ function build_context_state(state, ctx_info)
         inputs = filter(group_filter, keys(ctx_info["inputs"]))
         for input_name in inputs
             stripped_name = chopprefix(input_name, "$(name).")
-            push!(ctx_state[name]["outputs"], (node_hash(input_name), stripped_name))
+            push!(ctx_state[name]["outputs"], OutputPin(node_hash(input_name), stripped_name))
         end
 
         # Add group variables from the DAG as outputs
@@ -465,12 +484,12 @@ function build_context_state(state, ctx_info)
 
             # The variable itself
             attr_id = node_hash("$(var_name).outputs.")
-            push!(ctx_state[name]["outputs"], (attr_id, stripped_name))
+            push!(ctx_state[name]["outputs"], OutputPin(attr_id, stripped_name))
 
             # Its subvariables
             for subvar in ctx_info["subvariables"][var_name]
                 subvar_id = node_hash("$(var_name).outputs.$(subvar)")
-                push!(ctx_state[name]["outputs"], (subvar_id, subvar))
+                push!(ctx_state[name]["outputs"], OutputPin(subvar_id, chopprefix(subvar, "$(name)."), true))
             end
         end
 
@@ -493,7 +512,7 @@ function build_context_state(state, ctx_info)
         if !haskey(ctx_info, name)
             ctx_state[name] = Dict{String, Any}("id" => node_hash(name))
             ctx_state[name]["dependencies"] = []
-            ctx_state[name]["outputs"] = [(node_hash(name), name)]
+            ctx_state[name]["outputs"] = [OutputPin(node_hash(name), name)]
             ctx_state[name]["type"] = :input
             ctx_state[name]["links"] = LinkInfo[]
         end
@@ -520,7 +539,7 @@ function build_context_state(state, ctx_info)
                     link_start_id = node_hash("$(dep.name).outputs.")
                     dep_node = group_of(dep.name)
                 else
-                    link_start_id = ctx_state[dep.name]["outputs"][1][1]
+                    link_start_id = ctx_state[dep.name]["outputs"][1].id
                     dep_node = dep.name
                 end
                 link_id = node_hash("$(link_start_id)->$(link_end_id)")
@@ -613,6 +632,8 @@ function schema_property_names(schema::Dict)
     return DeviceProperties(sorted_slow, sorted_fast)
 end
 
+const NDARRAY_PROPERTIES = ("data", "shape", "type", "isBigEndian")
+
 function collect_properties!(props, prefix, node::Dict, target::PropertyList=props.slow)
     for (key, value) in node
         path = isempty(prefix) ? key : "$(prefix).$(key)"
@@ -625,6 +646,11 @@ function collect_properties!(props, prefix, node::Dict, target::PropertyList=pro
             elseif haskey(value, "noInputShared") && haskey(value, "schema")
                 pipeline_props = get!(props.fast, path, PropertyList())
                 collect_properties!(props, "", value["schema"], pipeline_props)
+            elseif issetequal(keys(value), NDARRAY_PROPERTIES)
+                push!(target.names, path)
+                push!(target.displayed_names, path)
+                push!(target.descriptions, "")
+                push!(target.value_types, "NDArray")
             else
                 collect_properties!(props, path, value, target)
             end
@@ -636,6 +662,41 @@ end
 function store_variable_data!(client, variable::VariableData)
     data = variable.data
     name = variable.name
+
+    compression_ratio = NaN
+    received_bytes = data isa AbstractArray ? sizeof(data) : 0
+    if data isa CompressedArray
+        # Allocate fresh — the decompressed array is queued onto `store.updates`
+        # and read by GUI consumers later, so reusing one buffer per variable
+        # would let later trains overwrite a not-yet-consumed payload.
+        ws = get!(() -> ZfpWorkspace(), client.zfp_workspaces, name)
+        decompressed = decompress_array(ws, data)
+        received_bytes = sizeof(data.data) + (isnothing(data.nonfinite_mask) ? 0 : sizeof(data.nonfinite_mask))
+        compression_ratio = sizeof(decompressed) / received_bytes
+        variable = VariableData(; tid=variable.tid, name=variable.name, data=decompressed,
+                                subvariables=variable.subvariables,
+                                title=variable.title, x_axis=variable.x_axis, y_axis=variable.y_axis,
+                                xlabel=variable.xlabel, ylabel=variable.ylabel, unit=variable.unit,
+                                fixed_aspect=variable.fixed_aspect, update_rate=variable.update_rate)
+        data = decompressed
+    end
+
+    # Unsubscribed array variables arrive as shape-only metadata. We store the
+    # ArrayMetadata directly so plot buttons and type labels can read the
+    # shape; real data only arrives after the user subscribes by opening a
+    # plot. Skip data-flow updates in this path.
+    if data isa ArrayMetadata
+        if !haskey(client.variable_data, name)
+            client.variable_data[name] = VariableStore(; data)
+        end
+        store = client.variable_data[name]
+        store.data = data
+        store.type = length(data.size) == 1 ? VariableType_Vector : VariableType_Array
+        store.update_rate = variable.update_rate
+        store.compression_ratio = compression_ratio
+        store.received_bytes = received_bytes
+        return
+    end
 
     if !haskey(client.variable_data, name)
         if data isa Number
@@ -665,9 +726,12 @@ function store_variable_data!(client, variable::VariableData)
     store.unit = variable.unit
     store.fixed_aspect = variable.fixed_aspect
 
-    # Use explicit labels if provided, otherwise derive from DimArray or data type
+    # Use explicit labels if provided, otherwise derive from DimArray or data type.
+    # For 2D DimArrays the heatmap maps dim 1 → Y (rows) and dim 2 → X (cols).
     store.xlabel = if !isnothing(variable.xlabel)
         variable.xlabel
+    elseif data isa DimMatrix
+        DD.label(DD.dims(data)[2])
     elseif data isa DimArray
         DD.label(DD.dims(data)[1])
     elseif data isa Number
@@ -677,6 +741,8 @@ function store_variable_data!(client, variable::VariableData)
     end
     store.ylabel = if !isnothing(variable.ylabel)
         variable.ylabel
+    elseif data isa DimMatrix
+        DD.label(DD.dims(data)[1])
     elseif data isa DimArray
         DD.label(data)
     else
@@ -693,15 +759,43 @@ function store_variable_data!(client, variable::VariableData)
         VariableType_Unknown
     end
     push!(store.updates, (variable.tid, data, type))
+    store.update_rate = variable.update_rate
+    store.compression_ratio = compression_ratio
+    store.received_bytes = received_bytes
+end
 
-    ts = store.update_timestamps
-    push!(ts, time())
-    if length(ts) > 100
-        popfirst!(ts)
+@enum ParameterOwnerKind ParameterOwner_Group ParameterOwner_Postprocessor
+
+struct ParameterOwner
+    kind::ParameterOwnerKind
+    var_name::String
+    pp_name::Maybe{String}
+    field_name::String
+end
+
+# Locate the node that owns a fully-qualified parameter in the loaded context.
+# Returns nothing if not found, otherwise a ParameterOwner describing where
+# the parameter lives.
+function find_parameter_owner(client, param_name::String)
+    for (var_name, var_data) in client.context.context_state
+        if var_data["type"] === :group
+            for (field_name, stored) in var_data["parameters"]
+                if stored.name == param_name
+                    return ParameterOwner(ParameterOwner_Group, var_name, nothing, field_name)
+                end
+            end
+        elseif var_data["type"] === :variable
+            for pp in var_data["postprocessors"]
+                for (field_name, stored) in pp.params
+                    if stored.name == param_name
+                        return ParameterOwner(ParameterOwner_Postprocessor,
+                                              var_name, pp.name, field_name)
+                    end
+                end
+            end
+        end
     end
-    if length(ts) >= 2
-        store.update_rate = 1 / nanmean(diff(ts))
-    end
+    return nothing
 end
 
 function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothing)
@@ -709,12 +803,14 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
 
     if msg isa Pong
         nothing
+
     elseif msg isa Stopped
         client.context.pipeline_status = PipelineStatus_Stopped
+
     elseif msg isa Devices
-        if msg.device_names isa Exception
-            @error "Error from server with DEVICES" exception=msg
-            log_engine_error(state, "Failed to get devices", sprint(showerror, msg.device_names))
+        if msg.device_names isa ExceptionMessage
+            @error "Error from server with DEVICES" exception=msg.device_names.text
+            log_engine_error(state, "Failed to get devices", msg.device_names.text)
             client.webproxy_status = RequestStatus_Error
         else
             client.karabo_devices = msg.device_names
@@ -745,8 +841,10 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
             client.sources_by_topic = sources_by_topic
             client.webproxy_status = RequestStatus_Idle
         end
+
     elseif msg isa EngineDir
         client.remote_engine_dir = msg.path
+
     elseif msg isa AvailableTrainmatchers
         trainmatchers = Dict{String, Vector{String}}()
         whitelisted = Set{KaraboDevice}()
@@ -763,14 +861,21 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
         client.trainmatchers = trainmatchers
         client.whitelisted_trainmatchers = whitelisted
         client.trainmatchers_request_status = RequestStatus_Idle
+
     elseif msg isa RoutingRules
         client.routing_rules = msg.rules
         client.routing_rules_request_status = RequestStatus_Idle
+
+    elseif msg isa RemapRules
+        client.remap_rules = msg.rules
+
     elseif msg isa DeviceSchema
         client.source_properties[(msg.topic, msg.name)] = schema_property_names(msg.schema)
         delete!(client.device_schema_requests, (msg.topic, msg.name))
+
     elseif msg isa DeviceProperty
         nothing
+
     elseif msg isa ContextInfo
         if msg.info isa Dict
             client.context.context_state = build_context_state(state, msg.info)
@@ -779,7 +884,7 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
             filter!(kv -> haskey(client.context.context_state, kv.first), client.variable_data)
         else
             @error "Context failed to load"
-            log_engine_error(state, "Context failed to load", sprint(showerror, msg.info))
+            log_engine_error(state, "Context failed to load", msg.info.text)
         end
 
         client.context.pipeline_status = msg.is_running ? PipelineStatus_Started : PipelineStatus_Stopped
@@ -793,29 +898,49 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
         end
     elseif msg isa ParameterChanged
         param = msg.parameter
-        # Update the parameter in the context state. Parameter names are
-        # prefixed with the group name (e.g. "bridge.address").
-        parts = split(param.name, "."; limit=2)
-        if length(parts) == 2
-            group, param_name = parts
-            group = String(group)
-            param_name = String(param_name)
-            ctx_state = client.context.context_state
-            if haskey(ctx_state, group) && haskey(ctx_state[group], "parameters")
-                if haskey(ctx_state[group]["parameters"], param_name)
-                    ctx_state[group]["parameters"][param_name].value = param.value
+        # The same parameter may appear under a node's "parameters" dict (group
+        # params) or inside a postprocessor's `params`. Walk every node and
+        # update wherever the full name matches.
+        for var_data in values(client.context.context_state)
+            params = get(var_data, "parameters", nothing)
+            if params isa Dict
+                for stored in values(params)
+                    if stored isa Parameter && stored.name == param.name
+                        stored.value = param.value
+                    end
+                end
+            end
+            for pp in get(var_data, "postprocessors", ())
+                for stored in values(pp.params)
+                    if stored isa Parameter && stored.name == param.name
+                        stored.value = param.value
+                    end
                 end
             end
         end
-    elseif msg isa ChannelStats
-        client.context.channel_stats = msg.stats
+
+        if client.pending_parameter_change == param.name
+            client.pending_parameter_change = nothing
+        end
+
+        if client.pending_source_edit == param.name
+            owner = find_parameter_owner(client, param.name)
+            if !isnothing(owner) && owner.kind == ParameterOwner_Group && param.value isa String
+                set_group_param(state, owner.var_name, owner.field_name,
+                                "\"$(escape_string(param.value))\""; reload=false)
+            end
+            client.pending_source_edit = nothing
+        end
+    elseif msg isa PipelineStats
+        client.context.channel_stats = msg.channel_stats
+        client.context.input_rates = msg.input_rates
     elseif msg isa RemoteReplState
         client.remoterepl_mode[] = msg.enabled
         client.remoterepl_status = msg.enabled ? RemoteReplStatus_Running : RemoteReplStatus_Stopped
     elseif msg isa Ack
         if !isnothing(msg.error)
-            @error "Server reported an error" exception=msg.error
-            log_engine_error(state, "Server reported an error", sprint(showerror, msg.error))
+            @error "Server reported an error" exception=msg.error.text
+            log_engine_error(state, "Server reported an error", msg.error.text)
         end
 
         if !isnothing(replied_to) && replied_to.msg_type == Start
@@ -824,6 +949,13 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
             else
                 client.context.pipeline_status = PipelineStatus_Stopped
             end
+        end
+
+        # On success, pending_parameter_change is cleared when the engine echoes
+        # back a ParameterChanged. On failure, no echo will arrive so clear here.
+        if !isnothing(replied_to) && replied_to.msg_type == ChangeParameter && !isnothing(msg.error)
+            client.pending_parameter_change = nothing
+            client.pending_source_edit = nothing
         end
     else
         @warn "Received unsupported message of type '$(typeof(msg))'"
@@ -856,6 +988,7 @@ function handle_server(state)
                 get_devices(client)
                 get_trainmatchers(client)
                 get_routing_rules(client)
+                send(client, GetRemapRules())
 
                 for msg_bytes in ws
                     buffer = IOBuffer(msg_bytes)
@@ -937,6 +1070,90 @@ function get_routing_rules(client)
     client.routing_rules_request_status = RequestStatus_Waiting
 end
 
+# Returns (topic, device, classId) for the device referenced by `source`, or
+# ("", device, "") if the device isn't in the loaded topology.
+function source_device_info(client::ClientState, source::String)
+    sep = find_separator(source)
+    device = strip_topic(isnothing(sep) ? source : source[1:sep-1])
+    for (topic, devices) in client.karabo_devices
+        if haskey(devices, device)
+            return topic, device, get(devices[device], "classId", "")
+        end
+    end
+    return "", device, ""
+end
+
+source_device_class(client::ClientState, source::String) = source_device_info(client, source)[3]
+
+# Apply a single rule to `source`. Returns the rewritten string, or nothing
+# if the rule's source/device_class regexes don't both match.
+# Returns (rewritten, pending). `rewritten` is the new source if the rule
+# matched and produced a result, else nothing. `pending` is a request ID if
+# the rule needs an in-flight device-property lookup to resolve.
+function apply_remap_rule(client::ClientState, rule::RemapRule, source::String,
+                          topic::String, device::String, device_class::String,
+                          property_ref::Ref{Any})
+    if !occursin(Regex(rule.device_class), device_class)
+        return nothing, nothing
+    end
+    pattern = Regex(rule.source)
+    if !occursin(pattern, source)
+        return nothing, nothing
+    end
+
+    return apply_remap_rule(Val(rule.kind), client, rule, source, topic, device, pattern, property_ref)
+end
+
+apply_remap_rule(::Val{RemapKind_Simple}, client, rule, source, topic, device, pattern, property_ref) =
+    replace(source, pattern => SubstitutionString(rule.replacement)), nothing
+
+# Rewrite `dev:output[prop]` to `<fast>[prop]@dev:output`, where `<fast>` is
+# the sole entry of the device's `fastSources` property. Returns a pending
+# request ID instead of a rewrite while the lookup is in flight; the response
+# callback writes the value into `property_ref`.
+function apply_remap_rule(::Val{RemapKind_Proxy}, client::ClientState, rule, source,
+                          topic, device, pattern, property_ref::Ref{Any})
+    if isnothing(property_ref[])
+        id = send_with_callback(
+            client, GetDeviceProperty(topic, device, "fastSources"),
+            msg -> property_ref[] = msg.value)
+        return nothing, id
+    end
+
+    value = property_ref[]
+    if value isa Exception || !(value isa AbstractVector) || isempty(value)
+        return nothing, nothing
+    end
+
+    bracket = findfirst('[', source)
+    if isnothing(bracket)
+        return nothing, nothing
+    end
+
+    proxied_source = string(value[1], source[bracket:end], "@", source[1:bracket-1])
+
+    return proxied_source, nothing
+end
+
+# Walks the remap rules in order, applying every rule that matches
+# cumulatively. Returns (source, pending); if pending is non-nothing the
+# caller should wait for that request before re-running the remap. Proxy
+# rules deposit the looked-up property value into `property_ref`.
+function remap_source(client::ClientState, source::String, property_ref::Ref{Any})
+    topic, device, device_class = source_device_info(client, source)
+    for rule in client.remap_rules
+        result, pending = apply_remap_rule(client, rule, source, topic, device, device_class,
+                                           property_ref)
+        if !isnothing(pending)
+            return source, pending
+        end
+        if !isnothing(result)
+            source = result
+        end
+    end
+    return source, nothing
+end
+
 function load_context(state)
     client = state.client
     send(client, LoadContext(client.context_path))
@@ -951,12 +1168,13 @@ function revise_engine(state)
 end
 
 function change_parameter(param::Parameter)
-    send(state[].client, ChangeParameter(param))
+    client = state[].client
+    send(client, ChangeParameter(param))
+    client.pending_parameter_change = param.name
 end
 
 function start(state)
     for store in values(state.client.variable_data)
-        empty!(store.update_timestamps)
         store.update_rate = 0
     end
 
@@ -982,4 +1200,66 @@ function set_remoterepl(state)
     client = state.client
     client.remoterepl_status = RemoteReplStatus_Changing
     send(client, SetRemoteRepl(client.remoterepl_mode[]))
+end
+
+function send_subscriptions(client)
+    variables = Dict{String, Int}(name => sub.precision
+                                  for (name, sub) in client.subscriptions
+                                  if sub.active)
+    send(client, SetVariableSubscriptions(variables))
+end
+
+# Update the requested zfp precision for a subscribed variable. Callers only
+# invoke this on a real change (e.g. InputInt edit), so we always send.
+function set_subscription_precision(state, name, precision::Int)
+    client = state.client
+    if isempty(name) || !haskey(client.subscriptions, name)
+        return
+    end
+    client.subscriptions[name].precision = precision
+    send_subscriptions(client)
+end
+
+function subscribe_variable(state, name; precision::Maybe{Int}=nothing)
+    if isempty(name)
+        return
+    end
+
+    client = state.client
+    needs_send = false
+
+    if !haskey(client.subscriptions, name)
+        client.subscriptions[name] = SubscriptionState(; count=1,
+                                                       precision=something(precision, -1))
+        needs_send = true
+    else
+        sub = client.subscriptions[name]
+        sub.count += 1
+        if !sub.active
+            sub.active = true
+            needs_send = true
+        end
+        if !isnothing(precision) && sub.precision != precision
+            sub.precision = precision
+            needs_send = true
+        end
+    end
+
+    if needs_send
+        send_subscriptions(client)
+    end
+end
+
+# Empty/unknown names are no-ops so callers can pass uninitialised slots safely.
+function unsubscribe_variable(state, name)
+    if isempty(name) || !haskey(state.client.subscriptions, name)
+        return
+    end
+
+    sub = state.client.subscriptions[name]
+    sub.count -= 1
+    if sub.count == 0
+        sub.active = false
+        send_subscriptions(state.client)
+    end
 end
