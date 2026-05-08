@@ -100,7 +100,7 @@ function draw_main_menubar()
 end
 
 function draw_parameter_widget(name, param::Parameter{Float64})
-    ret = @c ig.InputDouble(name, &param.value, 0.0, 0.0, "%.3f0", ig.ImGuiInputTextFlags_EnterReturnsTrue)
+    ret = @c ig.InputDouble("##$(name)", &param.value, 0.0, 0.0, "%.3f0", ig.ImGuiInputTextFlags_EnterReturnsTrue)
 
     return ret, param.value
 end
