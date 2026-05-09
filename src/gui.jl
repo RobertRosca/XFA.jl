@@ -1007,23 +1007,34 @@ function draw_plots()
             continue
         end
 
-        array = store.data
         new_tids = Set{Int}()
         while isready(store.updates)
             tid, x, type = take!(store.updates)
             push!(new_tids, tid)
             store.type = type
             if x isa Number
-                push!(array, x)
+                # Reset scalar_tids too, to preserve the parallel-length
+                # invariant — store.data may have been overwritten outside this
+                # loop (e.g. ArrayMetadata in client.jl) leaving stale tids.
+                if !(store.data isa CircularBuffer)
+                    store.data = CircularBuffer{Float64}(SCALAR_BUFFER_CAPACITY)
+                    store.scalar_tids = CircularBuffer{Int}(SCALAR_BUFFER_CAPACITY)
+                elseif isnothing(store.scalar_tids)
+                    store.scalar_tids = CircularBuffer{Int}(SCALAR_BUFFER_CAPACITY)
+                end
+                push!(store.data, x)
                 push!(store.scalar_tids, tid)
             elseif x isa AbstractArray
                 store.data = x
                 store.trainId = tid
+                if !isnothing(store.scalar_tids)
+                    empty!(store.scalar_tids)
+                end
             end
         end
 
         # Update contiguous caches for scalar data so plotting doesn't allocate
-        if !isnothing(store.scalar_tids)
+        if !isnothing(store.scalar_tids) && store.data isa CircularBuffer
             n = length(store.data)
             resize!(store.scalar_data_cache, n)
             resize!(store.scalar_tids_cache, n)
