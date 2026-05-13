@@ -446,6 +446,7 @@ end
     address::String = "wrigleyj@exflonc202.desy.de"
     client::ClientState = ClientState()
     engine_environment::String = "@xfa-default"
+    engine_working_dir::String = "/scratch/xfa"
     client_type_current_item::Cint = Cint(0)
 
     # Plot layout persistence, keyed by context path
@@ -460,6 +461,7 @@ function GuiState(settings::Dict; kwargs...)
 
     address = get(gui, "address", "wrigleyj@exflonc202.desy.de")
     engine_environment = get(gui, "engine_environment", "@xfa-default")
+    engine_working_dir = get(gui, "engine_working_dir", "/scratch/xfa")
     client_type_current_item = Cint(get(gui, "client_type", 0))
     saved_contexts = Dict{String, Dict{String, Any}}(
         k => Dict{String, Any}(v) for (k, v)
@@ -467,8 +469,8 @@ function GuiState(settings::Dict; kwargs...)
 
     client = ClientState(settings; embedded_engine = client_type_current_item == 1)
 
-    GuiState(; address, engine_environment, client_type_current_item,
-             saved_contexts, client, kwargs...)
+    GuiState(; address, engine_environment, engine_working_dir,
+             client_type_current_item, saved_contexts, client, kwargs...)
 end
 
 function Base.setproperty!(state::GuiState, sym::Symbol, x)

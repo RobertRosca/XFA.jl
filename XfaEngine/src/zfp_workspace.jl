@@ -78,6 +78,8 @@ native_int_scratch(ws::ZfpWorkspace, ::Type{Int64}) = ws.int64_scratch
 # and recording each element's kind (finite / NaN / +Inf / -Inf) into `kinds`.
 function sanitize_floats!(dest::DenseArray{T}, kinds::Vector{UInt8},
                           src::DenseArray{T}) where {T <: AbstractFloat}
+    fill_value = nanmean(src)
+
     n = length(src)
 
     for i in eachindex(src)
@@ -88,10 +90,7 @@ function sanitize_floats!(dest::DenseArray{T}, kinds::Vector{UInt8},
             dest[i] = x
         else
             kinds[i] = isnan(x) ? KIND_NAN : (x > 0 ? KIND_POSINF : KIND_NEGINF)
-            lo = max(1, i - NONFINITE_RADIUS)
-            hi = min(n, i + NONFINITE_RADIUS)
-            fill = nanmean(@view src[lo:hi])
-            dest[i] = isfinite(fill) ? fill : zero(T)
+            dest[i] = isfinite(fill_value) ? fill_value : zero(T)
         end
     end
 end

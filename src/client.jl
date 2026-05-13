@@ -29,6 +29,11 @@ function peekall(buffer::IOBuffer)
     return String(take!(copy(buffer)))
 end
 
+# Single ping with a 1s timeout; used to detect whether we can skip bastion/gateway jumps.
+function is_directly_reachable(address::AbstractString)
+    success(pipeline(`ping -c 1 -W 1 $address`; stdout=devnull, stderr=devnull))
+end
+
 function ssh_initialize(state::GuiState)
     client = state.client
     client.status = RemoteStatus_Connecting
@@ -38,7 +43,7 @@ function ssh_initialize(state::GuiState)
         user, address = split(address, "@")
     end
 
-    if endswith(address, ".desy.de") && address != GATEWAY && address != BASTION
+    if endswith(address, ".desy.de") && address != GATEWAY && address != BASTION && !is_directly_reachable(address)
         push!(client.ssh_hops, SshState(; address=BASTION))
         push!(client.ssh_hops, SshState(; address=GATEWAY))
     end
@@ -216,7 +221,7 @@ function initialize_engine(state)
             ssh_state = client.ssh_hops[end]
             session = ssh_state.session
 
-            working_dir = is_local ? pwd() : "/scratch/xfa"
+            working_dir = is_local ? pwd() : state.engine_working_dir
             bootstrap_jl = joinpath(working_dir, "bootstrap.jl")
             code = read(joinpath(@__DIR__, "bootstrap.jl"))
 
@@ -1090,9 +1095,8 @@ source_device_class(client::ClientState, source::String) = source_device_info(cl
 # Returns (rewritten, pending). `rewritten` is the new source if the rule
 # matched and produced a result, else nothing. `pending` is a request ID if
 # the rule needs an in-flight device-property lookup to resolve.
-function apply_remap_rule(client::ClientState, rule::RemapRule, source::String,
-                          topic::String, device::String, device_class::String,
-                          property_ref::Ref{Any})
+function apply_remap_rule(client::ClientState, rule::RemapRule, source,
+                          topic, device, device_class, property_ref::Ref{Any})
     if !occursin(Regex(rule.device_class), device_class)
         return nothing, nothing
     end

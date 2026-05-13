@@ -927,8 +927,7 @@ function draw_plot(plot::Plot, store, was_updated)
                 ig.SameLine()
                 ig.Checkbox("Fixed aspect", plot.fixed_aspect)
                 ig.SameLine()
-                if toggle_button("Auto colorbar##$(plot.id)", plot.autoscale_colorbar[])
-                    plot.autoscale_colorbar[] = !plot.autoscale_colorbar[]
+                if ig.Checkbox("Auto colorbar##$(plot.id)", plot.autoscale_colorbar)
                     if plot.autoscale_colorbar[]
                         plot.colorbar_display_zoomed = false
                     end
